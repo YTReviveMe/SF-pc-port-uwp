@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    IgnorableNamespaces="uap mp">
+  <Identity Name="SyphonFilterUWP" Publisher="CN=SyphonFilterPC" Version="0.1.0.0" />
+  <mp:PhoneIdentity PhoneProductId="00000000-0000-0000-0000-000000000000" PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+  <Properties>
+    <DisplayName>Syphon Filter PC</DisplayName>
+    <PublisherDisplayName>Syphon Filter PC</PublisherDisplayName>
+    <Logo>assets\launcher\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.19041.0" />
+  </Dependencies>
+  <Resources><Resource Language="en-us" /></Resources>
+  <Applications>
+    <Application Id="App" Executable="$targetnametoken$.exe" EntryPoint="SyphonFilterUwp.App">
+      <uap:VisualElements
+          DisplayName="Syphon Filter PC"
+          Description="Unofficial Syphon Filter PC runtime for legally dumped supported game media."
+          BackgroundColor="#030711"
+          Square150x150Logo="assets\launcher\Square150x150Logo.png"
+          Square44x44Logo="assets\launcher\Square44x44Logo.png">
+        <uap:SplashScreen Image="assets\launcher\SplashScreen.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="syphon-filter-disc-image">
+            <uap:SupportedFileTypes>
+              <uap:FileType>.cue</uap:FileType>
+              <uap:FileType>.bin</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <Capability Name="codeGeneration" />
+    <uap:Capability Name="removableStorage" />
+  </Capabilities>
+</Package>

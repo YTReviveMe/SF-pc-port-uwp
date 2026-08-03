@@ -46,7 +46,7 @@ constexpr bool contains(const PauseRect &outer, const PauseRect &inner) {
          inner.y + inner.height <= outer.y + outer.height;
 }
 
-PauseMenu makeMenu() {
+PauseMenu makeMenu(bool graphics_settings_available = false) {
   sf::game::PauseMenuData data;
   data.mission.mission_name = "Georgia Street";
   data.mission.date_time = "08/23 22:45";
@@ -100,6 +100,7 @@ PauseMenu makeMenu() {
       {0U, "1. Georgia Street"},
       {1U, "2. Destroyed Subway"},
   };
+  data.graphics_settings_available = graphics_settings_available;
   return PauseMenu{std::move(data)};
 }
 
@@ -433,6 +434,45 @@ void testRetailOptionsAndControllerOrder() {
                  command.text.starts_with(controller_prefixes[index]);
         }));
   }
+}
+
+void testXboxDisplayAndPerformanceMenu() {
+  auto menu = makeMenu(true);
+  openRootSection(menu, 5);
+  moveNext(menu, 9);
+  require(!menu.update({.confirm = true}));
+  settleTransition(menu);
+  require(menu.screen() == PauseScreen::graphics);
+
+  const auto commands = menu.buildRenderCommands();
+  require(std::ranges::any_of(commands, [](const auto &command) {
+    return command.kind == PauseRenderKind::title &&
+           command.text == "Display & Performance";
+  }));
+  require(std::ranges::any_of(commands, [](const auto &command) {
+    return command.kind == PauseRenderKind::menu_item &&
+           command.text == "MSAA: 4x";
+  }));
+  require(!std::ranges::any_of(commands, [](const auto &command) {
+    return command.kind == PauseRenderKind::menu_item &&
+           command.text.starts_with("Performance Overlay:");
+  }));
+
+  const auto original = menu.settings().graphics;
+  const auto preview = menu.update({.right = true});
+  require(preview.type == sf::game::PauseCommandType::preview_setting);
+  require(preview.subject == static_cast<std::uint32_t>(
+              sf::game::PauseSetting::graphics_render_resolution));
+  require(menu.settings().graphics.render_width != original.render_width);
+  const auto reverted = menu.update({.cancel = true});
+  require(reverted.type == sf::game::PauseCommandType::revert_settings);
+  require(menu.settings().graphics == original);
+
+  auto shortcut_menu = makeMenu(true);
+  require(shortcut_menu.openGraphicsSettings());
+  require(shortcut_menu.screen() == PauseScreen::graphics);
+  auto retail_menu = makeMenu();
+  require(!retail_menu.openGraphicsSettings());
 }
 
 void testRetailCheatsMenu() {
@@ -1518,6 +1558,7 @@ int main() {
     testOptionsPreviewIsImmediatelyComplete();
     testRetailControllerBindingsAreVisible();
     testRetailOptionsAndControllerOrder();
+    testXboxDisplayAndPerformanceMenu();
     testRetailCheatsMenu();
     testEverySectionKeepsAcdComposition();
     testNestedScreensStayInsideLeftPanel();

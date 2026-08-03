@@ -1,4 +1,5 @@
 #include "launcher.hpp"
+#include "app_main.hpp"
 
 #include "sf/core/error.hpp"
 #include "sf/game/game_disc.hpp"
@@ -10,6 +11,7 @@
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -18,6 +20,11 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#if defined(SF_XBOX_UWP)
+#include <SDL.h>
+#include <SDL_system.h>
+#endif
 
 namespace {
 
@@ -29,6 +36,10 @@ std::optional<int> parseInteger(std::string_view text) {
     return std::nullopt;
   }
   return value;
+}
+
+bool startsWith(std::string_view text, std::string_view prefix) noexcept {
+  return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
 }
 
 bool parseResolution(std::string_view text,
@@ -64,11 +75,11 @@ parseLaunchRequest(const std::vector<std::string_view> &arguments) {
   if (arguments.empty()) {
     return LaunchRequest{};
   }
-  if (arguments.size() == 1U && !arguments.front().starts_with("--")) {
+  if (arguments.size() == 1U && !startsWith(arguments.front(), "--")) {
     return LaunchRequest{LaunchMode::game,
                          std::filesystem::path{arguments.front()}};
   }
-  if (arguments.size() != 2U || arguments[1].starts_with("--")) {
+  if (arguments.size() != 2U || startsWith(arguments[1], "--")) {
     return std::nullopt;
   }
 
@@ -95,6 +106,58 @@ bool supportsMissionSelection(LaunchMode mode) noexcept {
          mode == LaunchMode::scene_test;
 }
 
+#if defined(SF_XBOX_UWP)
+void loadXboxGraphicsSettings(sf::platform::GraphicsSettings &graphics) noexcept {
+  try {
+    const auto *local_folder =
+        SDL_WinRTGetFSPathUTF8(SDL_WINRT_PATH_LOCAL_FOLDER);
+    if (local_folder == nullptr || local_folder[0] == '\0') {
+      return;
+    }
+    std::ifstream file{std::filesystem::path{local_folder} /
+                       "graphics-settings.ini"};
+    std::string line;
+    while (std::getline(file, line)) {
+      const auto separator = line.find('=');
+      if (separator == std::string::npos) {
+        continue;
+      }
+      const auto value = parseInteger(
+          std::string_view{line}.substr(separator + 1U));
+      if (!value) {
+        continue;
+      }
+      const auto key = std::string_view{line}.substr(0, separator);
+      if (key == "RenderWidth" &&
+          (*value == 1280 || *value == 1600 || *value == 1920)) {
+        graphics.render_width = *value;
+      } else if (key == "RenderHeight" &&
+                 (*value == 720 || *value == 900 || *value == 1080)) {
+        graphics.render_height = *value;
+      } else if (key == "MSAA" &&
+          (*value == 0 || *value == 2 || *value == 4 || *value == 8)) {
+        graphics.msaa_samples = *value;
+      } else if (key == "Bilinear" && (*value == 0 || *value == 1)) {
+        graphics.bilinear_filtering = *value != 0;
+      } else if (key == "Anisotropic" && (*value == 0 || *value == 1)) {
+        graphics.anisotropic_filtering = *value != 0;
+      } else if (key == "Aspect" && (*value == 0 || *value == 1)) {
+        graphics.aspect_ratio = *value != 0
+                                    ? sf::platform::AspectRatioMode::adaptive
+                                    : sf::platform::AspectRatioMode::original_4_3;
+      } else if (key == "VSync" && (*value == 0 || *value == 1)) {
+        graphics.vsync = *value != 0;
+      } else if (key == "FrameLimit" &&
+                 (*value == 0 || (*value >= 20 && *value <= 1000))) {
+        graphics.frame_limit = static_cast<std::uint32_t>(*value);
+      }
+    }
+  } catch (...) {
+    // Defaults remain active if LocalState is briefly unavailable.
+  }
+}
+#endif
+
 void printUsage() {
   std::cerr
       << "Usage:\n"
@@ -120,20 +183,43 @@ void printUsage() {
 
 } // namespace
 
-int main(int argc, char **argv) {
+int syphonFilterMain(int argc, char **argv) {
   try {
     sf::platform::GraphicsSettings graphics;
+#if defined(SF_XBOX_UWP)
+    graphics.width = 1920;
+    graphics.height = 1080;
+    // Keep the Xbox presentation surface at 1080p and render internally at
+    // 720p by default.
+    graphics.render_width = 1280;
+    graphics.render_height = 720;
+    graphics.msaa_samples = 2;
+    graphics.anisotropic_filtering = false;
+    graphics.fullscreen = true;
+#endif
     sf::game::RetailCheatState retail_cheats;
     auto input = sf::platform::defaultKeyboardMouseBindings();
     auto language = sf::game::GameLanguage::english;
+    std::filesystem::path executable_directory;
+#if defined(SF_XBOX_UWP)
+    const auto* installed_location =
+        SDL_WinRTGetFSPathUTF8(SDL_WINRT_PATH_INSTALLED_LOCATION);
+    executable_directory = installed_location != nullptr && installed_location[0] != '\0'
+                               ? std::filesystem::path{installed_location}
+                               : std::filesystem::current_path();
+#else
     std::error_code executable_path_error;
     const auto executable_path = std::filesystem::absolute(
         std::filesystem::path{argv[0]}, executable_path_error);
-    const auto executable_directory = executable_path_error
-                                          ? std::filesystem::current_path()
-                                          : executable_path.parent_path();
+    executable_directory = executable_path_error
+                               ? std::filesystem::current_path()
+                               : executable_path.parent_path();
+#endif
     sf::game::setLocalizationRoot(executable_directory / "locales" / "ru-vit");
     sf::platform::loadLauncherSettings(graphics, input, language);
+#if defined(SF_XBOX_UWP)
+    loadXboxGraphicsSettings(graphics);
+#endif
     bool show_launcher = true;
     std::optional<std::uint32_t> requested_mission;
     std::vector<std::string_view> arguments;
@@ -160,7 +246,7 @@ int main(int argc, char **argv) {
         graphics.vsync = true;
       } else if (argument == "--no-vsync") {
         graphics.vsync = false;
-      } else if (argument.starts_with("--fps-limit=")) {
+      } else if (startsWith(argument, "--fps-limit=")) {
         const auto limit = parseInteger(
             argument.substr(std::string_view{"--fps-limit="}.size()));
         if (!limit || (*limit != 0 && (*limit < 20 || *limit > 1000))) {
@@ -177,14 +263,14 @@ int main(int argc, char **argv) {
         graphics.aspect_ratio = sf::platform::AspectRatioMode::adaptive;
       } else if (argument == "--aspect-4-3") {
         graphics.aspect_ratio = sf::platform::AspectRatioMode::original_4_3;
-      } else if (argument.starts_with("--resolution=")) {
+      } else if (startsWith(argument, "--resolution=")) {
         if (!parseResolution(
                 argument.substr(std::string_view{"--resolution="}.size()),
                 graphics)) {
           printUsage();
           return 64;
         }
-      } else if (argument.starts_with("--msaa=")) {
+      } else if (startsWith(argument, "--msaa=")) {
         const auto samples =
             parseInteger(argument.substr(std::string_view{"--msaa="}.size()));
         if (!samples || (*samples != 0 && *samples != 2 && *samples != 4 &&
@@ -193,8 +279,8 @@ int main(int argc, char **argv) {
           return 64;
         }
         graphics.msaa_samples = *samples;
-      } else if (argument.starts_with("--mission=") ||
-                 argument.starts_with("--level=")) {
+      } else if (startsWith(argument, "--mission=") ||
+                 startsWith(argument, "--level=")) {
         const auto separator = argument.find('=');
         const auto mission_number =
             parseInteger(argument.substr(separator + 1U));
@@ -336,3 +422,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 }
+
+#if !defined(SF_XBOX_UWP)
+int main(int argc, char** argv) {
+  return syphonFilterMain(argc, argv);
+}
+#endif

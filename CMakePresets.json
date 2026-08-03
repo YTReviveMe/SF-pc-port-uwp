@@ -27,6 +27,20 @@
         "VCPKG_TARGET_TRIPLET": "x64-windows",
         "SF_ENABLE_PSYCROSS": "ON"
       }
+    },
+    {
+      "name": "xbox-devmode-uwp",
+      "displayName": "Xbox Dev Mode x64 / UWP / Mesa OpenGL",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/xbox-devmode-uwp",
+      "architecture": "x64",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "WindowsStore",
+        "CMAKE_SYSTEM_VERSION": "10.0.19041.0",
+        "SF_XBOX_UWP": "ON",
+        "SF_ENABLE_PSYCROSS": "ON",
+        "SF_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -56,6 +70,13 @@
       "name": "windows-psycross-app-release",
       "displayName": "Windows Release / playable app only",
       "configurePreset": "windows-psycross",
+      "configuration": "Release",
+      "targets": ["syphon_filter"]
+    },
+    {
+      "name": "xbox-devmode-uwp-release",
+      "displayName": "Xbox Dev Mode UWP Release package",
+      "configurePreset": "xbox-devmode-uwp",
       "configuration": "Release",
       "targets": ["syphon_filter"]
     }

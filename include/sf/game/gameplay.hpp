@@ -57,6 +57,17 @@ struct GameplayAudioVolumes {
              const GameplayAudioVolumes &) noexcept = default;
 };
 
+// Per-guest-tick CPU measurements exposed only to the optional performance
+// overlay. "retail" includes outer-frame bookkeeping around the VM; "vm"
+// is the original game-code interpreter; "renderer" is its visibility-
+// building renderer tail; and "bridge" projects the guest frame natively.
+struct GameplayRetailUpdateTimings {
+  double retail_milliseconds{};
+  double vm_milliseconds{};
+  double renderer_milliseconds{};
+  double bridge_milliseconds{};
+};
+
 [[nodiscard]] std::uint8_t
 composeMapFadeIntensity(std::uint8_t native_intensity,
                         const LegacyFadeBridgeState *guest_fade) noexcept;
@@ -799,6 +810,10 @@ public:
   ~GameplaySession();
 
   void update(const GameplayInput &input);
+  [[nodiscard]] const GameplayRetailUpdateTimings &
+  retailUpdateTimings() const noexcept {
+    return retail_update_timings_;
+  }
   void advanceAnimationClock() noexcept;
   void reset();
   [[nodiscard]] bool restartCheckpoint();
@@ -1248,6 +1263,7 @@ private:
   std::optional<std::uint64_t> legacy_last_synced_guest_frame_;
   std::uint64_t legacy_presentation_sequence_{};
   std::unique_ptr<LegacyFirstMissionRuntime> legacy_first_mission_;
+  GameplayRetailUpdateTimings retail_update_timings_{};
   MissionScriptRuntime mission_scripts_;
   GeorgiaMissionState legacy_mission_state_{};
   std::uint32_t legacy_mission_objective_count_{};

@@ -106,6 +106,14 @@ extern "C"
 
 	/* Returns the screen size dimensions */
 	extern void PsyX_GetScreenSize(int* screenWidth, int* screenHeight);
+	/* Returns the physical OpenGL drawable used for final presentation. */
+	extern void PsyX_GetDrawableSize(int* drawableWidth, int* drawableHeight);
+	/* Smoothed timings from the last submitted presentation, in milliseconds.
+	 * `submit` covers renderer completion before the native present, `present`
+	 * covers the final blit plus swap, and `limiter` is software cap sleep. */
+	extern void PsyX_GetPresentationTimings(double* submitMilliseconds,
+										double* presentMilliseconds,
+										double* limiterMilliseconds);
 
 	/* Resolves original 4:3 letterboxing or a full adaptive output viewport. */
 	extern PsyXPresentationViewport

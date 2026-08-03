@@ -24,6 +24,10 @@ enum class AspectRatioMode {
 struct GraphicsSettings {
   int width{1280};
   int height{720};
+  // Zero keeps the native target at the window/output extent.  Xbox uses a
+  // lower internal target while retaining a 1080p UWP presentation surface.
+  int render_width{};
+  int render_height{};
   int msaa_samples{4};
   bool bilinear_filtering{true};
   bool anisotropic_filtering{true};

@@ -30,7 +30,7 @@ constexpr std::array retail_root_sections{
     RetailRootSection{"Options", PauseScreen::options, true},
 };
 constexpr auto root_item_count = retail_root_sections.size();
-constexpr std::size_t option_item_count = 9;
+constexpr std::size_t retail_option_item_count = 9;
 constexpr std::size_t sound_item_count = 3;
 constexpr std::size_t controller_item_count = 7;
 constexpr std::size_t binding_item_count = 9;
@@ -47,7 +47,13 @@ constexpr std::array option_labels{
     "Screen Centering",
     "Controller",
     "Cheats",
+    "Display & Performance",
 };
+
+constexpr std::size_t optionItemCount(bool graphics_settings_available) {
+  return graphics_settings_available ? option_labels.size()
+                                     : retail_option_item_count;
+}
 
 // The release default controller table is shown in MENU.OVL even before the
 // player customizes a binding. Keeping it explicit prevents the native menu
@@ -146,6 +152,30 @@ T adjusted(T value, std::int32_t direction, std::int32_t step, T minimum,
   const auto result = static_cast<std::int32_t>(value) + direction * step;
   return static_cast<T>(std::clamp(result, static_cast<std::int32_t>(minimum),
                                    static_cast<std::int32_t>(maximum)));
+}
+
+template <typename T, std::size_t Size>
+T cycleValue(const std::array<T, Size> &values, T current,
+             std::int32_t direction) {
+  const auto found = std::ranges::find(values, current);
+  const auto index = found == values.end()
+                         ? std::size_t{}
+                         : static_cast<std::size_t>(found - values.begin());
+  const auto offset = direction < 0 ? Size - 1U : 1U;
+  return values[(index + offset) % Size];
+}
+
+std::string graphicsMsaaLabel(int samples) {
+  return samples > 1 ? std::to_string(samples) + "x" : "Off";
+}
+
+std::string graphicsRenderResolutionLabel(int width, int height) {
+  return std::to_string(width) + "x" + std::to_string(height);
+}
+
+std::string graphicsFrameLimitLabel(std::uint32_t frames_per_second) {
+  return frames_per_second == 0U ? "Unlimited"
+                                 : std::to_string(frames_per_second) + " FPS";
 }
 
 std::size_t visibleEntryCount(const std::vector<MissionMenuEntry> &entries) {
@@ -464,6 +494,9 @@ PauseMenuCommand PauseMenu::update(const PauseMenuInput &input) {
   case PauseScreen::screen_centering:
     result = updateCentering(input);
     break;
+  case PauseScreen::graphics:
+    result = updateGraphics(input);
+    break;
   case PauseScreen::mission_select:
     result = updateMissionSelect(input);
     break;
@@ -550,7 +583,8 @@ PauseMenuCommand PauseMenu::updateOptions(const PauseMenuInput &input) {
     pop();
     return {};
   }
-  moveSelection(current(), option_item_count, input);
+  moveSelection(current(), optionItemCount(data_.graphics_settings_available),
+                input);
   if (!input.confirm) {
     return {};
   }
@@ -591,6 +625,11 @@ PauseMenuCommand PauseMenu::updateOptions(const PauseMenuInput &input) {
     break;
   case 8:
     push(PauseScreen::cheats);
+    break;
+  case 9:
+    if (data_.graphics_settings_available) {
+      push(PauseScreen::graphics);
+    }
     break;
   default:
     break;
@@ -871,6 +910,77 @@ PauseMenuCommand PauseMenu::updateCentering(const PauseMenuInput &input) {
   return {};
 }
 
+PauseMenuCommand PauseMenu::updateGraphics(const PauseMenuInput &input) {
+  if (input.cancel) {
+    settings_.graphics = committed_settings_.graphics;
+    pop();
+    return PauseMenuCommand{PauseCommandType::revert_settings};
+  }
+
+  constexpr std::size_t graphics_item_count = 7U;
+  moveSelection(current(), graphics_item_count, input);
+  const auto direction = input.left ? -1 : (input.right ? 1 : 0);
+  if (direction == 0) {
+    return {};
+  }
+
+  switch (current().selection) {
+  case 0: {
+    constexpr std::array render_resolutions{
+        std::pair{1280, 720},
+        std::pair{1600, 900},
+        std::pair{1920, 1080},
+    };
+    const auto next = cycleValue(
+        render_resolutions,
+        std::pair{settings_.graphics.render_width,
+                  settings_.graphics.render_height},
+        direction);
+    settings_.graphics.render_width = next.first;
+    settings_.graphics.render_height = next.second;
+    return preview(PauseSetting::graphics_render_resolution,
+                   settings_.graphics.render_width);
+  }
+  case 1:
+    settings_.graphics.aspect_ratio =
+        settings_.graphics.aspect_ratio == PauseAspectRatio::adaptive
+            ? PauseAspectRatio::original_4_3
+            : PauseAspectRatio::adaptive;
+    return preview(PauseSetting::graphics_aspect_ratio,
+                   static_cast<std::int32_t>(settings_.graphics.aspect_ratio));
+  case 2: {
+    constexpr std::array msaa_values{0, 2, 4, 8};
+    settings_.graphics.msaa_samples =
+        cycleValue(msaa_values, settings_.graphics.msaa_samples, direction);
+    return preview(PauseSetting::graphics_msaa,
+                   settings_.graphics.msaa_samples);
+  }
+  case 3:
+    settings_.graphics.bilinear_filtering =
+        !settings_.graphics.bilinear_filtering;
+    return preview(PauseSetting::graphics_bilinear_filtering,
+                   settings_.graphics.bilinear_filtering ? 1 : 0);
+  case 4:
+    settings_.graphics.anisotropic_filtering =
+        !settings_.graphics.anisotropic_filtering;
+    return preview(PauseSetting::graphics_anisotropic_filtering,
+                   settings_.graphics.anisotropic_filtering ? 1 : 0);
+  case 5:
+    settings_.graphics.vsync = !settings_.graphics.vsync;
+    return preview(PauseSetting::graphics_vsync,
+                   settings_.graphics.vsync ? 1 : 0);
+  case 6: {
+    constexpr std::array frame_limits{0U, 30U, 60U, 120U};
+    settings_.graphics.frame_limit =
+        cycleValue(frame_limits, settings_.graphics.frame_limit, direction);
+    return preview(PauseSetting::graphics_frame_limit,
+                   static_cast<std::int32_t>(settings_.graphics.frame_limit));
+  }
+  default:
+    return {};
+  }
+}
+
 PauseMenuCommand PauseMenu::updateWeapons(const PauseMenuInput &input) {
   if (input.cancel) {
     if (current().expanded) {
@@ -1012,6 +1122,14 @@ void PauseMenu::resolveWeaponEquip(std::uint32_t id, bool accepted) {
   if (screen() != PauseScreen::notification) {
     push(PauseScreen::notification);
   }
+}
+
+bool PauseMenu::openGraphicsSettings() {
+  if (!data_.graphics_settings_available) {
+    return false;
+  }
+  push(PauseScreen::graphics);
+  return true;
 }
 
 std::vector<PauseRenderCommand> PauseMenu::buildRenderCommands() const {
@@ -1357,7 +1475,9 @@ std::vector<PauseRenderCommand> PauseMenu::buildRenderCommands() const {
         // Retail root preview lists only the four configuration categories.
         // Destructive/session actions belong to the Options detail screen.
         addLeft(PauseRenderKind::text, PauseRect{56, 54, 157, 105},
-                "Sound\nController\nGame Brightness\nScreen Centering");
+                data_.graphics_settings_available
+                    ? "Sound\nController\nGame Brightness\nScreen Centering\nDisplay & Performance"
+                    : "Sound\nController\nGame Brightness\nScreen Centering");
       }
       if (!preview_composed && !preview.empty()) {
         addLeft(PauseRenderKind::text, PauseRect{56, 51, 157, 131}, preview);
@@ -1377,7 +1497,8 @@ std::vector<PauseRenderCommand> PauseMenu::buildRenderCommands() const {
             PauseColorRole::accent);
     // MENU.OVL keeps Select Mission in this list. Retail restricts it to
     // reached missions until its held-button cheat opens the full table.
-    for (std::size_t index = 0; index < option_labels.size(); ++index) {
+    for (std::size_t index = 0;
+         index < optionItemCount(data_.graphics_settings_available); ++index) {
       addMenu(option_labels[index], index, state.selection,
               static_cast<std::int16_t>(47 + index * 16));
     }
@@ -1545,6 +1666,36 @@ std::vector<PauseRenderCommand> PauseMenu::buildRenderCommands() const {
     addInformation(PauseRenderKind::text, PauseRect{240, 44, 101, 60},
                    "Configuration\nScreen Centering");
     addHint(PauseAcdLayout::hint, "%x Save  %t Cancel");
+    break;
+  }
+  case PauseScreen::graphics: {
+    addLeft(PauseRenderKind::title, PauseRect{56, 36, 157, 10},
+            "Display & Performance", PauseColorRole::accent);
+    const std::array labels{
+        std::string{"Internal Resolution: "} +
+            graphicsRenderResolutionLabel(settings_.graphics.render_width,
+                                          settings_.graphics.render_height),
+        std::string{"Aspect Ratio: "} +
+            (settings_.graphics.aspect_ratio == PauseAspectRatio::adaptive
+                 ? "Widescreen"
+                 : "Original 4:3"),
+        std::string{"MSAA: "} +
+            graphicsMsaaLabel(settings_.graphics.msaa_samples),
+        std::string{"Texture Filtering: "} +
+            (settings_.graphics.bilinear_filtering ? "Bilinear" : "Nearest"),
+        std::string{"Anisotropic Filtering: "} +
+            (settings_.graphics.anisotropic_filtering ? "On" : "Off"),
+        std::string{"VSync: "} + (settings_.graphics.vsync ? "On" : "Off"),
+        std::string{"Frame Limit: "} +
+            graphicsFrameLimitLabel(settings_.graphics.frame_limit),
+    };
+    for (std::size_t index = 0; index < labels.size(); ++index) {
+      addMenu(labels[index], index, state.selection,
+              static_cast<std::int16_t>(47 + index * 16));
+    }
+    addInformation(PauseRenderKind::text, PauseRect{240, 44, 101, 60},
+                   "Xbox\nChanges apply live");
+    addHint(PauseAcdLayout::hint, "D-pad left/right adjust   %t cancel");
     break;
   }
   case PauseScreen::briefing: {
@@ -1864,6 +2015,8 @@ std::string_view pauseScreenName(PauseScreen screen) noexcept {
     return "Game Brightness";
   case PauseScreen::screen_centering:
     return "Screen Centering";
+  case PauseScreen::graphics:
+    return "Display & Performance";
   case PauseScreen::mission_select:
     return "Select Mission";
   case PauseScreen::weapons:

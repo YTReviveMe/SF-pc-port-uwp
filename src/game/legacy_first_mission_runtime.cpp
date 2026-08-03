@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -622,6 +623,8 @@ void LegacyFirstMissionRuntime::reset() noexcept {
 }
 
 void LegacyFirstMissionRuntime::advanceHostUpdate() noexcept {
+  last_retail_vm_milliseconds_ = 0.0;
+  last_retail_renderer_milliseconds_ = 0.0;
   if (!ready_ || finished_ || !vm_) {
     return;
   }
@@ -686,7 +689,13 @@ void LegacyFirstMissionRuntime::advanceHostUpdate() noexcept {
 
     // H4 has no native-driven gameplay frame. The retail outer loop owns
     // input processing, gameplay, player, animation and mission state.
+    const auto vm_started = std::chrono::steady_clock::now();
     const auto frame = vm_->tickRetailOuterFrame();
+    const auto vm_finished = std::chrono::steady_clock::now();
+    last_retail_vm_milliseconds_ =
+        std::chrono::duration<double, std::milli>(vm_finished - vm_started)
+            .count();
+    last_retail_renderer_milliseconds_ = frame.renderer_tail_milliseconds;
     if (!frame.completed()) {
       recordExecutionFault(frame);
       markFault();

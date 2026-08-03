@@ -47,6 +47,8 @@ if(SF_BUILD_TESTS)
         LIBRARIES sf::core)
     sf_add_unit_test(sf_retail_pause_map_tests
         tests/retail_pause_map_tests.cpp LIBRARIES sf::game)
+    sf_add_unit_test(sf_xbox_game_image_tests tests/xbox_game_image_tests.cpp
+        LIBRARIES sf::xbox_content)
 
     add_test(NAME sf_architecture_check
         COMMAND "${CMAKE_COMMAND}"

@@ -1,4 +1,4 @@
-#ifdef _WINDOWS
+#if defined(_WINDOWS) && !defined(SF_XBOX_UWP)
 
 #include <windows.h>
 #include <Dbghelp.h>

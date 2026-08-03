@@ -32,7 +32,6 @@
 #include "sf/platform/gameplay_presentation_transition.hpp"
 #include "sf/platform/optic_history.hpp"
 #include "sf/platform/player_camera_fade.hpp"
-#include "sf/platform/presentation_frame_meter.hpp"
 #include "sf/platform/retail_depth_cue.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
 #include "sf/platform/world_chunk_appearance.hpp"
@@ -3915,46 +3914,6 @@ void testPlayerCameraFade() {
           "Unrelated scripted camera made Gabe disappear");
 }
 
-void testPresentationFrameMeter() {
-  sf::platform::PresentationFrameMeter sixty_hz;
-  for (auto frame = 0; frame < 30; ++frame) {
-    sixty_hz.advance(1.0 / 60.0, frame % 3 == 2 ? 1U : 0U);
-  }
-  require(sixty_hz.ready() &&
-              std::abs(sixty_hz.framesPerSecond() - 60.0) < 0.0001 &&
-              std::abs(sixty_hz.simulationFramesPerSecond() - 20.0) <
-                  0.0001 &&
-              std::abs(sixty_hz.frameMilliseconds() - 1000.0 / 60.0) < 0.0001 &&
-              sixty_hz.text() == "FPS 60  LOGIC 20  16.7 MS",
-          "Dual FPS meter misreported a stable 60/20 Hz stream");
-
-  sf::platform::PresentationFrameMeter high_refresh;
-  for (auto frame = 0; frame < 120; ++frame) {
-    high_refresh.advance(1.0 / 240.0, frame % 12 == 11 ? 1U : 0U);
-  }
-  require(high_refresh.ready() &&
-              std::abs(high_refresh.framesPerSecond() - 240.0) < 0.0001 &&
-              std::abs(high_refresh.simulationFramesPerSecond() - 20.0) <
-                  0.0001 &&
-              high_refresh.text() == "FPS 240  LOGIC 20  4.2 MS",
-          "Dual FPS meter depends on the presentation refresh rate");
-
-  sf::platform::PresentationFrameMeter invalid;
-  invalid.advance(0.0);
-  invalid.advance(-1.0);
-  invalid.advance(std::numeric_limits<double>::infinity());
-  invalid.advance(1.0);
-  require(!invalid.ready() && invalid.text().empty(),
-          "Invalid or blocking host timing polluted the FPS meter");
-  invalid.advance(0.5);
-  require(invalid.ready(), "FPS meter did not recover after a blocked frame");
-  invalid.reset();
-  require(!invalid.ready() && invalid.text().empty() &&
-              invalid.framesPerSecond() == 0.0 &&
-              invalid.simulationFramesPerSecond() == 0.0,
-          "FPS meter retained stale telemetry after reset");
-}
-
 void testRetailOpticHistoryPolicy() {
   sf::platform::RetailOpticHistory<int> history;
   require(history.nextWriteSlot() == 0U,
@@ -4128,7 +4087,6 @@ int main() {
     testRetailTerrainDepthCuePolicy();
     testWorldChunkAppearance();
     testPlayerCameraFade();
-    testPresentationFrameMeter();
     std::cout << "All tests passed\n";
     return 0;
   } catch (const std::exception &error) {

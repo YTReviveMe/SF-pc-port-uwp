@@ -10,6 +10,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numbers>
@@ -5889,6 +5890,7 @@ bool GameplaySession::npcZoneContains(const NpcState &state, double x,
 }
 
 void GameplaySession::update(const GameplayInput &input) {
+  retail_update_timings_ = {};
   refreshLegacyTargetFollowCameraState();
   refreshLegacyRadioConversationState();
   updateEffects();
@@ -5919,8 +5921,24 @@ void GameplaySession::update(const GameplayInput &input) {
   }
 
   if (legacy_first_mission_->ready() && !legacy_first_mission_->finished()) {
+    const auto retail_started = std::chrono::steady_clock::now();
     legacy_first_mission_->advanceHostUpdate();
+    const auto retail_finished = std::chrono::steady_clock::now();
+    retail_update_timings_.retail_milliseconds =
+        std::chrono::duration<double, std::milli>(retail_finished -
+                                                  retail_started)
+            .count();
+    retail_update_timings_.vm_milliseconds =
+        legacy_first_mission_->lastRetailVmMilliseconds();
+    retail_update_timings_.renderer_milliseconds =
+        legacy_first_mission_->lastRetailRendererMilliseconds();
+    const auto bridge_started = std::chrono::steady_clock::now();
     syncLegacyGameplayBridge();
+    const auto bridge_finished = std::chrono::steady_clock::now();
+    retail_update_timings_.bridge_milliseconds =
+        std::chrono::duration<double, std::milli>(bridge_finished -
+                                                  bridge_started)
+            .count();
     refreshLegacyTargetFollowCameraState();
     refreshLegacyRadioConversationState();
   }

@@ -13,7 +13,7 @@
 #include <string.h>
 #include <vector>
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(SF_XBOX_UWP)
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -31,7 +31,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
-#endif // def WIN32
+#endif // _WIN32 && !SF_XBOX_UWP
 
 #if defined(RENDERER_OGL)
 
@@ -622,8 +622,17 @@ static void PsyX_PresentNativeFramebuffer() {
 
   glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glNativeFramebuffer);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
+  // Adaptive presentation fills the complete drawable. Clearing first would
+  // make UWP Mesa write a second full 4K surface on Xbox Series consoles
+  // before the real 720p/900p/1080p source is scaled into it. The clear is
+  // only required when original 4:3 presentation leaves letterbox bars.
+  const bool presentation_fills_drawable =
+      viewport.x == 0 && viewport.y == 0 &&
+      viewport.w == g_drawableWidth && viewport.h == g_drawableHeight;
+  if (!presentation_fills_drawable) {
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+  }
   glBlitFramebuffer(source.x, source.y, source.x + source.w,
                     source.y + source.h, viewport.x, viewport.y,
                     viewport.x + viewport.w, viewport.y + viewport.h,

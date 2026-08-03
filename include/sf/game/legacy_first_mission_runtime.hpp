@@ -272,6 +272,14 @@ public:
   [[nodiscard]] bool restoreCheckpoint() noexcept;
   void reset() noexcept;
   void advanceHostUpdate() noexcept;
+  // Measurements from the most recent host update. Diagnostics only: these
+  // never alter the retail clock or guest state.
+  [[nodiscard]] double lastRetailVmMilliseconds() const noexcept {
+    return last_retail_vm_milliseconds_;
+  }
+  [[nodiscard]] double lastRetailRendererMilliseconds() const noexcept {
+    return last_retail_renderer_milliseconds_;
+  }
   [[nodiscard]] bool
   setRetailAudioVolumes(const LegacyRetailAudioVolumes &volumes) noexcept;
   [[nodiscard]] std::optional<LegacyRetailAudioVolumes>
@@ -344,6 +352,8 @@ private:
   std::uint64_t guest_frame_{};
   std::uint64_t presentation_sequence_{};
   std::uint32_t native_update_phase_{};
+  double last_retail_vm_milliseconds_{};
+  double last_retail_renderer_milliseconds_{};
   std::uint8_t consecutive_renderer_snapshot_replays_{};
   std::optional<std::uint32_t> last_checkpoint_frame_;
   std::optional<LegacyRetailAudioVolumes> retail_audio_volumes_;

@@ -53,8 +53,14 @@ void configureGraphics(const GraphicsSettings &settings) noexcept {
   g_cfg_aspectMode = settings.aspect_ratio == AspectRatioMode::adaptive
                          ? PSYX_ASPECT_ADAPTIVE
                          : PSYX_ASPECT_ORIGINAL_4_3;
-  g_cfg_renderWidth = std::max(settings.width, 1);
-  g_cfg_renderHeight = std::max(settings.height, 1);
+  g_cfg_renderWidth =
+      std::max(settings.render_width > 0 ? settings.render_width
+                                         : settings.width,
+               1);
+  g_cfg_renderHeight =
+      std::max(settings.render_height > 0 ? settings.render_height
+                                          : settings.height,
+               1);
   g_cfg_swapInterval = settings.vsync ? 1 : 0;
   // Presentation is native: no game code samples the displayed framebuffer
   // through PSX VRAM, and the guest simulation has its own deterministic
@@ -676,7 +682,7 @@ public:
                       campaign->missionIndex() + 1U);
       }
       detail::PsyCrossMissionStart mission_start;
-      detail::PsyCrossSceneViewer scene_viewer{input_, cheats_};
+      detail::PsyCrossSceneViewer scene_viewer{graphics_, input_, cheats_};
       std::optional<game::MissionPackage> loaded_mission;
       auto exit_application = false;
       while (campaign->active()) {
@@ -906,7 +912,7 @@ public:
     detail::PsyCrossMissionStart mission_start;
     previous_buttons =
         mission_start.run(mission_, pad, previous_buttons, input_);
-    detail::PsyCrossSceneViewer scene_viewer{input_, cheats_};
+      detail::PsyCrossSceneViewer scene_viewer{graphics_, input_, cheats_};
     const auto result = scene_viewer.run(mission_, pad, previous_buttons,
                                          cue_path_, mission_.definition().index,
                                          mission_start.takePreloadedGameplay(),

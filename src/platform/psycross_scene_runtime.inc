@@ -90,6 +90,10 @@ SceneViewerResult PsyCrossSceneViewer::run(
   std::vector<WorldCalloutAnchor> world_callout_scratch;
   GameplayHudScratch gameplay_hud_scratch;
   constexpr std::uint16_t pause_button = 0x08U;
+  constexpr std::uint16_t left_stick_button = 0x02U;
+  constexpr std::uint16_t right_stick_button = 0x04U;
+  constexpr std::uint16_t graphics_shortcut_buttons =
+      left_stick_button | right_stick_button;
   constexpr std::uint16_t cancel_button = 0x1000U | 0x2000U;
   constexpr std::uint16_t confirm_button = 0x4000U | 0x8000U;
   constexpr std::uint16_t left_button = 0x80U;
@@ -121,6 +125,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
   bool binding_capture = false;
   bool pause_was_down = false;
   bool interact_was_down = false;
+  bool graphics_shortcut_was_down = false;
   int pause_analog_x = 0;
   int pause_analog_y = 0;
   double dpad_down_held_seconds = 0.0;
@@ -256,6 +261,20 @@ SceneViewerResult PsyCrossSceneViewer::run(
       }};
   RelativeMouseCapture mouse_capture;
   auto &pause_settings = pause_settings_;
+  pause_settings.graphics = {
+      .render_width = graphics_.render_width > 0 ? graphics_.render_width
+                                                  : graphics_.width,
+      .render_height = graphics_.render_height > 0 ? graphics_.render_height
+                                                    : graphics_.height,
+      .msaa_samples = graphics_.msaa_samples,
+      .bilinear_filtering = graphics_.bilinear_filtering,
+      .anisotropic_filtering = graphics_.anisotropic_filtering,
+      .aspect_ratio = graphics_.aspect_ratio == AspectRatioMode::adaptive
+                          ? game::PauseAspectRatio::adaptive
+                          : game::PauseAspectRatio::original_4_3,
+      .vsync = graphics_.vsync,
+      .frame_limit = graphics_.frame_limit,
+  };
   if (!pause_settings_initialized_) {
     if (const auto volumes = gameplay.audioVolumes()) {
       pause_settings.sound_effects_volume = volumes->sound_effects;
@@ -299,6 +318,33 @@ SceneViewerResult PsyCrossSceneViewer::run(
     return accepted;
   };
   const auto apply_pause_settings = [&](const game::PauseSettings &settings) {
+    graphics_.render_width = settings.graphics.render_width;
+    graphics_.render_height = settings.graphics.render_height;
+    graphics_.msaa_samples = settings.graphics.msaa_samples;
+    graphics_.bilinear_filtering = settings.graphics.bilinear_filtering;
+    graphics_.anisotropic_filtering = settings.graphics.anisotropic_filtering;
+    graphics_.aspect_ratio =
+        settings.graphics.aspect_ratio == game::PauseAspectRatio::adaptive
+            ? AspectRatioMode::adaptive
+            : AspectRatioMode::original_4_3;
+    graphics_.vsync = settings.graphics.vsync;
+    graphics_.frame_limit = settings.graphics.frame_limit;
+    // PsyCross checks these values while it builds each presentation frame.
+    // In particular its native framebuffer is recreated whenever the MSAA
+    // sample count changes, so Xbox can apply this page without a dashboard
+    // restart or a second graphics launcher.
+    g_cfg_renderWidth = std::max(graphics_.render_width, 1);
+    g_cfg_renderHeight = std::max(graphics_.render_height, 1);
+    g_cfg_msaaSamples = graphics_.msaa_samples;
+    g_cfg_bilinearFiltering = graphics_.bilinear_filtering ? 1 : 0;
+    g_cfg_anisotropicFiltering = graphics_.anisotropic_filtering ? 1 : 0;
+    g_cfg_aspectMode = graphics_.aspect_ratio == AspectRatioMode::adaptive
+                           ? PSYX_ASPECT_ADAPTIVE
+                           : PSYX_ASPECT_ORIGINAL_4_3;
+    g_cfg_swapInterval = graphics_.vsync ? 1 : 0;
+    PsyX_EnableSwapInterval(graphics_.vsync ? 1 : 0);
+    PsyX_SetSwapInterval(1);
+    PsyX_SetFrameLimit(static_cast<int>(graphics_.frame_limit));
     SetGeomOffset(screen_width / 2 + settings.screen_center_x,
                   screen_height / 2 + settings.screen_center_y);
     auto configuration = player_input.configuration();
@@ -318,6 +364,52 @@ SceneViewerResult PsyCrossSceneViewer::run(
     ui_audio.setVolumePercent(settings.sound_effects_volume);
     ui_audio.setVoiceVolumePercent(settings.voice_volume);
     return true;
+  };
+#if defined(SF_XBOX_UWP)
+  const auto save_xbox_graphics_settings = [this]() noexcept {
+    try {
+      const auto *local_folder =
+          SDL_WinRTGetFSPathUTF8(SDL_WINRT_PATH_LOCAL_FOLDER);
+      if (local_folder == nullptr || local_folder[0] == '\0') {
+        return;
+      }
+      std::ofstream file{std::filesystem::path{local_folder} /
+                         "graphics-settings.ini",
+                         std::ios::out | std::ios::trunc};
+      if (!file) {
+        return;
+      }
+      file << "MSAA=" << graphics_.msaa_samples << '\n'
+           << "RenderWidth=" << graphics_.render_width << '\n'
+           << "RenderHeight=" << graphics_.render_height << '\n'
+           << "Bilinear=" << (graphics_.bilinear_filtering ? 1 : 0) << '\n'
+           << "Anisotropic=" << (graphics_.anisotropic_filtering ? 1 : 0)
+           << '\n'
+           << "Aspect="
+           << (graphics_.aspect_ratio == AspectRatioMode::adaptive ? 1 : 0)
+           << '\n'
+           << "VSync=" << (graphics_.vsync ? 1 : 0) << '\n'
+           << "FrameLimit=" << graphics_.frame_limit << '\n';
+    } catch (...) {
+      // A graphics preference must never compromise a running mission.
+    }
+  };
+#else
+  const auto save_xbox_graphics_settings = []() noexcept {};
+#endif
+  const auto is_graphics_preview = [](std::uint32_t subject) noexcept {
+    switch (static_cast<game::PauseSetting>(subject)) {
+    case game::PauseSetting::graphics_render_resolution:
+    case game::PauseSetting::graphics_msaa:
+    case game::PauseSetting::graphics_bilinear_filtering:
+    case game::PauseSetting::graphics_anisotropic_filtering:
+    case game::PauseSetting::graphics_aspect_ratio:
+    case game::PauseSetting::graphics_vsync:
+    case game::PauseSetting::graphics_frame_limit:
+      return true;
+    default:
+      return false;
+    }
   };
   if (!apply_pause_settings(pause_settings)) {
     return SceneViewerResult{previous_buttons,
@@ -341,6 +433,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
   };
   const auto retail_blackout_mission =
       mission.definition().resource_name == "CAVE2";
+  const auto performance_frequency = SDL_GetPerformanceFrequency();
   const auto draw_gameplay_frame = [&](unsigned int effect_updates) {
     glass_shatter.observe(gameplay, current_render_presentation);
     // Resource selectors are published atomically by the 20 Hz guest. Do not
@@ -657,16 +750,9 @@ SceneViewerResult PsyCrossSceneViewer::run(
     return true;
   };
 
-  PresentationFrameMeter presentation_frame_meter;
-  auto meter_elapsed_seconds = 0.0;
-  auto meter_simulation_updates = 0U;
   const auto end_presented_frame = [&] {
-    presentation_frame_meter.advance(meter_elapsed_seconds,
-                                     meter_simulation_updates);
-    drawPresentationFrameMeter(hud_textures, presentation_frame_meter.text());
     PsyX_EndScene();
   };
-  const auto performance_frequency = SDL_GetPerformanceFrequency();
   auto previous_frame_counter = SDL_GetPerformanceCounter();
   const auto periodic_audio_diagnostics = psyCrossAudioDiagnosticsEnabled();
   auto next_audio_diagnostic_counter =
@@ -737,8 +823,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
             ? 0.0
             : static_cast<double>(counter_delta) /
                   static_cast<double>(performance_frequency);
-    meter_elapsed_seconds = raw_elapsed_seconds;
-    meter_simulation_updates = 0U;
     const auto elapsed_seconds =
         std::clamp(raw_elapsed_seconds, 0.0, maximum_frame_time_seconds);
     presentation_delta_seconds = elapsed_seconds;
@@ -768,6 +852,17 @@ SceneViewerResult PsyCrossSceneViewer::run(
         held & static_cast<std::uint16_t>(~keyboard_pad_mask));
     const auto controller_pressed = static_cast<std::uint16_t>(
         pressed & static_cast<std::uint16_t>(~keyboard_pad_mask));
+#if defined(SF_XBOX_UWP)
+    const auto graphics_shortcut_down =
+        (controller_held & graphics_shortcut_buttons) ==
+        graphics_shortcut_buttons;
+    const auto graphics_shortcut_pressed =
+        input_settle_seconds <= 0.0 && graphics_shortcut_down &&
+        !graphics_shortcut_was_down;
+    graphics_shortcut_was_down = graphics_shortcut_down;
+#else
+    constexpr auto graphics_shortcut_pressed = false;
+#endif
     const auto mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
     const auto mouse_wheel_delta = consumePsyCrossMouseWheel();
     const auto keyboard_state =
@@ -914,7 +1009,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
     };
     const auto current_pause_x = pause_direction(analog_x);
     const auto current_pause_y = pause_direction(analog_y);
-    if (!paused && pause_toggled) {
+    if (!paused && (pause_toggled || graphics_shortcut_pressed)) {
       if (!service_realtime_audio()) {
         PsyX_Log_Error("Realtime retail audio clock failed\n");
         return SceneViewerResult{previous_buttons,
@@ -926,9 +1021,15 @@ SceneViewerResult PsyCrossSceneViewer::run(
       auto pause_data =
           game::makePauseMenuData(mission, gameplay, maximum_unlocked_mission);
       pause_data.cheats = cheats_;
+#if defined(SF_XBOX_UWP)
+      pause_data.graphics_settings_available = true;
+#endif
       pause_menu.reset(std::move(pause_data), pause_settings);
       if (cheats_.stage_select) {
         pause_menu.unlockMissionSelect();
+      }
+      if (graphics_shortcut_pressed) {
+        static_cast<void>(pause_menu.openGraphicsSettings());
       }
       paused = true;
       // Preserve the guest SPU/XA clock and queued PCM, but fade every host
@@ -1094,6 +1195,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
+        save_xbox_graphics_settings();
         player_input.synchronize(raw_player_input);
         clear_latched_gameplay_input();
         movement_armed = false;
@@ -1113,6 +1215,9 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
+        if (is_graphics_preview(command.subject)) {
+          save_xbox_graphics_settings();
+        }
         if (command.subject ==
             static_cast<std::uint32_t>(game::PauseSetting::vibration)) {
           unsigned char motors[2]{
@@ -1131,6 +1236,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
+        save_xbox_graphics_settings();
         break;
       case game::PauseCommandType::revert_settings:
         pause_settings = pause_menu.settings();
@@ -1138,6 +1244,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
+        save_xbox_graphics_settings();
         break;
       case game::PauseCommandType::begin_controller_binding:
         binding_capture = true;
@@ -1366,7 +1473,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
       simulation_accumulator_seconds = std::max(
           0.0, simulation_accumulator_seconds - retail_simulation_step_seconds);
 
-      meter_simulation_updates = simulation_updates_this_frame;
       // State 2 retires the guest runtime on the exact tick which publishes
       // the failure-restart request. Do not execute a second catch-up tick on
       // that finished timeline; the coherent checkpoint is restored below.
@@ -1538,7 +1644,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
       previous_buttons = movie_player.playStandalone(
           scripted_movies[*scripted_movie_index], pad, previous_buttons);
       previous_frame_counter = SDL_GetPerformanceCounter();
-      presentation_frame_meter.reset();
       GR_EnableDepth(1);
       GR_SetDepthState(1, 1);
       GR_SetBlendMode(BM_NONE);

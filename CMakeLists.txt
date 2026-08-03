@@ -1,15 +1,24 @@
 cmake_minimum_required(VERSION 3.24)
 
+# CMake selects the UWP toolchain during project() rather than after it. The
+# cache value is set by the Xbox preset (or -DSF_XBOX_UWP=ON).
+if(DEFINED SF_XBOX_UWP AND SF_XBOX_UWP)
+    set(CMAKE_SYSTEM_NAME WindowsStore CACHE STRING "Target the UWP SDK" FORCE)
+    set(CMAKE_SYSTEM_VERSION 10.0.19041.0 CACHE STRING "UWP SDK version" FORCE)
+endif()
+
 if(POLICY CMP0174)
     cmake_policy(SET CMP0174 NEW)
 endif()
 
-project(SyphonFilterPC VERSION 0.1.0 LANGUAGES CXX)
+project(SyphonFilterPC VERSION 0.1.0 LANGUAGES C CXX)
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 option(SF_BUILD_TESTS "Build unit tests" ON)
 option(SF_ENABLE_PSYCROSS "Build the optional PsyCross platform backend" OFF)
+option(SF_XBOX_UWP "Build the Xbox Dev Mode UWP package" OFF)
+option(SF_XBOX_LTCG "Use link-time code generation for Xbox Release builds" ON)
 option(SF_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(SF_PARALLEL_COMPILE "Compile independent sources in parallel" ON)
 set(SF_PSYCROSS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/PsyCross" CACHE PATH
@@ -24,8 +33,26 @@ option(SF_BUILD_ROM_PROBES "Build supported-ROM diagnostic probes"
     ${_sf_rom_probes_default})
 unset(_sf_rom_probes_default)
 
+# The retail compatibility VM executes millions of small interpreter
+# operations per guest frame. Let MSVC inline across our static libraries in
+# the Xbox Release package; this is especially valuable for the VM's memory
+# and instruction-dispatch fast paths. It is intentionally UWP-only so the
+# normal desktop iteration loop remains fast.
+if(SF_XBOX_UWP AND MSVC AND SF_XBOX_LTCG)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(SfWarnings)
+if(SF_XBOX_UWP)
+    include(SfXboxDevMode)
+    sf_configure_xbox_devmode_dependencies()
+    add_compile_definitions(
+        SF_XBOX_UWP=1
+        __WINRT__=1
+        WINAPI_FAMILY=WINAPI_FAMILY_APP
+        NOMINMAX)
+endif()
 
 add_library(sf_core
     src/core/file_io.cpp
@@ -95,6 +122,15 @@ target_include_directories(sf_platform_input PUBLIC include)
 target_compile_features(sf_platform_input PUBLIC cxx_std_20)
 sf_set_project_warnings(sf_platform_input)
 
+add_library(sf_xbox_content
+    src/platform/xbox_game_image.cpp
+)
+add_library(sf::xbox_content ALIAS sf_xbox_content)
+target_include_directories(sf_xbox_content PUBLIC include)
+target_compile_features(sf_xbox_content PUBLIC cxx_std_20)
+target_link_libraries(sf_xbox_content PUBLIC sf::core sf::disc)
+sf_set_project_warnings(sf_xbox_content)
+
 add_library(sf_game
     src/game/actor_animation.cpp
     src/game/campaign.cpp
@@ -134,12 +170,14 @@ if(MSVC)
 endif()
 sf_set_project_warnings(sf_game)
 
-add_executable(sf_tool
-    apps/sf_tool/main.cpp
-    apps/sf_tool/ui_export.cpp
-)
-target_link_libraries(sf_tool PRIVATE sf::game)
-sf_set_project_warnings(sf_tool)
+if(NOT SF_XBOX_UWP)
+    add_executable(sf_tool
+        apps/sf_tool/main.cpp
+        apps/sf_tool/ui_export.cpp
+    )
+    target_link_libraries(sf_tool PRIVATE sf::game)
+    sf_set_project_warnings(sf_tool)
+endif()
 
 include(SfRomProbes)
 
@@ -148,10 +186,15 @@ if(SF_ENABLE_PSYCROSS)
         message(FATAL_ERROR "PsyCross was not found at SF_PSYCROSS_ROOT=${SF_PSYCROSS_ROOT}")
     endif()
 
-    find_package(SDL2 CONFIG REQUIRED)
-    find_package(OpenAL CONFIG REQUIRED)
-    find_package(OpenGL REQUIRED)
-    find_package(FFMPEG REQUIRED)
+    if(SF_XBOX_UWP)
+        set(FFMPEG_INCLUDE_DIRS "${SF_UWP_FFMPEG_INCLUDE_ROOT}")
+        set(FFMPEG_LIBRARIES sf_uwp_ffmpeg)
+    else()
+        find_package(SDL2 CONFIG REQUIRED)
+        find_package(OpenAL CONFIG REQUIRED)
+        find_package(OpenGL REQUIRED)
+        find_package(FFMPEG REQUIRED)
+    endif()
 
     # PsyCross links a plain `OpenAL` item. Make that name a real target so the
     # final executable receives vcpkg's correctly named OpenAL32 import library.
@@ -206,11 +249,29 @@ if(SF_ENABLE_PSYCROSS)
         PRIVATE sf::media psycross_static OpenAL::OpenAL OpenGL::GL SDL2::SDL2)
     sf_set_project_warnings(sf_psycross_backend)
 
-    add_executable(syphon_filter
-        apps/syphon_filter/launcher.cpp
-        apps/syphon_filter/main.cpp
-    )
-    if(WIN32)
+    if(SF_XBOX_UWP)
+        add_library(sf_xbox_launcher STATIC
+            apps/syphon_filter/launcher_xbox.cpp
+        )
+        target_include_directories(sf_xbox_launcher PRIVATE include)
+        target_compile_features(sf_xbox_launcher PRIVATE cxx_std_17)
+        target_link_libraries(sf_xbox_launcher PRIVATE SDL2::SDL2)
+        if(MSVC)
+            # The 19041 C++/WinRT headers use MSVC's C++17 coroutine surface.
+            target_compile_options(sf_xbox_launcher PRIVATE /await /permissive)
+        endif()
+
+        add_executable(syphon_filter WIN32
+            apps/syphon_filter/main.cpp
+            apps/syphon_filter/xbox_entry.cpp
+        )
+    else()
+        add_executable(syphon_filter
+            apps/syphon_filter/launcher.cpp
+            apps/syphon_filter/main.cpp
+        )
+    endif()
+    if(WIN32 AND NOT SF_XBOX_UWP)
         set(SF_LAUNCHER_ICON_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/syphon_filter.ico")
         set(SF_LAUNCHER_ICON_SOURCE
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/launcher/gabe_launcher_icon.png")
@@ -237,12 +298,16 @@ if(SF_ENABLE_PSYCROSS)
             "${CMAKE_CURRENT_BINARY_DIR}/syphon_filter.rc")
     endif()
     target_link_libraries(syphon_filter PRIVATE sf::psycross_backend)
+    if(SF_XBOX_UWP)
+        target_link_libraries(syphon_filter PRIVATE
+            sf_xbox_launcher sf::xbox_content SDL2::SDL2)
+    endif()
     add_custom_command(TARGET syphon_filter POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/locales"
             "$<TARGET_FILE_DIR:syphon_filter>/locales"
         VERBATIM)
-    if(WIN32)
+    if(WIN32 AND NOT SF_XBOX_UWP)
         target_link_libraries(syphon_filter PRIVATE user32 comdlg32 gdiplus)
         set(SF_DOSSIER_SCREEN_DIR
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/dossiers/screens")
@@ -268,11 +333,87 @@ if(SF_ENABLE_PSYCROSS)
                 "$<TARGET_FILE_DIR:syphon_filter>/assets/dossiers/screens"
             VERBATIM)
     endif()
+    if(SF_XBOX_UWP)
+        set(SF_UWP_PACKAGE_MANIFEST
+            "${CMAKE_CURRENT_SOURCE_DIR}/apps/syphon_filter/Package.appxmanifest")
+        set(SF_UWP_PACKAGE_ICON_SOURCE
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/launcher/syphon_filter_uwp_cover.jpg")
+        set(SF_UWP_PACKAGE_ASSET_DIRECTORY
+            "${CMAKE_CURRENT_BINARY_DIR}/uwp-assets")
+        set(SF_UWP_PACKAGE_ASSETS
+            "${SF_UWP_PACKAGE_ASSET_DIRECTORY}/StoreLogo.png"
+            "${SF_UWP_PACKAGE_ASSET_DIRECTORY}/Square44x44Logo.png"
+            "${SF_UWP_PACKAGE_ASSET_DIRECTORY}/Square150x150Logo.png"
+            "${SF_UWP_PACKAGE_ASSET_DIRECTORY}/SplashScreen.png")
+        execute_process(
+            COMMAND "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe"
+                -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_uwp_visual_assets.ps1"
+                -OutputDirectory "${SF_UWP_PACKAGE_ASSET_DIRECTORY}"
+                -SourcePath "${SF_UWP_PACKAGE_ICON_SOURCE}"
+            RESULT_VARIABLE SF_UWP_PACKAGE_ASSET_RESULT)
+        if(NOT SF_UWP_PACKAGE_ASSET_RESULT EQUAL 0)
+            message(FATAL_ERROR "Unable to generate UWP package visual assets")
+        endif()
+        set_source_files_properties(
+            "${SF_UWP_PACKAGE_MANIFEST}" PROPERTIES
+            VS_DEPLOYMENT_CONTENT TRUE
+            VS_DEPLOYMENT_LOCATION ".")
+        set_source_files_properties(
+            ${SF_UWP_PACKAGE_ASSETS} PROPERTIES
+            VS_COPY_TO_OUT_DIR Always
+            VS_DEPLOYMENT_CONTENT TRUE
+            VS_DEPLOYMENT_LOCATION "assets/launcher")
+        target_sources(syphon_filter PRIVATE
+            "${SF_UWP_PACKAGE_MANIFEST}"
+            ${SF_UWP_PACKAGE_ASSETS})
+        file(GLOB_RECURSE SF_UWP_LOCALE_FILES CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/*")
+        foreach(SF_UWP_LOCALE_FILE IN LISTS SF_UWP_LOCALE_FILES)
+            if(IS_DIRECTORY "${SF_UWP_LOCALE_FILE}")
+                continue()
+            endif()
+            file(RELATIVE_PATH SF_UWP_LOCALE_RELATIVE
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets/locales"
+                "${SF_UWP_LOCALE_FILE}")
+            get_filename_component(SF_UWP_LOCALE_DIRECTORY
+                "${SF_UWP_LOCALE_RELATIVE}" DIRECTORY)
+            if(SF_UWP_LOCALE_DIRECTORY)
+                set(SF_UWP_LOCALE_DEPLOYMENT_LOCATION
+                    "locales/${SF_UWP_LOCALE_DIRECTORY}")
+            else()
+                set(SF_UWP_LOCALE_DEPLOYMENT_LOCATION "locales")
+            endif()
+            set_source_files_properties("${SF_UWP_LOCALE_FILE}" PROPERTIES
+                VS_COPY_TO_OUT_DIR Always
+                VS_DEPLOYMENT_CONTENT TRUE
+                VS_DEPLOYMENT_LOCATION "${SF_UWP_LOCALE_DEPLOYMENT_LOCATION}")
+            target_sources(syphon_filter PRIVATE "${SF_UWP_LOCALE_FILE}")
+        endforeach()
+        foreach(SF_UWP_RUNTIME_FILE IN LISTS SF_UWP_RUNTIME_FILES)
+            if(NOT EXISTS "${SF_UWP_RUNTIME_FILE}")
+                message(FATAL_ERROR "Missing UWP runtime file: ${SF_UWP_RUNTIME_FILE}")
+            endif()
+            get_filename_component(SF_UWP_RUNTIME_NAME "${SF_UWP_RUNTIME_FILE}" NAME)
+            set_source_files_properties("${SF_UWP_RUNTIME_FILE}" PROPERTIES
+                VS_COPY_TO_OUT_DIR Always
+                VS_DEPLOYMENT_CONTENT TRUE
+                VS_DEPLOYMENT_LOCATION ".")
+            target_sources(syphon_filter PRIVATE "${SF_UWP_RUNTIME_FILE}")
+            add_custom_command(TARGET syphon_filter POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${SF_UWP_RUNTIME_FILE}"
+                    "$<TARGET_FILE_DIR:syphon_filter>/${SF_UWP_RUNTIME_NAME}"
+                VERBATIM)
+        endforeach()
+    endif()
     sf_set_project_warnings(syphon_filter)
 
-    add_executable(sf_movie_probe apps/sf_movie_probe/main.cpp)
-    target_link_libraries(sf_movie_probe PRIVATE sf::game sf::media)
-    sf_set_project_warnings(sf_movie_probe)
+    if(NOT SF_XBOX_UWP)
+        add_executable(sf_movie_probe apps/sf_movie_probe/main.cpp)
+        target_link_libraries(sf_movie_probe PRIVATE sf::game sf::media)
+        sf_set_project_warnings(sf_movie_probe)
+    endif()
 endif()
 
 include(SfTests)

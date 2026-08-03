@@ -57,9 +57,9 @@ private:
 
 class PsyCrossSceneViewer final {
 public:
-  PsyCrossSceneViewer(KeyboardMouseBindings input,
+  PsyCrossSceneViewer(GraphicsSettings &graphics, KeyboardMouseBindings input,
                       game::RetailCheatState &cheats) noexcept
-      : input_(input), cheats_(cheats) {}
+      : graphics_(graphics), input_(input), cheats_(cheats) {}
 
   [[nodiscard]] SceneViewerResult
   run(const game::MissionPackage &mission, PADRAW &pad,
@@ -69,6 +69,7 @@ public:
       std::unique_ptr<PsyCrossAudioOutput> preloaded_audio = {});
 
 private:
+  GraphicsSettings &graphics_;
   KeyboardMouseBindings input_;
   game::RetailCheatState &cheats_;
   game::PauseSettings pause_settings_;

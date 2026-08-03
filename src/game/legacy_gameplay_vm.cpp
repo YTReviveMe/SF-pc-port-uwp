@@ -6,6 +6,7 @@
 #include <bit>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numbers>
@@ -422,6 +423,8 @@ bool LegacyHostCallContext::writeBytes(
 LegacyGameplayVm::LegacyGameplayVm(const psx::Executable &executable,
                                    psx::CpuClockScale cpu_clock_scale)
     : machine_(runtime_, cpu_clock_scale),
+      ram_host_call_presence_(
+          (psx::R3000Runtime::ram_size / sizeof(std::uint32_t) + 63U) / 64U),
       ram_host_calls_(psx::R3000Runtime::ram_size / sizeof(std::uint32_t)),
       executable_initial_pc_(executable.header().initial_pc) {
   host_calls_.reserve(128U);
@@ -738,8 +741,10 @@ void LegacyGameplayVm::bindHostCall(std::uint32_t address,
     static_cast<void>(inserted);
     if (address >= 0x80000000U && address < 0x80200000U &&
         (address & 3U) == 0U) {
-      ram_host_calls_[(address - 0x80000000U) / sizeof(std::uint32_t)] =
-          &entry->second;
+      const auto index =
+          (address - 0x80000000U) / sizeof(std::uint32_t);
+      ram_host_calls_[index] = &entry->second;
+      ram_host_call_presence_[index / 64U] |= 1ULL << (index % 64U);
     }
   } else {
     static_cast<void>(unbindHostCall(address));
@@ -748,7 +753,12 @@ void LegacyGameplayVm::bindHostCall(std::uint32_t address,
 
 LegacyHostCall *LegacyGameplayVm::findHostCall(std::uint32_t address) noexcept {
   if (address >= 0x80000000U && address < 0x80200000U && (address & 3U) == 0U) {
-    return ram_host_calls_[(address - 0x80000000U) / sizeof(std::uint32_t)];
+    const auto index = (address - 0x80000000U) / sizeof(std::uint32_t);
+    if ((ram_host_call_presence_[index / 64U] &
+         (1ULL << (index % 64U))) == 0U) {
+      return nullptr;
+    }
+    return ram_host_calls_[index];
   }
   const auto entry = host_calls_.find(address);
   return entry == host_calls_.end() ? nullptr : &entry->second;
@@ -2106,12 +2116,15 @@ void LegacyGameplayVm::bindSyphonFilterUsaV11GameplayTextHooks(
 
 bool LegacyGameplayVm::unbindHostCall(std::uint32_t address) noexcept {
   if (address >= 0x80000000U && address < 0x80200000U && (address & 3U) == 0U) {
-    ram_host_calls_[(address - 0x80000000U) / sizeof(std::uint32_t)] = nullptr;
+    const auto index = (address - 0x80000000U) / sizeof(std::uint32_t);
+    ram_host_calls_[index] = nullptr;
+    ram_host_call_presence_[index / 64U] &= ~(1ULL << (index % 64U));
   }
   return host_calls_.erase(address) != 0U;
 }
 
 void LegacyGameplayVm::clearHostCalls() noexcept {
+  std::ranges::fill(ram_host_call_presence_, 0U);
   std::ranges::fill(ram_host_calls_, nullptr);
   host_calls_.clear();
   host_aim_ray_.reset();
@@ -6577,8 +6590,23 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
         host_boundary,
     };
   };
-  const auto service_clock_neutral_dma = [&]() {
-    return advance_guest_clock || machine_.completePendingDmaTransfers();
+  // Frame calls intentionally execute without advancing the emulated clock.
+  // A DMA transfer still has to complete for guest busy-waits to make progress,
+  // but testing all seven DMA channels after every instruction was a dominant
+  // cost in renderer-heavy frames. Poll at a small deterministic interval;
+  // explicit host boundaries still force an immediate completion.
+  constexpr auto clock_neutral_dma_poll_interval = 32U;
+  auto clock_neutral_dma_poll_count = 0U;
+  const auto service_clock_neutral_dma = [&](bool force = false) {
+    if (advance_guest_clock) {
+      return true;
+    }
+    if (!force && ++clock_neutral_dma_poll_count <
+                      clock_neutral_dma_poll_interval) {
+      return true;
+    }
+    clock_neutral_dma_poll_count = 0U;
+    return machine_.completePendingDmaTransfers();
   };
 
   for (std::uint64_t operation = 0; operation < execution_budget; ++operation) {
@@ -6643,7 +6671,7 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
           };
         }
         instructions += execution.instructions;
-        if (!service_clock_neutral_dma()) {
+        if (!service_clock_neutral_dma(true)) {
           return LegacyGameplayVmResult{
               {psx::R3000StopReason::memory_fault, instructions,
                runtime_.state().pc, 0U},
@@ -6658,7 +6686,7 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
       if (advance_guest_clock) {
         machine_.advanceTicks(1U);
       }
-      if (!service_clock_neutral_dma()) {
+      if (!service_clock_neutral_dma(true)) {
         return LegacyGameplayVmResult{
             {psx::R3000StopReason::memory_fault, instructions,
              runtime_.state().pc, 0U},
@@ -7054,8 +7082,14 @@ LegacyRetailOuterFrameResult LegacyGameplayVm::tickRetailOuterFrame(
     // array empty and strands dynamically spawned actors outside the event
     // loop.
     const std::array renderer_arguments{1U, gameplay_frame};
+    const auto renderer_started = std::chrono::steady_clock::now();
     result.renderer_tail = invokeFrameCall(
         profile.renderer_frame_entry, renderer_arguments, execution_budget);
+    const auto renderer_finished = std::chrono::steady_clock::now();
+    result.renderer_tail_milliseconds =
+        std::chrono::duration<double, std::milli>(renderer_finished -
+                                                  renderer_started)
+            .count();
     if (result.renderer_tail->completed() &&
         !runtime_.read32(profile.current_state, result.state_after)) {
       result.bridge_fault = true;

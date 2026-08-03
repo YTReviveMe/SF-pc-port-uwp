@@ -24,9 +24,9 @@
 
 #include "PsyX/PsyX_render.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(SF_XBOX_UWP)
 #include <pla.h>
-#endif // _WIN32
+#endif // _WIN32 && !SF_XBOX_UWP
 
 #ifdef __EMSCRIPTEN__
 int strcasecmp(const char* _l, const char* _r)
@@ -52,6 +52,36 @@ static Uint64 g_frameLimitBaseInterval = 0;
 static Uint64 g_frameLimitRemainder = 0;
 static Uint64 g_frameLimitRemainderAccumulator = 0;
 static Uint64 g_frameLimitNextCounter = 0;
+
+// Presentation timing is intentionally a very small moving average. It is
+// queried only by the optional in-game diagnostic overlay, but keeping it in
+// PsyCross lets the host distinguish scene construction from UWP GL present
+// stalls without adding a GPU readback or a synchronizing timer query.
+static double g_presentationSubmitMilliseconds = 0.0;
+static double g_presentationPresentMilliseconds = 0.0;
+static double g_presentationLimiterMilliseconds = 0.0;
+static int g_presentationTimingsReady = 0;
+
+static double PsyX_TicksToMilliseconds(Uint64 ticks)
+{
+	const Uint64 frequency = SDL_GetPerformanceFrequency();
+	if (frequency == 0)
+		return 0.0;
+	return (double)ticks * 1000.0 / (double)frequency;
+}
+
+static void PsyX_RecordPresentationTiming(double* average, double sample)
+{
+	if (!g_presentationTimingsReady)
+	{
+		*average = sample;
+		return;
+	}
+
+	// A short average catches a repeating hitch while avoiding a diagnostic
+	// value which changes every presentation frame.
+	*average += (sample - *average) * 0.125;
+}
 
 static Uint64 PsyX_NextFrameLimitInterval()
 {
@@ -497,7 +527,7 @@ typedef enum
 	SPEW_SUCCESS,
 } SpewType_t;
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(SF_XBOX_UWP)
 static unsigned short g_InitialColor = 0xFFFF;
 static unsigned short g_LastColor = 0xFFFF;
 static unsigned short g_BadColor = 0xFFFF;
@@ -613,7 +643,7 @@ void PrintMessageToOutput(SpewType_t spewtype, char const* pMsgFormat,
 	int len = 0;
 	vsprintf(&pTempBuffer[len], pMsgFormat, args);
 
-#ifdef WIN32
+#if defined(WIN32) && !defined(SF_XBOX_UWP)
 	Spew_ConDebugSpew(spewtype, pTempBuffer);
 #elif defined(__EMSCRIPTEN__)
 	if (spewtype == SPEW_INFO)
@@ -696,7 +726,7 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 	PsyX_Log_Initialise();
 	PsyX_GetWindowName(windowNameStr);
 
-#if defined(_WIN32) && defined(_DEBUG)
+#if defined(_WIN32) && defined(_DEBUG) && !defined(SF_XBOX_UWP)
 	if (AllocConsole())
 	{
 		freopen("CONOUT$", "w", stdout);
@@ -755,6 +785,19 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 void PsyX_GetScreenSize(int* screenWidth, int* screenHeight)
 {
 	SDL_GetWindowSize(g_window, screenWidth, screenHeight);
+}
+
+void PsyX_GetDrawableSize(int* drawableWidth, int* drawableHeight)
+{
+	if (drawableWidth == NULL || drawableHeight == NULL)
+		return;
+	if (g_window == NULL)
+	{
+		*drawableWidth = 0;
+		*drawableHeight = 0;
+		return;
+	}
+	SDL_GL_GetDrawableSize(g_window, drawableWidth, drawableHeight);
 }
 
 void PsyX_SetCursorPosition(int x, int y)
@@ -940,14 +983,29 @@ void PsyX_EndScene()
 	PGXP_ClearCache();
 #endif
 
+	const Uint64 submitStarted = SDL_GetPerformanceCounter();
 	GR_EndScene();
 
 	if (g_cfg_framebufferFeedback)
 		GR_StoreFrameBuffer(activeDispEnv.disp.x, activeDispEnv.disp.y,
 							activeDispEnv.disp.w, activeDispEnv.disp.h);
 
+	const Uint64 presentStarted = SDL_GetPerformanceCounter();
 	GR_SwapWindow();
+	const Uint64 limiterStarted = SDL_GetPerformanceCounter();
 	PsyX_PaceCompletedFrame();
+	const Uint64 frameCompleted = SDL_GetPerformanceCounter();
+
+	PsyX_RecordPresentationTiming(
+		&g_presentationSubmitMilliseconds,
+		PsyX_TicksToMilliseconds(presentStarted - submitStarted));
+	PsyX_RecordPresentationTiming(
+		&g_presentationPresentMilliseconds,
+		PsyX_TicksToMilliseconds(limiterStarted - presentStarted));
+	PsyX_RecordPresentationTiming(
+		&g_presentationLimiterMilliseconds,
+		PsyX_TicksToMilliseconds(frameCompleted - limiterStarted));
+	g_presentationTimingsReady = 1;
 }
 
 #if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
@@ -1110,6 +1168,18 @@ void PsyX_SetFrameLimit(int framesPerSecond)
 	g_frameLimitRemainder =
 		g_frameLimit > 0 ? g_frameLimitFrequency % (Uint64)g_frameLimit : 0;
 	PsyX_ResetFrameLimiter();
+}
+
+void PsyX_GetPresentationTimings(double* submitMilliseconds,
+								double* presentMilliseconds,
+								double* limiterMilliseconds)
+{
+	if (submitMilliseconds != NULL)
+		*submitMilliseconds = g_presentationSubmitMilliseconds;
+	if (presentMilliseconds != NULL)
+		*presentMilliseconds = g_presentationPresentMilliseconds;
+	if (limiterMilliseconds != NULL)
+		*limiterMilliseconds = g_presentationLimiterMilliseconds;
 }
 
 void PsyX_ResetFrameLimiter(void)

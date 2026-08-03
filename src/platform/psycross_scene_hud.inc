@@ -2100,28 +2100,6 @@ void drawGameplayHud(const HudTextureAtlas &textures,
   GR_EnableDepth(1);
 }
 
-void drawPresentationFrameMeter(const HudTextureAtlas &textures,
-                                std::string_view text) {
-  if (text.empty()) {
-    return;
-  }
-  GR_SetBlendMode(BM_NONE);
-  GR_EnableDepth(0);
-  GR_SetDepthState(0, 0);
-  constexpr auto top = 4;
-  constexpr auto right_margin = 4;
-  const auto width = game::originalHudTextWidth(text);
-  const auto left = screen_width - right_margin - width;
-  drawSolidRect(left - 2, top - 2, width + 4, 11, 0U, 0U, 0U);
-  drawOriginalHudTextSolid(textures, text, left, top, 255U);
-  // The regular HUD has already flushed its immediate PsyCross primitives.
-  // Submit this late diagnostic layer before EndScene instead of silently
-  // leaving its rectangle and glyphs in the next frame's command queue.
-  DrawSync(0);
-  GR_EnableDepth(1);
-  GR_SetDepthState(1, 1);
-}
-
 void drawMissionCompleteOverlay(const HudTextureAtlas &textures) {
   DrawSync(0);
   GR_SetBlendMode(BM_NONE);

@@ -270,6 +270,10 @@ struct LegacyRetailOuterFrameResult {
   std::vector<LegacyGameplayVmResult> guest_calls;
   LegacyRetailPlatformTailResult platform_tail;
   std::optional<LegacyGameplayVmResult> renderer_tail;
+  // The retail renderer is still interpreted because it produces room
+  // visibility data consumed by the next guest event pass. Keep its cost
+  // visible independently from the rest of the outer frame.
+  double renderer_tail_milliseconds{};
   std::uint32_t state_before{};
   std::uint32_t state_after{};
   bool bridge_fault{};
@@ -1234,6 +1238,10 @@ private:
   psx::R3000Runtime runtime_;
   psx::PsxMachine machine_;
   std::unordered_map<std::uint32_t, LegacyHostCall> host_calls_;
+  // The interpreter probes for a host boundary before every guest
+  // instruction. Most PCs are not boundaries; use this compact bitmap to
+  // reject those probes without touching the 4 MiB pointer table below.
+  std::vector<std::uint64_t> ram_host_call_presence_;
   std::vector<LegacyHostCall *> ram_host_calls_;
   std::shared_ptr<LegacyVirtualCd> virtual_cd_;
   std::uint32_t executable_initial_pc_{};

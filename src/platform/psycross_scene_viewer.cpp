@@ -26,7 +26,6 @@
 #include "sf/platform/optic_history.hpp"
 #include "sf/platform/player_camera_fade.hpp"
 #include "sf/platform/player_input.hpp"
-#include "sf/platform/presentation_frame_meter.hpp"
 #include "sf/platform/retail_depth_cue.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
 #include "sf/platform/stable_frame_vector.hpp"
@@ -48,6 +47,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <numbers>

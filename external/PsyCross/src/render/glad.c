@@ -53,9 +53,21 @@ static PFNWGLGETPROCADDRESSPROC_PRIVATE gladGetProcAddressPtr;
   #endif
 #endif
 
+#ifdef IS_UWP
+// The UWP SDK intentionally omits the WGL declarations, while the Mesa UWP
+// opengl32 import library still exposes this procedure for its SDL backend.
+extern PROC WINAPI wglGetProcAddress(LPCSTR name);
+#endif
+
 static
 int open_gl(void) {
-#ifndef IS_UWP
+#ifdef IS_UWP
+    // UWP cannot load opengl32.dll at runtime. The WorleyDL Mesa package is
+    // linked into the AppX instead, and its WGL entry point is available from
+    // the import library just like any other UWP dependency.
+    gladGetProcAddressPtr = (PFNWGLGETPROCADDRESSPROC_PRIVATE)wglGetProcAddress;
+    return gladGetProcAddressPtr != NULL;
+#else
     libGL = LoadLibraryW(L"opengl32.dll");
     if(libGL != NULL) {
         void (* tmp)(void);
@@ -127,7 +139,9 @@ void close_gl(void) {
 static
 void* get_proc(const char *namez) {
     void* result = NULL;
+#ifndef IS_UWP
     if(libGL == NULL) return NULL;
+#endif
 
 #if !defined(__APPLE__) && !defined(__HAIKU__)
     if(gladGetProcAddressPtr != NULL) {
@@ -136,7 +150,11 @@ void* get_proc(const char *namez) {
 #endif
     if(result == NULL) {
 #if defined(_WIN32) || defined(__CYGWIN__)
+#ifdef IS_UWP
+        return result;
+#else
         result = (void*)GetProcAddress((HMODULE) libGL, namez);
+#endif
 #else
         result = dlsym(libGL, namez);
 #endif
@@ -1933,4 +1951,3 @@ int gladLoadGLES2Loader(GLADloadproc load) {
 	load_GL_KHR_debug(load);
 	return GLVersion.major != 0 || GLVersion.minor != 0;
 }
-

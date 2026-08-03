@@ -28,6 +28,7 @@ const u_char*			g_sdlKeyboardState = NULL;
 
 u_short PsyX_Pad_UpdateKeyboardInput();
 void	PsyX_Pad_UpdateGameControllerInput(SDL_GameController* cont, LPPADRAW pad);
+void	PsyX_Pad_Event_ControllerAdded(Sint32 deviceId);
 
 // Initializes SDL controllers
 int PsyX_Pad_InitSystem()
@@ -37,6 +38,13 @@ int PsyX_Pad_InitSystem()
 		return 1;
 
 	memset(g_controllers, 0, sizeof(g_controllers));
+	for (int i = 0; i < MAX_CONTROLLERS; i++)
+	{
+		// A paired Xbox controller already exists before the UWP app starts,
+		// so it may never generate SDL_CONTROLLERDEVICEADDED.  Initialize the
+		// automatic slots first, then enumerate the current SDL device list.
+		g_controllers[i].deviceId = g_cfg_controllerToSlotMapping[i];
+	}
 
 	// init keyboard state
 	g_sdlKeyboardState = SDL_GetKeyboardState(NULL);
@@ -49,6 +57,15 @@ int PsyX_Pad_InitSystem()
 
 	// Add more controllers from custom file
 	SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");
+
+	// SDL only emits controller-added events for devices that arrive after
+	// initialization. Open the controllers that were present at startup too.
+	const int joystick_count = SDL_NumJoysticks();
+	for (int device_index = 0; device_index < joystick_count; device_index++)
+	{
+		if (SDL_IsGameController(device_index))
+			PsyX_Pad_Event_ControllerAdded(device_index);
+	}
 
 	return 1;
 }

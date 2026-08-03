@@ -12,6 +12,10 @@
 /*.obj
 /*.zip
 /*.zip.sha256
+*.appx
+*.msix
+*.msixbundle
+*.cer
 /syphon_filter_cheats
 /.psycross-gitlink-backup
 *.pdb

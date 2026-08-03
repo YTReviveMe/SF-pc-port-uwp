@@ -21,6 +21,7 @@ enum class PauseScreen {
   controller_bindings,
   brightness,
   screen_centering,
+  graphics,
   mission_select,
   weapons,
   parameters,
@@ -128,6 +129,29 @@ enum class ControllerAction : std::uint32_t {
   aim,
 };
 
+// Native display settings deliberately live alongside the retail pause
+// settings rather than in the guest's MENU.OVL state.  Platforms can opt in
+// through PauseMenuData::graphics_settings_available without changing the
+// original game menu on desktop builds.
+enum class PauseAspectRatio : std::uint8_t {
+  original_4_3,
+  adaptive,
+};
+
+struct PauseGraphicsSettings {
+  int render_width{1280};
+  int render_height{720};
+  int msaa_samples{4};
+  bool bilinear_filtering{true};
+  bool anisotropic_filtering{true};
+  PauseAspectRatio aspect_ratio{PauseAspectRatio::adaptive};
+  bool vsync{true};
+  std::uint32_t frame_limit{60U};
+
+  friend bool operator==(const PauseGraphicsSettings &,
+                         const PauseGraphicsSettings &) = default;
+};
+
 struct ControllerBinding {
   ControllerAction action{ControllerAction::change_weapon};
   std::uint32_t button{};
@@ -144,6 +168,7 @@ struct PauseSettings {
   bool invert_aim{};
   bool vibration{true};
   std::vector<ControllerBinding> bindings;
+  PauseGraphicsSettings graphics;
 
   friend bool operator==(const PauseSettings &,
                          const PauseSettings &) = default;
@@ -156,6 +181,7 @@ struct PauseMenuData {
   std::uint32_t current_mission{};
   std::uint32_t maximum_unlocked_mission{};
   RetailCheatState cheats;
+  bool graphics_settings_available{};
 };
 
 struct PauseMenuInput {
@@ -179,6 +205,13 @@ enum class PauseSetting : std::uint32_t {
   invert_aim,
   vibration,
   bindings,
+  graphics_render_resolution,
+  graphics_msaa,
+  graphics_bilinear_filtering,
+  graphics_anisotropic_filtering,
+  graphics_aspect_ratio,
+  graphics_vsync,
+  graphics_frame_limit,
 };
 
 enum class PauseCommandType {
@@ -350,6 +383,9 @@ public:
   completeControllerBinding(std::uint32_t button);
   void showControllerMissing();
   void resolveWeaponEquip(std::uint32_t id, bool accepted);
+  // Opens the platform-native display page from an Xbox controller shortcut.
+  // Returns false on platforms that did not opt in for this pause session.
+  [[nodiscard]] bool openGraphicsSettings();
   void unlockMissionSelect() noexcept { setMissionSelectUnlocked(true); }
   void setMissionSelectUnlocked(bool enabled) noexcept;
   void setRetailCheatEnabled(RetailCheat cheat, bool enabled) noexcept;
@@ -403,6 +439,7 @@ private:
   [[nodiscard]] PauseMenuCommand updateBindings(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand updateBrightness(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand updateCentering(const PauseMenuInput &input);
+  [[nodiscard]] PauseMenuCommand updateGraphics(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand
   updateMissionSelect(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand updateWeapons(const PauseMenuInput &input);
