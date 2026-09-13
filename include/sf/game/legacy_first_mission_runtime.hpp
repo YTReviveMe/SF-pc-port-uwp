@@ -15,6 +15,36 @@
 
 namespace sf::game {
 
+[[nodiscard]] constexpr LegacyInventoryBridgeState
+mergeRetryInventoryState(const LegacyInventoryBridgeState &restored,
+                         const CampaignCarryState &retry) noexcept {
+  auto result = restored;
+  result.owned_weapons =
+      (restored.owned_weapons & ~campaign_persistent_weapon_mask) |
+      (retry.owned_weapons & campaign_persistent_weapon_mask);
+  for (std::size_t weapon = 0U; weapon < weapon_slot_count; ++weapon) {
+    const auto bit = std::uint32_t{1U} << weapon;
+    if ((campaign_persistent_weapon_mask & bit) == 0U) {
+      continue;
+    }
+    result.magazines[weapon] = retry.magazines[weapon];
+    result.reserves[weapon] = retry.reserves[weapon];
+  }
+  const auto restored_current =
+      static_cast<std::size_t>(restored.current_weapon);
+  const auto restored_current_bit = restored_current < weapon_slot_count
+                                        ? std::uint32_t{1U} << restored_current
+                                        : std::uint32_t{};
+  const auto preserve_mission_local_current =
+      restored_current_bit != 0U &&
+      (restored_current_bit & campaign_persistent_weapon_mask) == 0U &&
+      (result.owned_weapons & restored_current_bit) != 0U;
+  if (!preserve_mission_local_current) {
+    result.current_weapon = retry.current_weapon;
+  }
+  return result;
+}
+
 enum class LegacyRuntimeFaultReason {
   none,
   execution,
@@ -62,6 +92,14 @@ legacyManualAimTransitionButtons(std::uint16_t current_buttons,
   return manual_aim_active
              ? static_cast<std::uint16_t>(combined & ~target_lock_button)
              : combined;
+}
+
+// Once a grenade click is queued it must survive the retail readiness window,
+// even if L1/R1 is released before the next 20 Hz guest update.
+[[nodiscard]] constexpr bool
+legacyGrenadeThrowQueueAvailable(bool grenade_weapon,
+                                 bool projectile_in_flight) noexcept {
+  return grenade_weapon && !projectile_in_flight;
 }
 
 // FUN_80017844's 0x80115cca byte marks the beginning of the failure fade.
@@ -130,12 +168,10 @@ struct LegacyMissionTransitionDecision {
 };
 
 [[nodiscard]] constexpr LegacyMissionTransitionDecision
-classifyLegacyMissionTransition(std::uint32_t mission_index,
-                                std::uint32_t state_before,
-                                std::uint32_t state_after,
-                                const LegacyMissionBridgeState &mission,
-                                bool movie_loader_pending,
-                                std::size_t scripted_movie_count = 0U) noexcept {
+classifyLegacyMissionTransition(
+    std::uint32_t mission_index, std::uint32_t state_before,
+    std::uint32_t state_after, const LegacyMissionBridgeState &mission,
+    bool movie_loader_pending, std::size_t scripted_movie_count = 0U) noexcept {
   LegacyMissionTransitionDecision result;
   result.movie_loader_pending = movie_loader_pending;
   const auto gameplay_state = state_after == 0U || state_after == 5U;
@@ -149,8 +185,7 @@ classifyLegacyMissionTransition(std::uint32_t mission_index,
     // mid-mission INTRO and the final source-30 MOVIE handoff. Objective
     // bit 3 is set only after the upper subway bomb has been tagged, which
     // is the overlay's exact prerequisite for the latter path.
-    if (mission_index == 0U &&
-        (mission.completed_objectives & 0x08U) != 0U) {
+    if (mission_index == 0U && (mission.completed_objectives & 0x08U) != 0U) {
       result.request_ending_movie = true;
       result.finished = true;
     } else {
@@ -195,9 +230,12 @@ classifyLegacyMissionTransition(std::uint32_t mission_index,
 // camera presentation never rewrites the guest collision/root transform.
 class LegacyFirstMissionRuntime final {
 public:
-  explicit LegacyFirstMissionRuntime(const LegacyMissionImage &image) noexcept;
+  explicit LegacyFirstMissionRuntime(
+      const LegacyMissionImage &image,
+      bool initial_agent_difficulty = false) noexcept;
   LegacyFirstMissionRuntime(const MissionDefinition &mission,
-                            const LegacyMissionImage &image) noexcept;
+                            const LegacyMissionImage &image,
+                            bool initial_agent_difficulty = false) noexcept;
 
   LegacyFirstMissionRuntime(const LegacyFirstMissionRuntime &) = delete;
   LegacyFirstMissionRuntime &
@@ -250,22 +288,31 @@ public:
   [[nodiscard]] bool
   applyHostAimLocomotion(const LegacyHostPlayerLocomotion &state) noexcept;
   void setHostAimRay(std::optional<LegacyHostAimRay> ray) noexcept;
+  void
+  setPark2FlameLineOfSight(std::optional<bool> line_of_sight_clear) noexcept;
   [[nodiscard]] bool restoreHostPlayerHeading(std::int32_t yaw) noexcept;
   [[nodiscard]] std::uint64_t hostAimRayPatchCount() const noexcept;
+  [[nodiscard]] LegacyPadMotorState padMotorState() const noexcept;
+  [[nodiscard]] bool setRetailVibrationEnabled(bool enabled) noexcept;
   [[nodiscard]] bool applyHostWeaponMenuInput(bool held,
                                               std::int32_t delta) noexcept;
   [[nodiscard]] bool applyHostFirstPersonAim(bool active) noexcept;
   [[nodiscard]] bool activateRetailAllWeaponsCheat() noexcept;
   [[nodiscard]] bool setRetailAllWeaponsCheat(bool enabled) noexcept;
   [[nodiscard]] bool setRetailHardMode(bool enabled) noexcept;
+  [[nodiscard]] bool setAgentDifficulty(bool enabled) noexcept;
+  [[nodiscard]] bool agentHeadshotThreatActive() const noexcept;
+  [[nodiscard]] std::optional<std::uint8_t>
+  agentPark2BombDetonationPercent() const noexcept;
   [[nodiscard]] bool setRetailOneShotKills(bool enabled) noexcept;
   [[nodiscard]] bool setRetailWeakEnemies(bool enabled) noexcept;
   [[nodiscard]] bool activateRetailMovieTheaterCheat() noexcept;
   [[nodiscard]] bool
   applyCampaignCarryState(const CampaignCarryState &state) noexcept;
+  [[nodiscard]] bool
+  applyRetryInventoryState(const CampaignCarryState &state) noexcept;
   [[nodiscard]] bool consumeCheckpointCommit() noexcept;
-  [[nodiscard]] std::optional<std::size_t>
-  consumeIntroMovieRequest() noexcept;
+  [[nodiscard]] std::optional<std::size_t> consumeIntroMovieRequest() noexcept;
   [[nodiscard]] bool consumeEndingMovieRequest() noexcept;
   [[nodiscard]] bool consumeFailureRestartRequest() noexcept;
   [[nodiscard]] bool captureCheckpoint() noexcept;
@@ -337,6 +384,10 @@ private:
   [[nodiscard]] bool applyRetailAudioVolumes() noexcept;
   [[nodiscard]] bool
   maintainRetailCheats(const LegacyMissionBridgeState &mission) noexcept;
+  [[nodiscard]] bool maintainAgentMissionNpcOverrides() noexcept;
+  [[nodiscard]] bool maintainAgentMissionTimers() noexcept;
+  void resetAgentPark2BombDetonation() noexcept;
+  [[nodiscard]] bool updateAgentPark2BombDetonation() noexcept;
   [[nodiscard]] std::vector<LegacyPresentationCommandType>
   pendingPresentationCommands() const;
   void markFault(LegacyRuntimeFaultReason reason =
@@ -349,6 +400,7 @@ private:
   std::optional<RuntimeCheckpoint> checkpoint_;
   std::shared_ptr<const LegacyPresentationFrame> presentation_frame_;
   LegacyHostPadState host_pad_state_;
+  std::optional<bool> pending_park2_flame_line_of_sight_clear_;
   std::uint16_t latched_pad_buttons_{};
   std::uint64_t guest_frame_{};
   std::uint64_t presentation_sequence_{};
@@ -360,6 +412,8 @@ private:
   std::optional<LegacyRetailAudioVolumes> retail_audio_volumes_;
   std::optional<LegacyInventoryBridgeState> retail_infinite_ammo_;
   bool retail_weak_enemies_{};
+  bool agent_difficulty_{};
+  std::uint8_t agent_park2_bomb_detonation_percent_{};
   bool checkpoint_commit_pending_{};
   std::uint8_t transition_requests_{};
   std::uint8_t issued_transitions_{};

@@ -11,6 +11,8 @@
 namespace sf::game {
 
 inline constexpr std::size_t maximum_dynamic_lights = 32U;
+inline constexpr std::size_t maximum_baked_world_dynamic_lights = 12U;
+inline constexpr std::size_t maximum_flamethrower_dynamic_light_samples = 5U;
 
 struct DynamicLightPoint {
   double x{};
@@ -31,6 +33,23 @@ struct DynamicLightRgb {
   operator==(const DynamicLightRgb &,
              const DynamicLightRgb &) noexcept = default;
 };
+
+// Neutral renderer-independent appearance authored by the same visual source
+// as a glow or particle. Missing colour keeps the kind profile; unit scales
+// keep its radius/intensity. Malformed descriptors are ignored as a whole so
+// presentation metadata cannot poison or silently remove gameplay lighting.
+struct DynamicLightAppearance {
+  std::optional<DynamicLightRgb> color;
+  double radius_scale{1.0};
+  double intensity_scale{1.0};
+
+  [[nodiscard]] friend constexpr bool
+  operator==(const DynamicLightAppearance &,
+             const DynamicLightAppearance &) noexcept = default;
+};
+
+[[nodiscard]] bool
+validDynamicLightAppearance(const DynamicLightAppearance &appearance) noexcept;
 
 enum class DynamicLightKind : std::uint8_t {
   street_lamp,
@@ -53,6 +72,7 @@ struct PersistentDynamicLightState {
   bool active{};
   bool resident{};
   bool destroyed{};
+  DynamicLightAppearance appearance;
 };
 
 // Attached effects must be resolved to their exact interpolated world anchor
@@ -66,7 +86,37 @@ struct TransientDynamicLightState {
   std::uint16_t remaining_updates{};
   std::uint16_t total_updates{};
   bool position_confirmed{};
+  DynamicLightAppearance appearance;
 };
+
+// The PARK2 overlay supplies the exact world-space ends of every drawable
+// flamethrower ribbon. Keep the renderer-facing conversion independent of the
+// ribbon packet format so lighting can follow that retail trajectory without
+// reconstructing or extending it.
+struct FlamethrowerLightSegment {
+  DynamicLightPoint first;
+  DynamicLightPoint second;
+  std::uint32_t source_id{};
+};
+
+struct FlamethrowerDynamicLightSamples {
+  std::array<TransientDynamicLightState,
+             maximum_flamethrower_dynamic_light_samples>
+      lights{};
+  std::size_t count{};
+
+  [[nodiscard]] constexpr std::span<const TransientDynamicLightState>
+  active() const noexcept {
+    return std::span<const TransientDynamicLightState>{lights}.first(count);
+  }
+};
+
+// Produces a small, evenly distributed set of warm transient lights along the
+// actual drawable ribbon chain. Invalid/zero-length segments fail closed and
+// the dedicated cap prevents the stream from consuming the scene-light frame.
+[[nodiscard]] FlamethrowerDynamicLightSamples
+flamethrowerDynamicLightSamples(
+    std::span<const FlamethrowerLightSegment> segments) noexcept;
 
 struct DynamicLight {
   DynamicLightKind kind{DynamicLightKind::street_lamp};
@@ -110,13 +160,14 @@ struct DynamicLightFrame {
     std::span<const DirectionalDynamicLightState> directional = {},
     std::uint64_t animation_tick = 0U) noexcept;
 
-// Static level geometry already contains the retail lamp/fire contribution in
-// its authored vertex colours. Reapplying reconstructed persistent sources
-// washes out lamp-off rooms and other intentionally dark sections. Keep only
-// genuinely dynamic events and the player flashlight for that baked pass;
-// actors and movable props continue to use the complete frame.
+// Static level geometry keeps its authored vertex colours as the base. Add a
+// small camera-local set of confirmed emissive sources on top: short-lived
+// events and functional rays have priority, followed by the nearest resident
+// lamps and fires. The tighter cap prevents distant emitters from washing out
+// intentionally dark rooms.
 [[nodiscard]] DynamicLightFrame
-dynamicLightFrameForBakedWorld(const DynamicLightFrame &frame) noexcept;
+dynamicLightFrameForBakedWorld(const DynamicLightFrame &frame,
+                               DynamicLightPoint observer) noexcept;
 
 struct DynamicLightModulation {
   double red{};
@@ -209,6 +260,16 @@ struct RetailVertexLightState {
   std::uint32_t channel_mask{0x00ffffffU};
 };
 
+struct PreparedRetailVertexLight {
+  RetailVertexLightState state;
+  std::array<std::int16_t, 9U> view_rotation{};
+  std::array<std::int32_t, 3U> inverse_translation{};
+};
+
+// Precomputes the GsSetView2 matrix work shared by every illuminated vertex.
+[[nodiscard]] std::optional<PreparedRetailVertexLight>
+prepareRetailVertexLight(const RetailVertexLightState &light) noexcept;
+
 struct RetailVertexLightRay {
   DynamicLightPoint origin;
   DynamicLightPoint direction;
@@ -230,10 +291,19 @@ retailVertexLightRay(const RetailVertexLightState &light) noexcept;
 [[nodiscard]] std::uint32_t applyRetailVertexLightingPacked(
     std::uint32_t packed_color, std::span<const RetailVertexLightState> lights,
     DynamicLightPoint world_point, std::int32_t projection) noexcept;
+[[nodiscard]] std::uint32_t applyRetailVertexLightingPacked(
+    std::uint32_t packed_color,
+    std::span<const PreparedRetailVertexLight> lights,
+    DynamicLightPoint world_point, std::int32_t projection) noexcept;
 
 [[nodiscard]] DynamicLightVertexColor
 applyRetailVertexLighting(DynamicLightVertexColor base,
                           std::span<const RetailVertexLightState> lights,
+                          DynamicLightPoint world_point,
+                          std::int32_t projection) noexcept;
+[[nodiscard]] DynamicLightVertexColor
+applyRetailVertexLighting(DynamicLightVertexColor base,
+                          std::span<const PreparedRetailVertexLight> lights,
                           DynamicLightPoint world_point,
                           std::int32_t projection) noexcept;
 

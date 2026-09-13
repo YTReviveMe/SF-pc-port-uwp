@@ -125,6 +125,50 @@ EmdPolygon parsePolygon(std::span<const std::byte> bytes, std::size_t offset) {
   return polygon;
 }
 
+bool samePresentationPolygon(const EmdSection &section,
+                             const EmdPolygon &first,
+                             const EmdPolygon &second) noexcept {
+  if (first.quad != second.quad ||
+      first.clut != second.clut ||
+      first.texture_page != second.texture_page) {
+    return false;
+  }
+  const auto corners = first.quad ? std::size_t{4U} : std::size_t{3U};
+  for (auto corner = std::size_t{}; corner < corners; ++corner) {
+    const auto &first_vertex = section.vertices[first.vertex_indices[corner]];
+    const auto &second_vertex =
+        section.vertices[second.vertex_indices[corner]];
+    if (first_vertex.x != second_vertex.x ||
+        first_vertex.y != second_vertex.y ||
+        first_vertex.z != second_vertex.z ||
+        first_vertex.color != second_vertex.color ||
+        first.uv[corner].u != second.uv[corner].u ||
+        first.uv[corner].v != second.uv[corner].v) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void suppressExactPresentationDuplicates(EmdSection &section) noexcept {
+  for (auto index = std::size_t{1U}; index < section.polygons.size(); ++index) {
+    auto &polygon = section.polygons[index];
+    if (!polygon.renderable || polygon.degenerate) {
+      continue;
+    }
+    const auto duplicate = std::ranges::find_if(
+        section.polygons.begin(), section.polygons.begin() + index,
+        [&section, &polygon](const EmdPolygon &candidate) {
+          return candidate.renderable && !candidate.degenerate &&
+                 samePresentationPolygon(section, candidate, polygon);
+        });
+    if (duplicate != section.polygons.begin() + index) {
+      polygon.renderable = false;
+      polygon.duplicate = true;
+    }
+  }
+}
+
 EmdSection parseSection(std::span<const std::byte> bytes,
                         std::size_t section_offset, std::size_t section_end) {
   if (section_offset > section_end || section_end > bytes.size() ||
@@ -200,6 +244,7 @@ EmdSection parseSection(std::span<const std::byte> bytes,
         section.vertices[polygon.vertex_indices[1]],
         section.vertices[polygon.vertex_indices[2]]);
   }
+  suppressExactPresentationDuplicates(section);
   return section;
 }
 

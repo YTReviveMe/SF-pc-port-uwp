@@ -5,6 +5,709 @@ isSvdThermalSubject(const RenderPresentationSnapshot &presentation,
          authored_actor;
 }
 
+inline constexpr std::uint32_t retail_keycard_pickup_class = 0x63U;
+
+[[nodiscard]] bool
+retailKeycardPickupObject(const game::SceneObject &object,
+                          std::string_view model_name) noexcept {
+  return object.class_id == retail_keycard_pickup_class &&
+         model_name == "KEYCARD.GMD";
+}
+
+[[nodiscard]] bool legacyGuestSlotHasLiveAuthoredFire(
+    std::span<const game::LegacyExplParticle> particles,
+    std::int32_t guest_slot) noexcept {
+  return std::ranges::any_of(
+      particles, [&](const game::LegacyExplParticle &particle) {
+        return game::legacyExplParticlePresentsAuthoredFire(particle.family) &&
+               game::legacyExplParticleOwnedByGuestSlot(particle.source_slot,
+                                                        guest_slot);
+      });
+}
+
+[[nodiscard]] const game::ObjectFireEmitter *legacyDistantAuthoredFireEmitter(
+    const game::GameplaySession &gameplay,
+    std::size_t object_index) noexcept {
+  if (!gameplay.legacyEffectParticlesAuthoritative() ||
+      object_index >= gameplay.objects().size() ||
+      object_index > std::numeric_limits<std::uint16_t>::max()) {
+    return {};
+  }
+
+  const auto scene_index = static_cast<std::uint16_t>(object_index);
+  const auto &object = gameplay.objects()[object_index];
+  if (object.model >= gameplay.objectModels().size() ||
+      gameplay.objectDestroyed(scene_index)) {
+    return {};
+  }
+  const auto *fire = std::get_if<game::ObjectFireEmitter>(
+      &gameplay.objectModels()[object.model].geometry);
+  if (fire == nullptr) {
+    return {};
+  }
+
+  const auto authored_rooms = gameplay.authoredObjectRooms(scene_index);
+  const auto authored_owner_presented = std::ranges::any_of(
+      authored_rooms, [&](const auto room) {
+        return std::ranges::find(gameplay.presentationModels(), room) !=
+               gameplay.presentationModels().end();
+      });
+  const auto scene_active =
+      std::ranges::find(gameplay.activeObjects(), scene_index) !=
+      gameplay.activeObjects().end();
+  const auto guest_slots = gameplay.legacyGuestSlotsBySceneObject();
+  const auto guest_slot =
+      object_index < guest_slots.size() ? guest_slots[object_index] : -1;
+  const auto has_live_owned_particle = legacyGuestSlotHasLiveAuthoredFire(
+      gameplay.legacyExplParticles(), guest_slot);
+  if (!game::legacyDistantFireEmitterAllowed(
+          gameplay.legacyEffectParticlesAuthoritative(),
+          scene_active, authored_owner_presented,
+          guest_slot, has_live_owned_particle)) {
+    return nullptr;
+  }
+  return fire;
+}
+
+bool objectUsesEmbeddedWorldGeometry(std::uint32_t mission,
+                                     std::uint32_t class_id,
+                                     std::string_view name) noexcept {
+  const auto bunker_helper = mission == 8U && class_id == 0x64U &&
+                             (name == "MSHELL.GMD" || name == "WESSL.GMD");
+  const auto exterior_tank_helper = (mission == 7U || mission == 10U) &&
+                                    class_id == 0x67U && name == "GHOST.GMD";
+  return bunker_helper || exterior_tank_helper;
+}
+
+constexpr std::size_t maximum_world_object_shadow_casters = 12U;
+constexpr std::size_t maximum_world_terrain_shadow_casters = 4U;
+constexpr std::size_t maximum_world_object_shadow_triangles = 3072U;
+constexpr std::size_t maximum_world_object_shadow_triangles_per_caster =
+    1024U;
+constexpr double maximum_world_object_shadow_distance = 6144.0;
+constexpr double maximum_world_object_shadow_radius = 2048.0;
+constexpr double maximum_world_terrain_shadow_radius = 1024.0;
+constexpr double object_shadow_pgxp_unit = 128.0;
+
+[[nodiscard]] bool
+volumetricObjectShadowBounds(const assets::EmdBounds &bounds,
+                             double minimum_absolute_extent,
+                             double minimum_relative_extent) noexcept {
+  const std::array extents{
+      static_cast<double>(bounds.maximum_x) - bounds.minimum_x,
+      static_cast<double>(bounds.maximum_y) - bounds.minimum_y,
+      static_cast<double>(bounds.maximum_z) - bounds.minimum_z,
+  };
+  if (!std::ranges::all_of(extents, [](double extent) {
+        return std::isfinite(extent) && extent > 0.0;
+      })) {
+    return false;
+  }
+  const auto [minimum, maximum] = std::ranges::minmax_element(extents);
+  return *minimum >= std::max(minimum_absolute_extent,
+                              *maximum * minimum_relative_extent);
+}
+
+[[nodiscard]] std::optional<assets::EmdBounds>
+worldObjectShadowLocalBounds(const game::ObjectModel &object_model) noexcept {
+  if (object_model.bounds) {
+    return object_model.bounds;
+  }
+  if (const auto *gmd =
+          std::get_if<assets::GmdModel>(&object_model.geometry)) {
+    return gmd->bounds();
+  }
+  const auto *emd = std::get_if<assets::EmdScene>(&object_model.geometry);
+  if (emd == nullptr || emd->sections().empty()) {
+    return std::nullopt;
+  }
+  auto result = emd->sections().front().bounds;
+  for (const auto &section : emd->sections()) {
+    result.minimum_x = std::min(result.minimum_x, section.bounds.minimum_x);
+    result.minimum_y = std::min(result.minimum_y, section.bounds.minimum_y);
+    result.minimum_z = std::min(result.minimum_z, section.bounds.minimum_z);
+    result.maximum_x = std::max(result.maximum_x, section.bounds.maximum_x);
+    result.maximum_y = std::max(result.maximum_y, section.bounds.maximum_y);
+    result.maximum_z = std::max(result.maximum_z, section.bounds.maximum_z);
+  }
+  return result;
+}
+
+[[nodiscard]] std::optional<WorldObjectShadowBounds>
+transformedWorldObjectShadowBounds(
+    const assets::EmdBounds &bounds,
+    const assets::MissionTransform &transform) noexcept {
+  auto minimum = Vector3{std::numeric_limits<double>::max(),
+                         std::numeric_limits<double>::max(),
+                         std::numeric_limits<double>::max()};
+  auto maximum = Vector3{std::numeric_limits<double>::lowest(),
+                         std::numeric_limits<double>::lowest(),
+                         std::numeric_limits<double>::lowest()};
+  constexpr std::array<bool, 2U> sides{false, true};
+  for (const auto high_x : sides) {
+    for (const auto high_y : sides) {
+      for (const auto high_z : sides) {
+        const auto point = transformPoint(
+            high_x ? bounds.maximum_x : bounds.minimum_x,
+            high_y ? bounds.maximum_y : bounds.minimum_y,
+            high_z ? bounds.maximum_z : bounds.minimum_z, transform);
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+            !std::isfinite(point.z)) {
+          return std::nullopt;
+        }
+        minimum.x = std::min(minimum.x, point.x);
+        minimum.y = std::min(minimum.y, point.y);
+        minimum.z = std::min(minimum.z, point.z);
+        maximum.x = std::max(maximum.x, point.x);
+        maximum.y = std::max(maximum.y, point.y);
+        maximum.z = std::max(maximum.z, point.z);
+      }
+    }
+  }
+  const auto center = Vector3{(minimum.x + maximum.x) * 0.5,
+                              (minimum.y + maximum.y) * 0.5,
+                              (minimum.z + maximum.z) * 0.5};
+  const auto extent_x = maximum.x - center.x;
+  const auto extent_y = maximum.y - center.y;
+  const auto extent_z = maximum.z - center.z;
+  const auto radius =
+      std::sqrt(extent_x * extent_x + extent_y * extent_y +
+                extent_z * extent_z);
+  if (!std::isfinite(radius) || radius <= 0.0) {
+    return std::nullopt;
+  }
+  return WorldObjectShadowBounds{center, radius};
+}
+
+[[nodiscard]] std::optional<WorldObjectShadowBounds>
+worldTerrainShadowBounds(const assets::EmdBounds &bounds) noexcept {
+  if (!volumetricObjectShadowBounds(bounds, 8.0, 0.02)) {
+    return std::nullopt;
+  }
+  const auto center = Vector3{
+      (static_cast<double>(bounds.minimum_x) + bounds.maximum_x) * 0.5,
+      (static_cast<double>(bounds.minimum_y) + bounds.maximum_y) * 0.5,
+      (static_cast<double>(bounds.minimum_z) + bounds.maximum_z) * 0.5};
+  const auto extent_x = static_cast<double>(bounds.maximum_x) - center.x;
+  const auto extent_y = static_cast<double>(bounds.maximum_y) - center.y;
+  const auto extent_z = static_cast<double>(bounds.maximum_z) - center.z;
+  const auto radius =
+      std::sqrt(extent_x * extent_x + extent_y * extent_y +
+                extent_z * extent_z);
+  if (!std::isfinite(radius) || radius <= 0.0) {
+    return std::nullopt;
+  }
+  return WorldObjectShadowBounds{center, radius};
+}
+
+[[nodiscard]] double
+worldObjectShadowMaximumReach(double radius) noexcept {
+  return std::clamp(radius * 4.0, 192.0, 1536.0);
+}
+
+[[nodiscard]] assets::EmdBounds
+expandedWorldShadowBounds(const assets::EmdBounds &bounds,
+                          double padding) noexcept {
+  const auto lower = [padding](std::int16_t value) {
+    return static_cast<std::int16_t>(std::clamp<long long>(
+        static_cast<long long>(std::floor(static_cast<double>(value) - padding)),
+        std::numeric_limits<std::int16_t>::min(),
+        std::numeric_limits<std::int16_t>::max()));
+  };
+  const auto upper = [padding](std::int16_t value) {
+    return static_cast<std::int16_t>(std::clamp<long long>(
+        static_cast<long long>(std::ceil(static_cast<double>(value) + padding)),
+        std::numeric_limits<std::int16_t>::min(),
+        std::numeric_limits<std::int16_t>::max()));
+  };
+  return assets::EmdBounds{lower(bounds.minimum_x), lower(bounds.minimum_y),
+                           lower(bounds.minimum_z), upper(bounds.maximum_x),
+                           upper(bounds.maximum_y), upper(bounds.maximum_z)};
+}
+
+[[nodiscard]] std::size_t
+worldObjectShadowTriangleCount(const game::ObjectGeometry &geometry) noexcept {
+  if (const auto *gmd = std::get_if<assets::GmdModel>(&geometry)) {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        gmd->triangles(), [&](const assets::GmdTriangle &triangle) {
+          return triangle.flags != 0U && !triangle.degenerate &&
+                 !triangle.semi_transparent &&
+                 std::ranges::all_of(triangle.vertex_indices,
+                                     [&](std::uint8_t index) {
+                                       return index < gmd->vertices().size();
+                                     });
+        }));
+  }
+  const auto *emd = std::get_if<assets::EmdScene>(&geometry);
+  if (emd == nullptr) {
+    return 0U;
+  }
+  auto result = std::size_t{};
+  for (const auto &section : emd->sections()) {
+    for (const auto &polygon : section.polygons) {
+      const auto corner_count = polygon.quad ? 4U : 3U;
+      if (!polygon.renderable || polygon.degenerate ||
+          !std::ranges::all_of(
+              std::span{polygon.vertex_indices}.first(corner_count),
+              [&](std::uint16_t index) {
+                return index < section.vertices.size();
+              })) {
+        continue;
+      }
+      result += polygon.quad ? 2U : 1U;
+    }
+  }
+  return result;
+}
+
+[[nodiscard]] std::size_t worldTerrainShadowTriangleCount(
+    const assets::EmdSection &section) noexcept {
+  auto result = std::size_t{};
+  for (const auto &polygon : section.polygons) {
+    const auto corner_count = polygon.quad ? 4U : 3U;
+    if (!polygon.renderable || polygon.degenerate ||
+        !std::ranges::all_of(
+            std::span{polygon.vertex_indices}.first(corner_count),
+            [&](std::uint16_t index) {
+              return index < section.vertices.size();
+            })) {
+      continue;
+    }
+    result += polygon.quad ? 2U : 1U;
+  }
+  return result;
+}
+
+void appendWorldObjectShadowGeometry(const game::ObjectGeometry &geometry,
+                                     const game::SceneObject &object,
+                                     std::vector<Vector3> &result) {
+  result.clear();
+  if (const auto *gmd = std::get_if<assets::GmdModel>(&geometry)) {
+    for (const auto &triangle : gmd->triangles()) {
+      if (triangle.flags == 0U || triangle.degenerate ||
+          triangle.semi_transparent ||
+          !std::ranges::all_of(triangle.vertex_indices,
+                               [&](std::uint8_t index) {
+                                 return index < gmd->vertices().size();
+                               })) {
+        continue;
+      }
+      for (const auto index : triangle.vertex_indices) {
+        const auto &vertex = gmd->vertices()[index];
+        result.push_back(transformPoint(vertex.x, vertex.y, vertex.z,
+                                        object.transform));
+      }
+    }
+    return;
+  }
+  const auto *emd = std::get_if<assets::EmdScene>(&geometry);
+  if (emd == nullptr) {
+    return;
+  }
+  constexpr std::array<std::size_t, 6U> quad_corners{0U, 1U, 2U,
+                                                     1U, 3U, 2U};
+  constexpr std::array<std::size_t, 3U> triangle_corners{0U, 1U, 2U};
+  for (const auto &section : emd->sections()) {
+    for (const auto &polygon : section.polygons) {
+      const auto corner_count = polygon.quad ? 4U : 3U;
+      if (!polygon.renderable || polygon.degenerate ||
+          !std::ranges::all_of(
+              std::span{polygon.vertex_indices}.first(corner_count),
+              [&](std::uint16_t index) {
+                return index < section.vertices.size();
+              })) {
+        continue;
+      }
+      const auto append_corner = [&](std::size_t corner) {
+        const auto &vertex =
+            section.vertices[polygon.vertex_indices[corner]];
+        result.push_back(transformPoint(vertex.x, vertex.y, vertex.z,
+                                        object.transform));
+      };
+      if (polygon.quad) {
+        for (const auto corner : quad_corners) {
+          append_corner(corner);
+        }
+      } else {
+        for (const auto corner : triangle_corners) {
+          append_corner(corner);
+        }
+      }
+    }
+  }
+}
+
+void appendWorldTerrainShadowGeometry(const assets::EmdSection &section,
+                                      std::vector<Vector3> &result) {
+  result.clear();
+  constexpr std::array<std::size_t, 6U> quad_corners{0U, 1U, 2U,
+                                                     1U, 3U, 2U};
+  constexpr std::array<std::size_t, 3U> triangle_corners{0U, 1U, 2U};
+  for (const auto &polygon : section.polygons) {
+    const auto corner_count = polygon.quad ? 4U : 3U;
+    if (!polygon.renderable || polygon.degenerate ||
+        !std::ranges::all_of(
+            std::span{polygon.vertex_indices}.first(corner_count),
+            [&](std::uint16_t index) {
+              return index < section.vertices.size();
+            })) {
+      continue;
+    }
+    const auto append_corner = [&](std::size_t corner) {
+      const auto &vertex = section.vertices[polygon.vertex_indices[corner]];
+      result.push_back(Vector3{static_cast<double>(vertex.x),
+                               static_cast<double>(vertex.y),
+                               static_cast<double>(vertex.z)});
+    };
+    if (polygon.quad) {
+      for (const auto corner : quad_corners) {
+        append_corner(corner);
+      }
+    } else {
+      for (const auto corner : triangle_corners) {
+        append_corner(corner);
+      }
+    }
+  }
+}
+
+void collectWorldObjectShadows(
+    const game::GameplaySession &gameplay,
+    const RenderPresentationSnapshot &presentation,
+    std::span<const game::PersistentDynamicLightState> persistent_lights,
+    const MATRIX &view,
+    PrimitiveBuffer &primitives) {
+  if (GR_ObjectShadowsAvailable() == 0) {
+    return;
+  }
+
+  auto &retained_keys = primitives.object_shadow_retained_keys;
+  const auto mission_changed =
+      primitives.object_shadow_retained_mission != gameplay.missionIndex();
+  const auto guest_frame_rolled_back =
+      primitives.object_shadow_retained_frame_valid &&
+      presentation.guest_frame < primitives.object_shadow_retained_guest_frame;
+  if (mission_changed || guest_frame_rolled_back) {
+    retained_keys.clear();
+  }
+  primitives.object_shadow_retained_mission = gameplay.missionIndex();
+  primitives.object_shadow_retained_guest_frame = presentation.guest_frame;
+  primitives.object_shadow_retained_frame_valid = true;
+  retained_keys.reserve(maximum_world_object_shadow_casters);
+
+  auto &candidates = primitives.object_shadow_candidates;
+  candidates.reserve(gameplay.activeObjects().size() + 64U);
+  const WorldSectionFrustum shadow_frustum{view,
+                                            presentation.camera.projection};
+  auto terrain_candidate_count = std::size_t{};
+  for (const auto model_index : gameplay.presentationModels()) {
+    if (model_index >= gameplay.models().size()) {
+      continue;
+    }
+    const auto &scene = gameplay.models()[model_index].scene;
+    for (auto section_index = std::size_t{};
+         section_index < scene.sections().size(); ++section_index) {
+      const auto &section = scene.sections()[section_index];
+      const auto bounds = worldTerrainShadowBounds(section.bounds);
+      if (!bounds ||
+          bounds->radius > maximum_world_terrain_shadow_radius) {
+        continue;
+      }
+      const auto delta_x = bounds->center.x - presentation.player.x;
+      const auto delta_y = bounds->center.y + presentation.player.y;
+      const auto delta_z = bounds->center.z - presentation.player.z;
+      const auto distance_squared =
+          delta_x * delta_x + delta_y * delta_y + delta_z * delta_z;
+      const auto resident_reach =
+          maximum_world_object_shadow_distance + bounds->radius;
+      if (!std::isfinite(distance_squared) ||
+          distance_squared > resident_reach * resident_reach) {
+        continue;
+      }
+      const auto directly_visible = !shadow_frustum.outside(section.bounds);
+      const auto expanded_bounds = expandedWorldShadowBounds(
+          section.bounds, worldObjectShadowMaximumReach(bounds->radius));
+      if (!directly_visible && shadow_frustum.outside(expanded_bounds)) {
+        continue;
+      }
+      candidates.push_back(WorldObjectShadowCandidate{
+          .object_index = std::numeric_limits<std::size_t>::max(),
+          .model = nullptr,
+          .terrain_section = &section,
+          .bounds = *bounds,
+          .player_distance_squared = distance_squared,
+          .directly_visible = directly_visible,
+          .stable_key = (std::uint64_t{1U} << 63U) |
+                        (static_cast<std::uint64_t>(model_index) << 32U) |
+                        static_cast<std::uint64_t>(section_index),
+      });
+      ++terrain_candidate_count;
+    }
+  }
+  for (const auto object_index : gameplay.activeObjects()) {
+    if (object_index >= gameplay.objects().size() ||
+        object_index >= presentation.objects.size()) {
+      continue;
+    }
+    const auto &source_object = gameplay.objects()[object_index];
+    const auto &object = presentation.objects[object_index];
+    const auto scanner_subject =
+        source_object.model < gameplay.objectModels().size() &&
+        source_object.destroyed_model &&
+        *source_object.destroyed_model < gameplay.objectModels().size() &&
+        game::legacyVirusScannerMarker(
+            gameplay.missionIndex(), source_object.class_id,
+            gameplay.objectModels()[source_object.model].name,
+            gameplay.objectModels()[*source_object.destroyed_model].name);
+    if (scanner_subject && !presentation.retail_virus_scanner_overlay) {
+      continue;
+    }
+    const auto *object_model = gameplay.displayedObjectModel(object_index);
+    if (object_model == nullptr ||
+        game::legacyAuthoredObjectPresentationHidden(
+            gameplay.missionIndex(),
+            object_index < gameplay.legacyGuestSlotsBySceneObject().size()
+                ? gameplay.legacyGuestSlotsBySceneObject()[object_index]
+                : -1,
+            source_object.source_index, source_object.definition_index,
+            source_object.class_id, object_model->name) ||
+        (object_model->visual_effect != game::ObjectVisualEffect::none &&
+         object_model->visual_effect !=
+             game::ObjectVisualEffect::lamp_fixture) ||
+        objectUsesEmbeddedWorldGeometry(gameplay.missionIndex(),
+                                        object.class_id,
+                                        object_model->name) ||
+        retailKeycardPickupObject(source_object, object_model->name)) {
+      continue;
+    }
+    const auto geometry_is_static_prop =
+        std::holds_alternative<assets::GmdModel>(object_model->geometry) ||
+        std::holds_alternative<assets::EmdScene>(object_model->geometry);
+    if (!geometry_is_static_prop) {
+      continue;
+    }
+    const auto local_bounds = worldObjectShadowLocalBounds(*object_model);
+    if (!local_bounds ||
+        !volumetricObjectShadowBounds(*local_bounds, 4.0, 0.01)) {
+      continue;
+    }
+    const auto bounds =
+        transformedWorldObjectShadowBounds(*local_bounds, object.transform);
+    if (!bounds || bounds->radius > maximum_world_object_shadow_radius) {
+      continue;
+    }
+    const auto delta_x = bounds->center.x - presentation.player.x;
+    const auto delta_y = bounds->center.y + presentation.player.y;
+    const auto delta_z = bounds->center.z - presentation.player.z;
+    const auto distance_squared =
+        delta_x * delta_x + delta_y * delta_y + delta_z * delta_z;
+    const auto resident_reach =
+        maximum_world_object_shadow_distance + bounds->radius;
+    if (!std::isfinite(distance_squared) ||
+        distance_squared > resident_reach * resident_reach) {
+      continue;
+    }
+    const auto directly_visible =
+        !shadow_frustum.outside(*local_bounds, object.transform);
+    const auto expanded_bounds = expandedWorldShadowBounds(
+        *local_bounds, worldObjectShadowMaximumReach(bounds->radius));
+    if (!directly_visible &&
+        shadow_frustum.outside(expanded_bounds, object.transform)) {
+      continue;
+    }
+    candidates.push_back(WorldObjectShadowCandidate{
+        .object_index = object_index,
+        .model = object_model,
+        .terrain_section = nullptr,
+        .bounds = *bounds,
+        .player_distance_squared = distance_squared,
+        .directly_visible = directly_visible,
+        .stable_key = static_cast<std::uint64_t>(object_index),
+    });
+  }
+  const auto was_retained = [&](std::uint64_t key) noexcept {
+    return std::ranges::find(retained_keys, key) != retained_keys.end();
+  };
+  const auto shadow_score = [&](const WorldObjectShadowCandidate &candidate) {
+    const auto normalized_distance =
+        candidate.player_distance_squared /
+        std::max(candidate.bounds.radius * candidate.bounds.radius, 1.0);
+    return normalized_distance *
+           (was_retained(candidate.stable_key) ? 0.8 : 1.0);
+  };
+  std::ranges::sort(candidates, [&](const auto &left, const auto &right) {
+    if (left.directly_visible != right.directly_visible) {
+      return left.directly_visible;
+    }
+    const auto left_is_terrain = left.terrain_section != nullptr;
+    const auto right_is_terrain = right.terrain_section != nullptr;
+    if (left_is_terrain != right_is_terrain) {
+      return !left_is_terrain;
+    }
+    const auto left_score = shadow_score(left);
+    const auto right_score = shadow_score(right);
+    if (left_score != right_score) {
+      return left_score < right_score;
+    }
+    return left.stable_key < right.stable_key;
+  });
+
+  const auto camera_basis = viewBasis(presentation.camera);
+  const auto dot = [](Vector3 first, Vector3 second) noexcept {
+    return first.x * second.x + first.y * second.y + first.z * second.z;
+  };
+  const auto camera_point = [&](Vector3 point) {
+    const auto delta = Vector3{point.x - presentation.camera.x,
+                               point.y - presentation.camera.y,
+                               point.z - presentation.camera.z};
+    return Vector3{dot(delta, camera_basis[0]) / object_shadow_pgxp_unit,
+                   dot(delta, camera_basis[1]) / object_shadow_pgxp_unit,
+                   dot(delta, camera_basis[2]) / object_shadow_pgxp_unit};
+  };
+  const auto camera_axis = [&](Vector3 axis) {
+    return Vector3{dot(axis, camera_basis[0]), dot(axis, camera_basis[1]),
+                   dot(axis, camera_basis[2])};
+  };
+
+  auto &world_vertices = primitives.object_shadow_world_vertices;
+  auto submitted_triangles = std::size_t{};
+  std::array<std::uint64_t, maximum_world_object_shadow_casters>
+      submitted_keys{};
+  auto submitted_key_count = std::size_t{};
+  auto submitted_terrain_casters = std::size_t{};
+  auto submitted_prop_casters = std::size_t{};
+  for (const auto &candidate : candidates) {
+    if (primitives.object_shadow_casters.size() >=
+        maximum_world_object_shadow_casters) {
+      break;
+    }
+    const auto terrain_section = candidate.terrain_section;
+    if (terrain_section != nullptr &&
+        submitted_terrain_casters >= maximum_world_terrain_shadow_casters) {
+      continue;
+    }
+    const auto triangle_count =
+        terrain_section != nullptr
+            ? worldTerrainShadowTriangleCount(*terrain_section)
+            : worldObjectShadowTriangleCount(candidate.model->geometry);
+    if (triangle_count == 0U ||
+        triangle_count > maximum_world_object_shadow_triangles_per_caster ||
+        triangle_count >
+            maximum_world_object_shadow_triangles - submitted_triangles) {
+      continue;
+    }
+    world_vertices.reserve(triangle_count * 3U);
+    if (terrain_section != nullptr) {
+      appendWorldTerrainShadowGeometry(*terrain_section, world_vertices);
+    } else {
+      const auto &object = presentation.objects[candidate.object_index];
+      appendWorldObjectShadowGeometry(candidate.model->geometry, object,
+                                      world_vertices);
+    }
+    if (world_vertices.size() != triangle_count * 3U) {
+      continue;
+    }
+
+    const auto anchor = game::DynamicLightPoint{candidate.bounds.center.x,
+                                                 candidate.bounds.center.y,
+                                                 candidate.bounds.center.z};
+    const auto caster_facts = sf::platform::WorldObjectShadowCasterFacts{
+        .anchor = anchor,
+        .bounding_radius = candidate.bounds.radius,
+        .triangle_count = triangle_count,
+        .resident = true,
+        .opaque_geometry = true,
+        .authoritative_transform = true,
+        .actor_shadow_owned = false,
+        .embedded_world_geometry = false,
+    };
+    const auto projection = sf::platform::selectWorldObjectShadowProjection(
+        persistent_lights, caster_facts, {0.0, 1.0, 0.0},
+        presentation.guest_frame);
+    const auto forward = normalize(Vector3{projection.ray_direction.x,
+                                           projection.ray_direction.y,
+                                           projection.ray_direction.z});
+    const auto reference = std::abs(forward.z) < 0.92
+                               ? Vector3{0.0, 0.0, 1.0}
+                               : Vector3{1.0, 0.0, 0.0};
+    const auto right = normalize(cross(reference, forward));
+    const auto up = normalize(cross(forward, right));
+    auto extent_x = 0.0;
+    auto extent_y = 0.0;
+    auto depth_extent = 0.0;
+    for (const auto &vertex : world_vertices) {
+      const auto delta = Vector3{vertex.x - candidate.bounds.center.x,
+                                 vertex.y - candidate.bounds.center.y,
+                                 vertex.z - candidate.bounds.center.z};
+      extent_x = std::max(extent_x, std::abs(dot(delta, right)));
+      extent_y = std::max(extent_y, std::abs(dot(delta, up)));
+      depth_extent =
+          std::max(depth_extent, std::abs(dot(delta, forward)));
+    }
+    const auto margin = std::max(candidate.bounds.radius * 0.06, 4.0);
+    extent_x = std::max(extent_x + margin, 8.0);
+    extent_y = std::max(extent_y + margin, 8.0);
+    depth_extent = std::max(depth_extent + margin, 8.0);
+    const auto maximum_reach =
+        std::clamp(candidate.bounds.radius * 4.0, 192.0, 1536.0);
+    const auto first_vertex =
+        static_cast<int>(primitives.object_shadow_vertices.size());
+    for (const auto &vertex : world_vertices) {
+      const auto camera = camera_point(vertex);
+      primitives.object_shadow_vertices.push_back(GrObjectShadowVertex{
+          static_cast<float>(camera.x), static_cast<float>(camera.y),
+          static_cast<float>(camera.z)});
+    }
+    const auto center = camera_point(candidate.bounds.center);
+    const auto camera_right = camera_axis(right);
+    const auto camera_up = camera_axis(up);
+    const auto camera_forward = camera_axis(forward);
+    primitives.object_shadow_casters.push_back(GrObjectShadowCaster{
+        .first_vertex = first_vertex,
+        .vertex_count = static_cast<int>(world_vertices.size()),
+        .center_x = static_cast<float>(center.x),
+        .center_y = static_cast<float>(center.y),
+        .center_z = static_cast<float>(center.z),
+        .right_x = static_cast<float>(camera_right.x),
+        .right_y = static_cast<float>(camera_right.y),
+        .right_z = static_cast<float>(camera_right.z),
+        .up_x = static_cast<float>(camera_up.x),
+        .up_y = static_cast<float>(camera_up.y),
+        .up_z = static_cast<float>(camera_up.z),
+        .forward_x = static_cast<float>(camera_forward.x),
+        .forward_y = static_cast<float>(camera_forward.y),
+        .forward_z = static_cast<float>(camera_forward.z),
+        .extent_x = static_cast<float>(extent_x / object_shadow_pgxp_unit),
+        .extent_y = static_cast<float>(extent_y / object_shadow_pgxp_unit),
+        .depth_extent =
+            static_cast<float>(depth_extent / object_shadow_pgxp_unit),
+        .maximum_reach =
+            static_cast<float>(maximum_reach / object_shadow_pgxp_unit),
+        .darkness = static_cast<float>(
+            std::clamp(projection.darkness * 1.35, 0.24, 0.50)),
+    });
+    submitted_keys[submitted_key_count++] = candidate.stable_key;
+    if (terrain_section != nullptr) {
+      ++submitted_terrain_casters;
+    } else {
+      ++submitted_prop_casters;
+    }
+    submitted_triangles += triangle_count;
+  }
+  retained_keys.assign(submitted_keys.begin(),
+                       submitted_keys.begin() + submitted_key_count);
+  if (primitives.object_shadow_logged_room != gameplay.currentRoom()) {
+    primitives.object_shadow_logged_room = gameplay.currentRoom();
+    PsyX_Log_Info(
+        "Object shadows: room=%u candidates=%zu terrain=%zu props=%zu "
+        "submitted=%zu terrain=%zu props=%zu triangles=%zu\n",
+        gameplay.currentRoom(), candidates.size(), terrain_candidate_count,
+        candidates.size() - terrain_candidate_count,
+        primitives.object_shadow_casters.size(), submitted_terrain_casters,
+        submitted_prop_casters, submitted_triangles);
+  }
+}
+
 void renderObjects(const game::GameplaySession &gameplay,
                    const FireAnimation &fire_animation,
                    const FireTexturePlacement &fire_texture_placement,
@@ -50,6 +753,25 @@ void renderObjects(const game::GameplaySession &gameplay,
       continue;
     }
     const auto &object_model = *displayed_model;
+    if (game::legacyAuthoredObjectPresentationHidden(
+            gameplay.missionIndex(),
+            object_index < gameplay.legacyGuestSlotsBySceneObject().size()
+                ? gameplay.legacyGuestSlotsBySceneObject()[object_index]
+                : -1,
+            source_object.source_index, source_object.definition_index,
+            source_object.class_id, object_model.name)) {
+      continue;
+    }
+    if (objectUsesEmbeddedWorldGeometry(
+            gameplay.missionIndex(), object.class_id, object_model.name)) {
+      continue;
+    }
+    // Retail class 0x63 is the mission keycard pickup. Its KEYCARD.GMD is
+    // placement/size metadata; the visible pickup is the authored two-part
+    // KEYCARDA/B interface sprite rendered below.
+    if (retailKeycardPickupObject(source_object, object_model.name)) {
+      continue;
+    }
     const auto &geometry = object_model.geometry;
     // GMD and EMD props carry stable authored bounds. Cull the complete
     // transformed object before pose, lighting, shadow and triangle work.
@@ -64,8 +786,8 @@ void renderObjects(const game::GameplaySession &gameplay,
       // The guest display-light pointer is reliable for the two weapon-crate
       // classes. Several flat GMD signs reuse that field for material state;
       // interpreting it as RGB tinted those sprites magenta.
-      const auto weapon_crate =
-          object.class_id == 0x4fU || object.class_id == 0x50U;
+      const auto weapon_crate = game::legacyWeaponCratePresentation(
+          object.class_id, object_model.name);
       const auto guest_back_color = weapon_crate
                                         ? retailGmdObjectBackColor(object)
                                         : VertexColor{128U, 128U, 128U};
@@ -75,7 +797,10 @@ void renderObjects(const game::GameplaySession &gameplay,
       // Sample the same active world-color cache for every ordinary GMD prop;
       // emissive billboards/lightbars deliberately retain their own intensity.
       const auto back_color =
-          object_model.visual_effect == game::ObjectVisualEffect::none
+          (object_model.visual_effect == game::ObjectVisualEffect::none ||
+           object_model.visual_effect ==
+               game::ObjectVisualEffect::smoke_volume ||
+           object_model.visual_effect == game::ObjectVisualEffect::fog_volume)
               ? localSceneBackColor(gameplay, presentation, object_index,
                                     object, guest_back_color,
                                     local_scene_lighting_cache)
@@ -108,9 +833,12 @@ void renderObjects(const game::GameplaySession &gameplay,
           dedicated_presentation && !exact_guest_pose ? nullptr : &pose;
       const auto *resolved_pose =
           prepareHmdWorldVertices(*hmd_model, object, render_pose, pose_scratch,
-                                  primitives.actor_scratch.hmd_world_vertices);
+                                  primitives.actor_scratch.hmd_world_vertices,
+                                  &primitives.actor_scratch.hmd_world_normals);
       const auto world_vertices =
           std::span<const Vector3>{primitives.actor_scratch.hmd_world_vertices};
+      const auto world_normals =
+          std::span<const Vector3>{primitives.actor_scratch.hmd_world_normals};
       // Animated HMD actors have no stable authored bounds, but their exact
       // posed vertices are already available here. Cull fully off-screen
       // actors before weapon attachment, shadow receivers, dynamic lighting
@@ -176,9 +904,17 @@ void renderObjects(const game::GameplaySession &gameplay,
                              OpticSubjectStyle::virus_scanner, view,
                              ordering_table, primitives, stats, 1U, 0);
       } else {
+        const auto guest_slots = gameplay.legacyGuestSlotsBySceneObject();
+        const auto guest_slot =
+            object_index < guest_slots.size()
+                ? static_cast<std::int16_t>(guest_slots[object_index])
+                : std::int16_t{-1};
+        const auto wound_vertices =
+            legacyHmdWoundVertices(gameplay, guest_slot, *hmd_model);
         renderHmdObject(*hmd_model, object, render_pose, texture_bank,
                         pose_scratch, view, ordering_table, primitives, stats,
-                        back_color, world_vertices);
+                        back_color, world_vertices, world_normals, false, true,
+                        &wound_vertices);
       }
       if (weapon_presentation) {
         if (thermal_subject) {
@@ -203,7 +939,8 @@ void renderObjects(const game::GameplaySession &gameplay,
       // Keep the reconstructed host emitter only for non-legacy play.
       if (!gameplay.legacyEffectParticlesAuthoritative()) {
         renderFireObject(*fire, fire_animation.particles(object_index),
-                         fire_texture_placement, view, fire_ordering_table,
+                         fire_texture_placement, presentation.camera, view,
+                         fire_ordering_table,
                          primitives, stats);
       }
     } else {
@@ -211,6 +948,23 @@ void renderObjects(const game::GameplaySession &gameplay,
                       texture_bank, view, ordering_table, primitives, stats,
                       false, scanner_material_active);
     }
+  }
+
+  // activeObjects only records static guest-object residency. The authoritative
+  // path intentionally skips native CFIRE there, so residency alone is not
+  // proof that a flame is presented. Keep the authored flame visible until the
+  // exact guest-owned EXPL particle appears; presentation ownership remains
+  // identical to the current PS1 world model set.
+  for (auto object_index = std::size_t{};
+       object_index < gameplay.objects().size(); ++object_index) {
+    const auto *fire = legacyDistantAuthoredFireEmitter(gameplay, object_index);
+    if (fire == nullptr) {
+      continue;
+    }
+    renderFireObject(*fire, fire_animation.particles(object_index),
+                     fire_texture_placement, presentation.camera, view,
+                     fire_ordering_table, primitives, stats, 1.0, true,
+                     &primitives.volumetric_effects);
   }
 }
 
@@ -387,7 +1141,6 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
   const auto projection = static_cast<double>(std::max(camera.projection, 1));
   constexpr auto center_x = static_cast<double>(screen_width) * 0.5;
   constexpr auto center_y = static_cast<double>(screen_height) * 0.5;
-  constexpr double pickup_world_extent = 96.0;
   constexpr double maximum_screen_extent = 34.0;
   constexpr double pickup_center_clearance = 72.0;
   constexpr double fallback_visual_lift = 96.0;
@@ -404,23 +1157,24 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
       pickup_minimum_brightness +
       pickup_brightness_range * pickup_pulse_rise / pickup_pulse_half_ticks);
 
-  for (const auto &item : presentation.dropped_items) {
-    const auto layers = game::droppedItemIconLayers(item.item);
+  const auto render_pickup =
+      [&](std::uint16_t item, double position_x, double raw_world_y,
+          double position_z, std::uint16_t room,
+          const game::ObjectModel *pickup_model, double screen_offset_x,
+          double screen_offset_y) {
+    const auto layers = game::droppedItemIconLayers(item);
     if (layers.empty()) {
-      continue;
+      return;
     }
-    const auto &position = item.transform.translation;
-    const auto raw_world_y = -static_cast<double>(position.y);
-    const auto ground_y = gameplay.droppedItemGroundY(
-        static_cast<double>(position.x), static_cast<double>(position.z),
-        raw_world_y, item.room);
-    const auto world = Vector3{static_cast<double>(position.x),
+    const auto ground_y =
+        gameplay.droppedItemGroundY(position_x, position_z, raw_world_y, room);
+    const auto world = Vector3{position_x,
                                ground_y ? *ground_y - pickup_center_clearance
                                         : raw_world_y - fallback_visual_lift,
-                               static_cast<double>(position.z)};
+                               position_z};
     if (!gameplay.droppedItemVisibleFrom(camera.x, camera.y, camera.z, world.x,
-                                         world.y, world.z, item.room)) {
-      continue;
+                                         world.y, world.z, room)) {
+      return;
     }
     const auto delta =
         Vector3{world.x - camera.x, world.y - camera.y, world.z - camera.z};
@@ -429,15 +1183,15 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
     };
     const auto depth = preciseCameraDepth(view, world.x, world.y, world.z);
     if (depth <= active_near_clip_depth) {
-      continue;
+      return;
     }
     const auto projected_x =
-        center_x + component(basis[0]) * projection / depth;
+        center_x + component(basis[0]) * projection / depth + screen_offset_x;
     const auto projected_y =
-        center_y + component(basis[1]) * projection / depth;
+        center_y + component(basis[1]) * projection / depth + screen_offset_y;
     if (projected_x < -64.0 || projected_x > screen_width + 64.0 ||
         projected_y < -64.0 || projected_y > screen_height + 64.0) {
-      continue;
+      return;
     }
 
     std::array<int, game::maximum_weapon_icon_layers> widths{};
@@ -463,11 +1217,22 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
         heights.begin() + static_cast<std::ptrdiff_t>(layers.size()));
     const auto source_extent =
         static_cast<double>(std::max(group_width, maximum_height));
-    const auto category_scale = game::droppedItemPresentationScale(item.item);
+    auto authored_world_extent = source_extent;
+    // Bounds preserve retail size hierarchy only. No GMD vertices or
+    // primitives are ever submitted by this sprite-only renderer.
+    if (pickup_model != nullptr && pickup_model->bounds) {
+      const auto &bounds = *pickup_model->bounds;
+      const auto width = static_cast<double>(bounds.maximum_x) -
+                         static_cast<double>(bounds.minimum_x);
+      const auto height = static_cast<double>(bounds.maximum_y) -
+                          static_cast<double>(bounds.minimum_y);
+      const auto depth_extent = static_cast<double>(bounds.maximum_z) -
+                                static_cast<double>(bounds.minimum_z);
+      authored_world_extent = std::max({width, height, depth_extent, 1.0});
+    }
     const auto scale =
-        std::min({projection * pickup_world_extent * category_scale /
-                      (depth * source_extent),
-                  maximum_screen_extent * category_scale / source_extent, 1.0});
+        std::min({projection * authored_world_extent / (depth * source_extent),
+                  maximum_screen_extent / source_extent, 1.0});
     const auto sort_depth =
         std::clamp(static_cast<int>(std::lround(depth * 0.25)), 1,
                    ordering_table_size - 1);
@@ -475,10 +1240,16 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
     for (std::size_t layer = 0U; layer < layers.size(); ++layer) {
       const auto &image = textures.image(layers[layer]);
       const auto armor_pickup = layers[layer] == armor_pickup_texture;
-      const auto resident_x =
-          armor_pickup ? pickup_resident_x : hudResidentX(image.pixels().x);
-      const auto resident_y =
-          armor_pickup ? pickup_resident_y : image.pixels().y;
+      const auto chopper_gun_pickup =
+          layers[layer] == chopper_gun_pickup_texture;
+      const auto resident_x = armor_pickup ? pickup_resident_x
+                              : chopper_gun_pickup
+                                  ? chopper_gun_pickup_resident_x
+                                  : hudResidentX(image.pixels().x);
+      const auto resident_y = armor_pickup ? pickup_resident_y
+                              : chopper_gun_pickup
+                                  ? chopper_gun_pickup_resident_y
+                                  : image.pixels().y;
       const auto page_x =
           static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
       const auto page_y =
@@ -506,8 +1277,10 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
       setPolyFT4(&polygon);
       polygon.tpage = texture_page;
       polygon.clut =
-          GetClut(hud_resident_clut_x,
-                  armor_pickup ? pickup_resident_clut_y : hud_resident_clut_y);
+          GetClut(hud_resident_clut_x, armor_pickup ? pickup_resident_clut_y
+                                       : chopper_gun_pickup
+                                           ? chopper_gun_pickup_resident_clut_y
+                                           : hud_resident_clut_y);
       setRGB0(&polygon, pickup_brightness, pickup_brightness,
               pickup_brightness);
       setXY4(&polygon, static_cast<float>(left), static_cast<float>(top),
@@ -543,6 +1316,85 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
       addPrim(&ordering_table[sort_depth], &polygon);
       ++stats.submitted;
     }
+  };
+
+  constexpr auto pile_columns = std::size_t{5U};
+  constexpr double pile_horizontal_spacing = 18.0;
+  constexpr double pile_vertical_spacing = 14.0;
+  const auto same_pile = [](const auto &left, const auto &right) {
+    constexpr std::int64_t horizontal_tolerance = 128;
+    constexpr std::int64_t vertical_tolerance = 192;
+    const auto within = [](std::int32_t first, std::int32_t second,
+                           std::int64_t tolerance) {
+      const auto difference = static_cast<std::int64_t>(first) -
+                              static_cast<std::int64_t>(second);
+      return difference >= -tolerance && difference <= tolerance;
+    };
+    return left.room == right.room &&
+           within(left.transform.translation.x, right.transform.translation.x,
+                  horizontal_tolerance) &&
+           within(left.transform.translation.y, right.transform.translation.y,
+                  vertical_tolerance) &&
+           within(left.transform.translation.z, right.transform.translation.z,
+                  horizontal_tolerance);
+  };
+  const auto pile_offset = [&](std::size_t rank, std::size_t count) {
+    if (count <= 1U) {
+      return std::array{0.0, 0.0};
+    }
+    const auto row = rank / pile_columns;
+    const auto row_start = row * pile_columns;
+    const auto row_count = std::min(pile_columns, count - row_start);
+    const auto column = rank - row_start;
+    const auto centered_column =
+        static_cast<double>(column) -
+        static_cast<double>(row_count - 1U) * 0.5;
+    return std::array{centered_column * pile_horizontal_spacing,
+                      -static_cast<double>(row) * pile_vertical_spacing};
+  };
+
+  for (std::size_t item_index = 0U;
+       item_index < presentation.dropped_items.size(); ++item_index) {
+    const auto &item = presentation.dropped_items[item_index];
+    auto pile_count = std::size_t{};
+    auto pile_rank = std::size_t{};
+    for (std::size_t candidate_index = 0U;
+         candidate_index < presentation.dropped_items.size();
+         ++candidate_index) {
+      const auto &candidate = presentation.dropped_items[candidate_index];
+      if (game::droppedItemIconLayers(candidate.item).empty() ||
+          !same_pile(item, candidate)) {
+        continue;
+      }
+      pile_rank += candidate_index < item_index ? 1U : 0U;
+      ++pile_count;
+    }
+    const auto offset = pile_offset(pile_rank, pile_count);
+    const auto &position = item.transform.translation;
+    render_pickup(item.item, static_cast<double>(position.x),
+                  -static_cast<double>(position.y),
+                  static_cast<double>(position.z), item.room,
+                  gameplay.droppedItemModel(item.item), offset[0], offset[1]);
+  }
+
+  constexpr auto inferred_room = std::numeric_limits<std::uint16_t>::max();
+  for (const auto object_index : gameplay.activeObjects()) {
+    if (object_index >= presentation.objects.size() ||
+        object_index >= gameplay.objects().size()) {
+      continue;
+    }
+    const auto &source_object = gameplay.objects()[object_index];
+    const auto *displayed_model = gameplay.displayedObjectModel(object_index);
+    if (displayed_model == nullptr ||
+        !retailKeycardPickupObject(source_object, displayed_model->name)) {
+      continue;
+    }
+    const auto &transform = presentation.objects[object_index].transform;
+    render_pickup(
+        static_cast<std::uint16_t>(game::WeaponId::key_card),
+        static_cast<double>(transform.x), static_cast<double>(transform.y),
+        static_cast<double>(transform.z), inferred_room, displayed_model, 0.0,
+        0.0);
   }
 }
 
@@ -700,9 +1552,12 @@ void renderPresentedPlayer(
     }();
     const auto *resolved_pose = prepareHmdWorldVertices(
         *player_model, player_object, &pose, pose_scratch,
-        primitives.actor_scratch.hmd_world_vertices);
+        primitives.actor_scratch.hmd_world_vertices,
+        &primitives.actor_scratch.hmd_world_normals);
     const auto world_vertices =
         std::span<const Vector3>{primitives.actor_scratch.hmd_world_vertices};
+    const auto world_normals =
+        std::span<const Vector3>{primitives.actor_scratch.hmd_world_normals};
     auto support_player_object = game::SceneObject{
         0, playerTransform(gameplay.player(), gameplay.playerModelHeading())};
     if (const auto *authoritative_guest_player =
@@ -738,10 +1593,13 @@ void renderPresentedPlayer(
             : PlayerCameraVisibility::opaque;
     const auto translucent = visibility == PlayerCameraVisibility::translucent;
     if (visibility != PlayerCameraVisibility::hidden) {
+      const auto wound_vertices = legacyHmdWoundVertices(
+          gameplay, presentation.player_guest_slot, *player_model);
       renderHmdObject(*player_model, player_object, &pose,
                       game::resident_hmd_texture_bank, pose_scratch, view,
                       ordering_table, primitives, stats, std::nullopt,
-                      world_vertices, translucent);
+                      world_vertices, world_normals, translucent, true,
+                      &wound_vertices);
     }
     if (gameplay.playerAlive() &&
         visibility != PlayerCameraVisibility::hidden && weapon_presentation) {
@@ -789,6 +1647,8 @@ void setPacketColor(std::uint32_t word, std::uint8_t &red, std::uint8_t &green,
 void renderGuestCameraLists(
     const game::GameplaySession &gameplay, const TextureStreamer &textures,
     const RenderPresentationSnapshot &presentation,
+    const game::ActorAnimationBank &actor_animations, std::uint64_t actor_tick,
+    HmdPoseScratch &pose_scratch,
     std::span<const game::LegacyGuestSpritePresentationState> retained_sprites,
     std::span<const game::LegacyGuestRawPacketPresentationState>
         retained_raw_packets,
@@ -809,13 +1669,12 @@ void renderGuestCameraLists(
           gameplay.legacyEffectParticlesAuthoritative());
   constexpr auto center_x = static_cast<double>(screen_width) * 0.5;
   constexpr auto center_y = static_cast<double>(screen_height) * 0.5;
-  const auto project_world = [](const game::CameraState &camera,
-                                const game::LegacyNativePoint &point)
+  const auto project_position = [](const game::CameraState &camera,
+                                   const Vector3 &point)
       -> std::optional<std::array<double, 3U>> {
     const auto basis = viewBasis(camera);
-    const auto delta = Vector3{static_cast<double>(point.x) - camera.x,
-                               -static_cast<double>(point.y) - camera.y,
-                               static_cast<double>(point.z) - camera.z};
+    const auto delta = Vector3{point.x - camera.x, point.y - camera.y,
+                               point.z - camera.z};
     const auto component = [&delta](const Vector3 &axis) {
       return delta.x * axis.x + delta.y * axis.y + delta.z * axis.z;
     };
@@ -829,6 +1688,14 @@ void renderGuestCameraLists(
         center_y + component(basis[1]) * projection / depth,
         depth,
     };
+  };
+  const auto project_world = [&project_position](
+                                 const game::CameraState &camera,
+                                 const game::LegacyNativePoint &point) {
+    return project_position(camera,
+                            Vector3{static_cast<double>(point.x),
+                                    -static_cast<double>(point.y),
+                                    static_cast<double>(point.z)});
   };
 
   const auto bridge_camera = [](const game::LegacyCameraBridgeState &camera) {
@@ -873,6 +1740,24 @@ void renderGuestCameraLists(
       continue;
     }
     const auto world_effect = game::legacyGuestSpriteUsesWorldDepth(sprite);
+    auto presented_effect_position =
+        Vector3{static_cast<double>(sprite.effect_position.x),
+                -static_cast<double>(sprite.effect_position.y),
+                static_cast<double>(sprite.effect_position.z)};
+    if (world_effect && retained_entry == nullptr &&
+        sprite.effect_particle >= 0) {
+      const auto particle = std::ranges::find_if(
+          presentation.expl_particles, [&](const auto &candidate) {
+            return candidate.pool_index == sprite.effect_particle &&
+                   static_cast<std::uint8_t>(candidate.family) ==
+                       sprite.effect_family;
+          });
+      if (particle != presentation.expl_particles.end()) {
+        presented_effect_position = Vector3{
+            static_cast<double>(particle->x), static_cast<double>(particle->y),
+            static_cast<double>(particle->z)};
+      }
+    }
     const auto nightvision_scope_sprite = sprite.retail_scope_overlay &&
                                           presentation.retail_scope_overlay &&
                                           presentation.optic_mode == 3U;
@@ -921,7 +1806,7 @@ void renderGuestCameraLists(
       const auto authored_effect =
           project_world(authored_camera, sprite.effect_position);
       projected_effect =
-          project_world(presentation.camera, sprite.effect_position);
+          project_position(presentation.camera, presented_effect_position);
       if (!authored_effect || !projected_effect) {
         ++stats.rejected;
         continue;
@@ -973,8 +1858,94 @@ void renderGuestCameraLists(
     const auto retail_clut = static_cast<std::uint16_t>(
         (static_cast<unsigned int>(sprite.center_y) << 6U) |
         ((static_cast<unsigned int>(sprite.center_x) >> 4U) & 0x3fU));
+    const auto steam_effect =
+        world_effect && textures.guestSpriteIsSteam(sprite);
+    const auto persistent_fire =
+        steam_effect ? std::optional<PersistentFireEmitterSource>{}
+                     : legacyGuestPersistentFireEmitterSource(
+                           gameplay, presentation.expl_particles, sprite);
+    const auto volume_kind_override = steam_effect         ? GR_VOLUME_SMOKE
+                                      : persistent_fire     ? GR_VOLUME_FIRE
+                                                            : -1;
+    const auto halo_clut_color =
+        textures.authoredGuestSpriteHaloColor(sprite, texture_bank)
+            .value_or(game::LegacyRgbBridgeState{128U, 128U, 128U});
+    const auto halo_back_color =
+        game::legacyHaloBackColor(sprite.color, sprite.force_fullbright);
+    const auto halo_presentation = game::legacyHaloPresentationDescriptor(
+        halo_clut_color, halo_back_color);
+    const auto volume_may_replace_retail_sprite =
+        game::legacyCfireVolumeMayReplaceRetailSprite(
+            gameplay.missionIndex(), persistent_fire.has_value());
+    const auto fire_tuning = game::legacyCfireVolumeTuning(
+        gameplay.missionIndex(), volume_kind_override == GR_VOLUME_FIRE);
+    const auto retail_expl_frame_volume =
+        persistent_fire.has_value() && sprite.effect_family != 0U &&
+        game::legacyCfireUsesRetailExplFrameVolume(
+            gameplay.missionIndex(), true,
+            static_cast<game::LegacyEffectSpriteFamily>(
+                sprite.effect_family));
+    const auto retail_fire_frame_volume =
+        sprite.effect_family != 0U &&
+        game::legacyCfireUsesRetailFireFrameVolume(
+            gameplay.missionIndex(), true,
+            static_cast<game::LegacyEffectSpriteFamily>(
+                sprite.effect_family));
+    const auto retail_frame_volume_flags =
+        retail_expl_frame_volume
+            ? GR_VOLUME_FLAG_RETAIL_EXPL_FRAME
+            : retail_fire_frame_volume ? GR_VOLUME_FLAG_RETAIL_FIRE_FRAME
+                                       : GR_VOLUME_FLAG_NONE;
+    const auto retail_frame_volume =
+        retail_frame_volume_flags != GR_VOLUME_FLAG_NONE;
     const auto special_material = textures.relocateGuestSprite(sprite);
+    if (world_effect &&
+        (sprite.effect_family != 0U || sprite.force_fullbright ||
+         steam_effect) &&
+        projected_effect) {
+      const auto half_screen_width =
+          std::max({std::abs(first[0] - sprite_center_x),
+                    std::abs(second[0] - sprite_center_x),
+                    std::abs(third[0] - sprite_center_x),
+                    std::abs(fourth[0] - sprite_center_x)});
+      const auto half_screen_height =
+          std::max({std::abs(first[1] - sprite_center_y),
+                    std::abs(second[1] - sprite_center_y),
+                    std::abs(third[1] - sprite_center_y),
+                    std::abs(fourth[1] - sprite_center_y)});
+      const auto projection =
+          static_cast<double>(std::max(presentation.camera.projection, 1));
+      const auto view_depth = (*projected_effect)[2];
+      const auto half_width = half_screen_width * view_depth / projection;
+      const auto half_height = half_screen_height * view_depth / projection;
+      const auto volume_requested =
+          volume_may_replace_retail_sprite || retail_frame_volume;
+      const auto volume_presented =
+          volume_requested &&
+          enqueueGuestVolumetricEffect(
+              sprite,
+              presented_effect_position,
+              Vector3{half_width, half_height,
+                      std::max(half_width, half_height) *
+                          (retail_frame_volume ? 0.55 : 0.68)},
+              presentation.camera, primitives.volumetric_effects,
+              volume_kind_override, halo_presentation, fire_tuning,
+              persistent_fire && !retail_frame_volume
+                  ? &*persistent_fire
+                  : nullptr,
+              retail_frame_volume_flags);
+      if (game::legacyEffectVolumeConsumesRetailSprite(
+              volume_may_replace_retail_sprite, volume_presented,
+              retail_frame_volume)) {
+        // Once the volume is accepted it owns the complete particle, including
+        // the compact emissive core. The retail quad remains only as a safe
+        // fallback when the volume pass is unavailable or at capacity.
+        primitives.guest_sprites.pop_back();
+        continue;
+      }
+    }
     if (world_effect && sprite.effect_family != 0U && !special_material) {
+      // A resident retail texture is required only by the quad fallback.
       primitives.guest_sprites.pop_back();
       ++stats.rejected;
       continue;
@@ -1028,9 +1999,9 @@ void renderGuestCameraLists(
     auto *target_table = &overlay_ordering_table;
     if (world_effect) {
       const auto view_depth =
-          preciseCameraDepth(view, sprite.effect_position.x,
-                             -static_cast<double>(sprite.effect_position.y),
-                             sprite.effect_position.z);
+          preciseCameraDepth(view, presented_effect_position.x,
+                             presented_effect_position.y,
+                             presented_effect_position.z);
       if (view_depth <= 0.0) {
         primitives.guest_sprites.pop_back();
         ++stats.rejected;
@@ -1064,7 +2035,9 @@ void renderGuestCameraLists(
     ++stats.submitted;
   }
 
-  for (const auto &line : presentation.guest_lines) {
+  for (std::size_t index = 0U; index < presentation.guest_lines.size();
+       ++index) {
+    const auto &line = presentation.guest_lines[index];
     if ((line.attribute & 0x80000000U) != 0U) {
       continue;
     }
@@ -1114,10 +2087,285 @@ void renderGuestCameraLists(
     }
     ++stats.submitted;
   };
+
+  struct RetailTaserPacketWarp {
+    std::int16_t controller{-1};
+    std::uint16_t segment_count{};
+    std::uint16_t first_segment{};
+    std::uint16_t last_segment{};
+    double raw_source_x{};
+    double raw_source_y{};
+    double presented_source_x{};
+    double presented_source_y{};
+    double scale_cosine{1.0};
+    double scale_sine{};
+    double source_depth{};
+    double target_depth{};
+  };
+  struct RetailTaserPacketWarpSet {
+    std::array<RetailTaserPacketWarp,
+               game::legacy_effect_particle_capacity> entries{};
+    std::size_t count{};
+  };
+  const auto taser_warp_for = [](const RetailTaserPacketWarpSet &warps,
+                                 const auto &packet)
+      -> const RetailTaserPacketWarp * {
+    for (std::size_t index = 0U; index < warps.count; ++index) {
+      const auto &warp = warps.entries[index];
+      if (warp.controller == packet.effect_controller &&
+          warp.segment_count == packet.taser_segment_count) {
+        return &warp;
+      }
+    }
+    return nullptr;
+  };
+  const auto taser_endpoint_amount = [](const RetailTaserPacketWarp &warp,
+                                        std::uint16_t endpoint) {
+    const auto first = static_cast<std::uint32_t>(warp.first_segment);
+    const auto last = static_cast<std::uint32_t>(warp.last_segment) + 1U;
+    const auto bounded = std::clamp<std::uint32_t>(endpoint, first, last);
+    return static_cast<double>(bounded - first) /
+           static_cast<double>(last - first);
+  };
+  const auto transform_taser_point = [](const RetailTaserPacketWarp &warp,
+                                        double x, double y) {
+    const auto local_x = x - warp.raw_source_x;
+    const auto local_y = y - warp.raw_source_y;
+    return std::array{
+        warp.presented_source_x + warp.scale_cosine * local_x -
+            warp.scale_sine * local_y,
+        warp.presented_source_y + warp.scale_sine * local_x +
+            warp.scale_cosine * local_y,
+    };
+  };
+
+  const auto taser_target_object = gameplay.taserTarget();
+  auto taser_target_position = std::optional<Vector3>{};
+  if (const auto &retail_point = gameplay.retailAimPoint();
+      retail_point &&
+      (presentation.first_person_aim ||
+       (taser_target_object &&
+        gameplay.aimTarget() == taser_target_object))) {
+    taser_target_position = Vector3{
+        static_cast<double>(retail_point->x),
+        -static_cast<double>(retail_point->y),
+        static_cast<double>(retail_point->z),
+    };
+  }
+  if (!taser_target_position && taser_target_object) {
+    taser_target_position = sceneObjectCalloutAnchor(
+        gameplay, actor_animations, actor_tick,
+        std::span<const game::SceneObject>{presentation.objects},
+        *taser_target_object, false, pose_scratch);
+  }
+  const auto projected_taser_target =
+      taser_target_position
+          ? project_position(presentation.camera, *taser_target_position)
+          : std::nullopt;
+  auto projected_taser_muzzle =
+      std::optional<std::array<double, 3U>>{};
+  if (!presentation.first_person_aim) {
+    if (const auto muzzle = playerWeaponMuzzleAnchor(
+            gameplay, actor_animations, presentedPlayerObject(presentation),
+            game::WeaponId::taser)) {
+      projected_taser_muzzle =
+          project_position(presentation.camera, *muzzle);
+    }
+  }
+
+  const auto build_retail_taser_warps =
+      [&](const auto &entries,
+          const auto &packet_for) -> RetailTaserPacketWarpSet {
+    auto result = RetailTaserPacketWarpSet{};
+    for (const auto &entry : entries) {
+      const auto &candidate = packet_for(entry);
+      if (!game::legacyGuestRawPacketIsRetailTaserConductor(candidate) ||
+          candidate.taser_segment_count >
+              game::legacy_effect_particle_capacity ||
+          std::ranges::any_of(
+              result.entries.begin(), result.entries.begin() + result.count,
+              [&](const auto &warp) {
+                return warp.controller == candidate.effect_controller &&
+                       warp.segment_count == candidate.taser_segment_count;
+              })) {
+        continue;
+      }
+      std::array<const game::LegacyGuestRawPacketBridgeState *,
+                 game::legacy_effect_particle_capacity>
+          segments{};
+      for (const auto &segment_entry : entries) {
+        const auto &segment = packet_for(segment_entry);
+        if (!game::legacyGuestRawPacketHasProjectedTaserSegment(segment) ||
+            segment.effect_controller != candidate.effect_controller ||
+            segment.taser_segment_count != candidate.taser_segment_count ||
+            static_cast<std::uint16_t>(segment.taser_segment_index) >=
+                candidate.taser_segment_count) {
+          continue;
+        }
+        segments[static_cast<std::uint16_t>(segment.taser_segment_index)] =
+            &segment;
+      }
+
+      std::size_t best_first{};
+      std::size_t best_length{};
+      std::size_t run_first{};
+      std::size_t run_length{};
+      for (std::size_t segment = 0U;
+           segment < candidate.taser_segment_count; ++segment) {
+        if (segments[segment] == nullptr) {
+          run_length = 0U;
+          continue;
+        }
+        if (run_length == 0U) {
+          run_first = segment;
+        }
+        ++run_length;
+        if (run_length > best_length) {
+          best_first = run_first;
+          best_length = run_length;
+        }
+      }
+      if (best_length == 0U || result.count == result.entries.size()) {
+        continue;
+      }
+      const auto first_segment = best_first;
+      const auto last_segment = best_first + best_length - 1U;
+      const auto *source_packet = segments[first_segment];
+      const auto *target_packet = segments[last_segment];
+      const auto raw_source_x = reprojectGuestCoordinate(
+        static_cast<double>(packedScreenX(source_packet->words[1])),
+        guest_draw_offset_x, 0.0);
+      const auto raw_source_y = reprojectGuestCoordinate(
+        static_cast<double>(packedScreenY(source_packet->words[1])),
+        guest_draw_offset_y, 0.0);
+      const auto raw_target_x = reprojectGuestCoordinate(
+        static_cast<double>(packedScreenX(target_packet->words[3])),
+        guest_draw_offset_x, 0.0);
+      const auto raw_target_y = reprojectGuestCoordinate(
+        static_cast<double>(packedScreenY(target_packet->words[3])),
+        guest_draw_offset_y, 0.0);
+
+      auto presented_source_x = raw_source_x;
+      auto presented_source_y = raw_source_y;
+      auto presented_target_x = raw_target_x;
+      auto presented_target_y = raw_target_y;
+      const auto safe_source_depth = active_near_clip_depth + 8.0;
+      auto source_depth = safe_source_depth;
+      auto target_depth = std::max(
+          safe_source_depth + 1.0,
+          static_cast<double>(target_packet->ordering_depth) * 4.0);
+      if (presentation.first_person_aim) {
+        // Gabe's model muzzle is at/behind the FP eye. Retail already clipped
+        // the invisible prefix; keep its first valid screen endpoint and
+        // constrain near-overflow to the visible canvas edge.
+        constexpr auto screen_margin = 8.0;
+        presented_source_x = std::clamp(
+            raw_source_x, screen_margin,
+            static_cast<double>(screen_width) - screen_margin);
+        presented_source_y = std::clamp(
+            raw_source_y, screen_margin,
+            static_cast<double>(screen_height) - screen_margin);
+        if (projected_taser_target) {
+          presented_target_x = (*projected_taser_target)[0];
+          presented_target_y = (*projected_taser_target)[1];
+          target_depth = (*projected_taser_target)[2];
+        }
+      } else {
+        const auto full_source_x = projected_taser_muzzle
+                                       ? (*projected_taser_muzzle)[0]
+                                       : raw_source_x;
+        const auto full_source_y = projected_taser_muzzle
+                                       ? (*projected_taser_muzzle)[1]
+                                       : raw_source_y;
+        const auto full_target_x = projected_taser_target
+                                       ? (*projected_taser_target)[0]
+                                       : raw_target_x;
+        const auto full_target_y = projected_taser_target
+                                       ? (*projected_taser_target)[1]
+                                       : raw_target_y;
+        const auto full_source_depth = projected_taser_muzzle
+                                           ? (*projected_taser_muzzle)[2]
+                                           : safe_source_depth;
+        const auto full_target_depth = projected_taser_target
+                                           ? (*projected_taser_target)[2]
+                                           : target_depth;
+        const auto first_amount =
+            static_cast<double>(first_segment) /
+            static_cast<double>(candidate.taser_segment_count);
+        const auto last_amount =
+            static_cast<double>(last_segment + 1U) /
+            static_cast<double>(candidate.taser_segment_count);
+        presented_source_x =
+            std::lerp(full_source_x, full_target_x, first_amount);
+        presented_source_y =
+            std::lerp(full_source_y, full_target_y, first_amount);
+        presented_target_x =
+            std::lerp(full_source_x, full_target_x, last_amount);
+        presented_target_y =
+            std::lerp(full_source_y, full_target_y, last_amount);
+        source_depth =
+            std::lerp(full_source_depth, full_target_depth, first_amount);
+        target_depth =
+            std::lerp(full_source_depth, full_target_depth, last_amount);
+      }
+
+      const auto raw_delta_x = raw_target_x - raw_source_x;
+      const auto raw_delta_y = raw_target_y - raw_source_y;
+      const auto presented_delta_x = presented_target_x - presented_source_x;
+      const auto presented_delta_y = presented_target_y - presented_source_y;
+      const auto raw_length_squared =
+          raw_delta_x * raw_delta_x + raw_delta_y * raw_delta_y;
+      const auto presented_length_squared =
+          presented_delta_x * presented_delta_x +
+          presented_delta_y * presented_delta_y;
+      if (raw_length_squared < 1.0 || presented_length_squared < 1.0 ||
+          !std::isfinite(raw_length_squared) ||
+          !std::isfinite(presented_length_squared)) {
+        continue;
+      }
+      const auto scale_cosine =
+          (presented_delta_x * raw_delta_x +
+           presented_delta_y * raw_delta_y) /
+          raw_length_squared;
+      const auto scale_sine =
+          (presented_delta_y * raw_delta_x -
+           presented_delta_x * raw_delta_y) /
+          raw_length_squared;
+      const auto scale_squared = scale_cosine * scale_cosine +
+                                 scale_sine * scale_sine;
+      if (!std::isfinite(scale_squared) || scale_squared < 0.0001 ||
+          scale_squared > 64.0) {
+        continue;
+      }
+      result.entries[result.count++] = RetailTaserPacketWarp{
+          .controller = source_packet->effect_controller,
+          .segment_count = source_packet->taser_segment_count,
+          .first_segment = static_cast<std::uint16_t>(first_segment),
+          .last_segment = static_cast<std::uint16_t>(last_segment),
+          .raw_source_x = raw_source_x,
+          .raw_source_y = raw_source_y,
+          .presented_source_x = presented_source_x,
+          .presented_source_y = presented_source_y,
+          .scale_cosine = scale_cosine,
+          .scale_sine = scale_sine,
+          .source_depth = source_depth,
+          .target_depth = target_depth,
+      };
+    }
+    return result;
+  };
+  const auto current_taser_warps = build_retail_taser_warps(
+      presentation.guest_raw_packets,
+      [](const auto &packet) -> const auto & { return packet; });
+  const auto retained_taser_warps = build_retail_taser_warps(
+      retained_raw_packets,
+      [](const auto &entry) -> const auto & { return entry.packet; });
+
   const auto render_raw_packet = [&](const game::LegacyGuestRawPacketBridgeState
                                          &packet,
                                      const game::CameraState &authored_camera,
-                                     bool suppress_reconstructed_particle) {
+                                     bool suppress_reconstructed_particle,
+                                     const RetailTaserPacketWarpSet &taser_warps) {
     if (suppress_reconstructed_particle &&
         (game::legacyGuestRawPacketHasWorldLine(
              packet, presentation.current_line_particles) ||
@@ -1129,7 +2377,22 @@ void renderGuestCameraLists(
     if (packet.opcode == 0U || (packet.opcode & 0x80U) != 0U) {
       return;
     }
-    const auto world_effect = game::legacyGuestRawPacketUsesWorldDepth(packet);
+    const auto retail_taser_packet =
+        game::legacyGuestRawPacketIsRetailTaserConductor(packet);
+    const auto *active_taser_warp = retail_taser_packet
+                                        ? taser_warp_for(taser_warps, packet)
+                                        : nullptr;
+    if (retail_taser_packet &&
+        (active_taser_warp == nullptr ||
+         !game::legacyGuestRawPacketHasProjectedTaserSegment(packet) ||
+         static_cast<std::uint16_t>(packet.taser_segment_index) <
+             active_taser_warp->first_segment ||
+         static_cast<std::uint16_t>(packet.taser_segment_index) >
+             active_taser_warp->last_segment)) {
+      return;
+    }
+    const auto world_effect = retail_taser_packet ||
+                              game::legacyGuestRawPacketUsesWorldDepth(packet);
     const auto scope_packet =
         game::legacyGuestRawPacketIsRetailScopeOverlay(packet);
     const auto scanner_packet =
@@ -1162,21 +2425,32 @@ void renderGuestCameraLists(
     auto raw_offset_x = 0.0;
     auto raw_offset_y = 0.0;
     if (world_effect) {
-      const auto authored =
+      if (retail_taser_packet) {
+        raw_view_depth = active_taser_warp != nullptr
+                             ? active_taser_warp->source_depth
+                             : std::max(active_near_clip_depth + 1.0,
+                                        static_cast<double>(
+                                            packet.ordering_depth) * 4.0);
+        target_table = presentation.first_person_aim
+                           ? &overlay_ordering_table
+                           : &ordering_table;
+      } else {
+        const auto authored =
           project_world(authored_camera, packet.effect_position);
-      const auto presented =
+        const auto presented =
           project_world(presentation.camera, packet.effect_position);
-      if (!authored || !presented) {
-        ++stats.rejected;
-        return;
+        if (!authored || !presented) {
+          ++stats.rejected;
+          return;
+        }
+        raw_offset_x = (*presented)[0] - (*authored)[0];
+        raw_offset_y = (*presented)[1] - (*authored)[1];
+        raw_view_depth =
+            preciseCameraDepth(view, packet.effect_position.x,
+                               -static_cast<double>(packet.effect_position.y),
+                               packet.effect_position.z);
+        target_table = &ordering_table;
       }
-      raw_offset_x = (*presented)[0] - (*authored)[0];
-      raw_offset_y = (*presented)[1] - (*authored)[1];
-      raw_view_depth =
-          preciseCameraDepth(view, packet.effect_position.x,
-                             -static_cast<double>(packet.effect_position.y),
-                             packet.effect_position.z);
-      target_table = &ordering_table;
     }
     const auto raw_x = [raw_offset_x](std::uint32_t word) {
       return static_cast<float>(
@@ -1188,13 +2462,36 @@ void renderGuestCameraLists(
           reprojectGuestCoordinate(static_cast<double>(packedScreenY(word)),
                                    guest_draw_offset_y, raw_offset_y));
     };
+    const std::uint16_t segment_index =
+        retail_taser_packet
+            ? static_cast<std::uint16_t>(packet.taser_segment_index)
+            : std::uint16_t{};
+    const auto first_taser_amount =
+        active_taser_warp != nullptr
+            ? taser_endpoint_amount(*active_taser_warp, segment_index)
+            : 0.0;
+    const auto second_taser_amount =
+        active_taser_warp != nullptr
+            ? taser_endpoint_amount(
+                  *active_taser_warp,
+                  static_cast<std::uint16_t>(segment_index + 1U))
+            : 0.0;
+    const auto raw_sort_depth = active_taser_warp != nullptr
+                                    ? std::lerp(
+                                          active_taser_warp->source_depth,
+                                          active_taser_warp->target_depth,
+                                          (first_taser_amount +
+                                           second_taser_amount) * 0.5)
+                                    : raw_view_depth;
     const auto raw_depth =
         world_effect ? static_cast<std::uint32_t>(std::clamp(
-                           static_cast<int>(std::lround(raw_view_depth * 0.25)),
+                           static_cast<int>(std::lround(raw_sort_depth * 0.25)),
                            1, ordering_table_size - 1))
                      : packet.ordering_depth;
-    const auto emit_raw_pgxp = [&](VERTTYPE &x, VERTTYPE &y) {
-      if (!world_effect) {
+    const auto emit_raw_pgxp = [&](VERTTYPE &x, VERTTYPE &y,
+                                   double vertex_depth) {
+      if (!world_effect ||
+          (retail_taser_packet && presentation.first_person_aim)) {
         return;
       }
       const auto projection =
@@ -1203,11 +2500,11 @@ void renderGuestCameraLists(
       const auto screen_y = static_cast<float>(y);
       PGXPVData data{};
       data.lookup = PGXP_LOOKUP_VALUE(x, y);
-      data.px = static_cast<float>((screen_x - center_x) * raw_view_depth /
+      data.px = static_cast<float>((screen_x - center_x) * vertex_depth /
                                    projection / 128.0);
-      data.py = static_cast<float>((screen_y - center_y) * raw_view_depth /
+      data.py = static_cast<float>((screen_y - center_y) * vertex_depth /
                                    projection / 128.0);
-      data.pz = static_cast<float>(raw_view_depth / 128.0);
+      data.pz = static_cast<float>(vertex_depth / 128.0);
       data.sx = screen_x;
       data.sy = screen_y;
       data.scr_h = projection;
@@ -1221,7 +2518,7 @@ void renderGuestCameraLists(
       setPacketColor(packet.words[0], primitive.r0, primitive.g0, primitive.b0);
       primitive.code = packet.opcode;
       setXY0(&primitive, raw_x(packet.words[1]), raw_y(packet.words[1]));
-      emit_raw_pgxp(primitive.x0, primitive.y0);
+      emit_raw_pgxp(primitive.x0, primitive.y0, raw_view_depth);
       add_raw(primitive, raw_depth, packet.opcode, *target_table);
     } else if (packet.word_count == 3U && base_opcode == 0x40U) {
       auto &primitive = primitives.guest_raw_flat_lines.emplace_back();
@@ -1230,8 +2527,8 @@ void renderGuestCameraLists(
       primitive.code = packet.opcode;
       setXY2(&primitive, raw_x(packet.words[1]), raw_y(packet.words[1]),
              raw_x(packet.words[2]), raw_y(packet.words[2]));
-      emit_raw_pgxp(primitive.x0, primitive.y0);
-      emit_raw_pgxp(primitive.x1, primitive.y1);
+      emit_raw_pgxp(primitive.x0, primitive.y0, raw_view_depth);
+      emit_raw_pgxp(primitive.x1, primitive.y1, raw_view_depth);
       add_raw(primitive, raw_depth, packet.opcode, *target_table);
     } else if (packet.word_count == 4U && base_opcode == 0x20U) {
       auto &primitive = primitives.guest_raw_flat_triangles.emplace_back();
@@ -1241,21 +2538,45 @@ void renderGuestCameraLists(
       setXY3(&primitive, raw_x(packet.words[1]), raw_y(packet.words[1]),
              raw_x(packet.words[2]), raw_y(packet.words[2]),
              raw_x(packet.words[3]), raw_y(packet.words[3]));
-      emit_raw_pgxp(primitive.x0, primitive.y0);
-      emit_raw_pgxp(primitive.x1, primitive.y1);
-      emit_raw_pgxp(primitive.x2, primitive.y2);
+      emit_raw_pgxp(primitive.x0, primitive.y0, raw_view_depth);
+      emit_raw_pgxp(primitive.x1, primitive.y1, raw_view_depth);
+      emit_raw_pgxp(primitive.x2, primitive.y2, raw_view_depth);
       add_raw(primitive, raw_depth, packet.opcode, *target_table);
     } else if (packet.word_count == 4U && base_opcode == 0x50U) {
       auto &primitive = primitives.guest_raw_gouraud_lines.emplace_back();
       setLineG2(&primitive);
       setPacketColor(packet.words[0], primitive.r0, primitive.g0, primitive.b0);
       primitive.code = packet.opcode;
-      setXY0(&primitive, raw_x(packet.words[1]), raw_y(packet.words[1]));
+      auto first_x = raw_x(packet.words[1]);
+      auto first_y = raw_y(packet.words[1]);
+      auto second_x = raw_x(packet.words[3]);
+      auto second_y = raw_y(packet.words[3]);
+      auto first_depth = raw_view_depth;
+      auto second_depth = raw_view_depth;
+      if (active_taser_warp != nullptr) {
+        const auto first = transform_taser_point(
+            *active_taser_warp, static_cast<double>(first_x),
+            static_cast<double>(first_y));
+        const auto second = transform_taser_point(
+            *active_taser_warp, static_cast<double>(second_x),
+            static_cast<double>(second_y));
+        first_x = static_cast<float>(first[0]);
+        first_y = static_cast<float>(first[1]);
+        second_x = static_cast<float>(second[0]);
+        second_y = static_cast<float>(second[1]);
+        first_depth = std::lerp(active_taser_warp->source_depth,
+                                active_taser_warp->target_depth,
+                                first_taser_amount);
+        second_depth = std::lerp(active_taser_warp->source_depth,
+                                 active_taser_warp->target_depth,
+                                 second_taser_amount);
+      }
+      setXY0(&primitive, first_x, first_y);
       setPacketColor(packet.words[2], primitive.r1, primitive.g1, primitive.b1);
-      primitive.x1 = raw_x(packet.words[3]);
-      primitive.y1 = raw_y(packet.words[3]);
-      emit_raw_pgxp(primitive.x0, primitive.y0);
-      emit_raw_pgxp(primitive.x1, primitive.y1);
+      primitive.x1 = second_x;
+      primitive.y1 = second_y;
+      emit_raw_pgxp(primitive.x0, primitive.y0, first_depth);
+      emit_raw_pgxp(primitive.x1, primitive.y1, second_depth);
       add_raw(primitive, raw_depth, packet.opcode, *target_table);
     } else if (packet.word_count == 5U && base_opcode == 0x28U) {
       auto &primitive = primitives.guest_raw_flat_quads.emplace_back();
@@ -1266,10 +2587,10 @@ void renderGuestCameraLists(
              raw_x(packet.words[2]), raw_y(packet.words[2]),
              raw_x(packet.words[3]), raw_y(packet.words[3]),
              raw_x(packet.words[4]), raw_y(packet.words[4]));
-      emit_raw_pgxp(primitive.x0, primitive.y0);
-      emit_raw_pgxp(primitive.x1, primitive.y1);
-      emit_raw_pgxp(primitive.x2, primitive.y2);
-      emit_raw_pgxp(primitive.x3, primitive.y3);
+      emit_raw_pgxp(primitive.x0, primitive.y0, raw_view_depth);
+      emit_raw_pgxp(primitive.x1, primitive.y1, raw_view_depth);
+      emit_raw_pgxp(primitive.x2, primitive.y2, raw_view_depth);
+      emit_raw_pgxp(primitive.x3, primitive.y3, raw_view_depth);
       add_raw(primitive, raw_depth, packet.opcode, *target_table);
     } else if (packet.word_count == 6U && base_opcode == 0x30U) {
       auto &primitive = primitives.guest_raw_gouraud_triangles.emplace_back();
@@ -1283,9 +2604,9 @@ void renderGuestCameraLists(
       setPacketColor(packet.words[4], primitive.r2, primitive.g2, primitive.b2);
       primitive.x2 = raw_x(packet.words[5]);
       primitive.y2 = raw_y(packet.words[5]);
-      emit_raw_pgxp(primitive.x0, primitive.y0);
-      emit_raw_pgxp(primitive.x1, primitive.y1);
-      emit_raw_pgxp(primitive.x2, primitive.y2);
+      emit_raw_pgxp(primitive.x0, primitive.y0, raw_view_depth);
+      emit_raw_pgxp(primitive.x1, primitive.y1, raw_view_depth);
+      emit_raw_pgxp(primitive.x2, primitive.y2, raw_view_depth);
       add_raw(primitive, raw_depth, packet.opcode, *target_table);
     }
   };
@@ -1301,7 +2622,7 @@ void renderGuestCameraLists(
     if (game::legacyGuestRawPacketUsesWorldDepth(packet) && retained(packet)) {
       continue;
     }
-    render_raw_packet(packet, packet_camera, true);
+    render_raw_packet(packet, packet_camera, true, current_taser_warps);
   }
   for (const auto &entry : retained_raw_packets) {
     const auto &camera = entry.camera;
@@ -1317,7 +2638,8 @@ void renderGuestCameraLists(
     // Source-tick semantic duplicates were discarded by the queue. A newer
     // guest tick may already have reused the same particle index, so it must
     // not suppress this retained retail packet.
-    render_raw_packet(entry.packet, authored_camera, false);
+    render_raw_packet(entry.packet, authored_camera, false,
+                      retained_taser_warps);
   }
 }
 
@@ -1374,21 +2696,168 @@ struct LegacyLightAccumulator {
   double y{};
   double z{};
   double maximum_scale{};
+  std::uint64_t red_sum{};
+  std::uint64_t green_sum{};
+  std::uint64_t blue_sum{};
   std::uint8_t earliest_frame{0xffU};
   std::uint16_t count{};
 };
 
+[[nodiscard]] std::uint32_t
+legacyDynamicLightSourceId(const LegacyLightAccumulator &source) noexcept {
+  return static_cast<std::uint32_t>(
+      0x20000000U ^
+      (static_cast<std::uint32_t>(source.controller) << 8U) ^
+      static_cast<std::uint16_t>(source.source_slot) ^
+      static_cast<std::uint32_t>(source.family));
+}
+
+[[nodiscard]] game::DynamicLightAppearance dynamicLightAppearance(
+    const game::LegacyHaloPresentationDescriptor &descriptor) noexcept {
+  return {
+      game::DynamicLightRgb{descriptor.red, descriptor.green, descriptor.blue},
+      descriptor.light_radius_scale,
+      descriptor.light_intensity_scale,
+  };
+}
+
+[[nodiscard]] game::DynamicLightAppearance dynamicLightAppearance(
+    const game::LegacyCfireVolumeTuning &tuning) noexcept {
+  return {
+      std::nullopt,
+      tuning.light_radius_scale,
+      tuning.light_intensity_scale,
+  };
+}
+
+[[nodiscard]] game::DynamicLightAppearance legacyParticleLightAppearance(
+    const LegacyLightAccumulator &source, std::uint32_t mission_index,
+    bool cfire_owned) noexcept {
+  const auto tuning =
+      game::legacyCfireVolumeTuning(mission_index, cfire_owned);
+  if (source.count == 0U) {
+    return dynamicLightAppearance(tuning);
+  }
+  const auto fire =
+      source.family == game::LegacyEffectSpriteFamily::fire || cfire_owned;
+  const auto base = fire ? game::DynamicLightRgb{1.0, 0.36, 0.08}
+                         : game::DynamicLightRgb{1.0, 0.43, 0.10};
+  // The volume shader keeps the native heat ramp and uses bridge RGB only as
+  // a tint. Mirror its exact family weight so neutral retail modulation keeps
+  // the kind profile while authored coloured particles move both together.
+  const auto tint_weight = fire ? 0.64 : 0.62;
+  const auto inverse =
+      1.0 / (static_cast<double>(source.count) * 128.0);
+  const auto tint = game::DynamicLightRgb{
+      static_cast<double>(source.red_sum) * inverse,
+      static_cast<double>(source.green_sum) * inverse,
+      static_cast<double>(source.blue_sum) * inverse,
+  };
+  const auto channel = [tint_weight](double profile, double authored) {
+    return profile * ((1.0 - tint_weight) + authored * tint_weight);
+  };
+  return {
+      game::DynamicLightRgb{channel(base.red, tint.red),
+                            channel(base.green, tint.green),
+                            channel(base.blue, tint.blue)},
+      tuning.light_radius_scale,
+      tuning.light_intensity_scale,
+  };
+}
+
+void rebuildLegacyLightAccumulators(
+    std::span<const game::LegacyExplParticle> particles,
+    std::vector<LegacyLightAccumulator> &lights) {
+  lights.clear();
+  lights.reserve(particles.size());
+  for (const auto &particle : particles) {
+    if (particle.family != game::LegacyEffectSpriteFamily::explosion &&
+        particle.family != game::LegacyEffectSpriteFamily::fire) {
+      continue;
+    }
+    auto accumulator = std::ranges::find_if(
+        lights, [&](const LegacyLightAccumulator &candidate) {
+          return candidate.controller == particle.controller &&
+                 candidate.source_slot == particle.source_slot &&
+                 candidate.family == particle.family;
+        });
+    if (accumulator == lights.end()) {
+      lights.push_back(LegacyLightAccumulator{
+          particle.controller,
+          particle.source_slot,
+          particle.family,
+      });
+      accumulator = std::prev(lights.end());
+    }
+    accumulator->x += static_cast<double>(particle.x);
+    accumulator->y += static_cast<double>(particle.y);
+    accumulator->z += static_cast<double>(particle.z);
+    accumulator->maximum_scale =
+        std::max(accumulator->maximum_scale,
+                 static_cast<double>(particle.scale_byte) / 57.0);
+    accumulator->red_sum += particle.red;
+    accumulator->green_sum += particle.green;
+    accumulator->blue_sum += particle.blue;
+    accumulator->earliest_frame =
+        std::min(accumulator->earliest_frame, particle.frame);
+    ++accumulator->count;
+  }
+}
+
+template <typename Source, typename Valid>
+void retainVisiblePointLights(
+    std::vector<Source> &sources, Valid valid,
+    const game::GameplaySession &gameplay,
+    game::DynamicLightPoint observer, std::size_t maximum_queries) {
+  const auto finite = [](game::DynamicLightPoint point) {
+    return std::isfinite(point.x) && std::isfinite(point.y) &&
+           std::isfinite(point.z);
+  };
+  if (!finite(observer) || maximum_queries == 0U) {
+    sources.clear();
+    return;
+  }
+  std::erase_if(sources, [&](const Source &source) {
+    return !valid(source) || !finite(source.position);
+  });
+  const auto distance_squared = [observer](const Source &source) {
+    const auto x = source.position.x - observer.x;
+    const auto y = source.position.y - observer.y;
+    const auto z = source.position.z - observer.z;
+    return x * x + y * y + z * z;
+  };
+  std::stable_sort(sources.begin(), sources.end(), [&](const Source &first,
+                                                       const Source &second) {
+    return distance_squared(first) < distance_squared(second);
+  });
+  if (sources.size() > maximum_queries) {
+    sources.resize(maximum_queries);
+  }
+  const auto room = gameplay.currentRoom();
+  std::erase_if(sources, [&](const Source &source) {
+    return !gameplay.droppedItemVisibleFrom(
+        observer.x, observer.y, observer.z, source.position.x,
+        source.position.y, source.position.z, room);
+  });
+}
+
 struct DynamicLightFrameScratch {
   std::vector<game::PersistentDynamicLightState> persistent;
   std::vector<game::TransientDynamicLightState> transient;
+  std::vector<game::FlamethrowerLightSegment> flamethrower_segments;
   std::vector<LegacyLightAccumulator> legacy_lights;
+  std::array<std::int32_t, 0x58U> legacy_cfire_owner_by_controller{};
+  std::vector<bool> legacy_cfire_owned_emitters;
   std::uint64_t guest_frame{std::numeric_limits<std::uint64_t>::max()};
   bool valid{};
 
   void reset() noexcept {
     persistent.clear();
     transient.clear();
+    flamethrower_segments.clear();
     legacy_lights.clear();
+    legacy_cfire_owner_by_controller.fill(-1);
+    legacy_cfire_owned_emitters.clear();
     guest_frame = std::numeric_limits<std::uint64_t>::max();
     valid = false;
   }
@@ -1409,12 +2878,16 @@ void updateDynamicLightFrame(
   active_retail_vertex_lights.clear();
   active_retail_vertex_lights.reserve(presentation.vertex_lights.size());
   for (const auto &source : presentation.vertex_lights) {
-    active_retail_vertex_lights.push_back(retailVertexLightState(source));
+    if (auto light =
+            game::prepareRetailVertexLight(retailVertexLightState(source))) {
+      active_retail_vertex_lights.push_back(*light);
+    }
   }
   active_retail_light_projection = std::max(presentation.camera.projection, 1);
 
   auto &persistent = scratch.persistent;
   auto &transient = scratch.transient;
+  auto &legacy_lights = scratch.legacy_lights;
   const auto refresh_guest_sources =
       !scratch.valid || scratch.guest_frame != presentation.guest_frame;
   if (refresh_guest_sources) {
@@ -1424,6 +2897,29 @@ void updateDynamicLightFrame(
     scratch.valid = true;
     scratch.guest_frame = presentation.guest_frame;
     persistent.clear();
+    scratch.legacy_cfire_owner_by_controller.fill(-1);
+    scratch.legacy_cfire_owned_emitters.assign(gameplay.objects().size(),
+                                                false);
+    auto resolved_controllers = std::array<bool, 0x58U>{};
+    for (const auto &particle : presentation.expl_particles) {
+      if (particle.controller >= resolved_controllers.size() ||
+          resolved_controllers[particle.controller] ||
+          !game::legacyExplParticlePresentsAuthoredFire(particle.family)) {
+        continue;
+      }
+      resolved_controllers[particle.controller] = true;
+      const auto owner = persistentFireEmitterSource(
+          gameplay, presentation.expl_particles, particle);
+      if (!owner || owner->identity >= gameplay.objects().size() ||
+          owner->identity >
+              static_cast<std::size_t>(
+                  std::numeric_limits<std::int32_t>::max())) {
+        continue;
+      }
+      scratch.legacy_cfire_owner_by_controller[particle.controller] =
+          static_cast<std::int32_t>(owner->identity);
+      scratch.legacy_cfire_owned_emitters[owner->identity] = true;
+    }
     persistent.reserve(gameplay.activeObjects().size());
     for (const auto object_index : gameplay.activeObjects()) {
       if (object_index >= presentation.objects.size()) {
@@ -1437,7 +2933,9 @@ void updateDynamicLightFrame(
       auto kind = std::optional<game::DynamicLightKind>{};
       if (model.visual_effect == game::ObjectVisualEffect::police_lightbar) {
         kind = game::DynamicLightKind::police_lightbar;
-      } else if (std::holds_alternative<game::ObjectFireEmitter>(
+      } else if (model.visual_effect ==
+                     game::ObjectVisualEffect::fire_volume ||
+                 std::holds_alternative<game::ObjectFireEmitter>(
                      model.geometry)) {
         kind = game::DynamicLightKind::steady_fire;
       } else if (object.class_id != 0x16U &&
@@ -1453,6 +2951,20 @@ void updateDynamicLightFrame(
       if (!kind) {
         continue;
       }
+      if (*kind == game::DynamicLightKind::steady_fire &&
+          std::holds_alternative<game::ObjectFireEmitter>(model.geometry)) {
+        const auto guest_slots = gameplay.legacyGuestSlotsBySceneObject();
+        const auto guest_slot =
+            object_index < guest_slots.size() ? guest_slots[object_index] : -1;
+        if (legacyGuestSlotHasLiveAuthoredFire(presentation.expl_particles,
+                                               guest_slot) ||
+            (object_index < scratch.legacy_cfire_owned_emitters.size() &&
+             scratch.legacy_cfire_owned_emitters[object_index])) {
+          // The exact retail EXPL/FIRE controller owns both the volume and its
+          // dynamic light; do not add the host emitter's persistent duplicate.
+          continue;
+        }
+      }
       auto centre = transformPoint(0.0, 0.0, 0.0, object.transform);
       if (model.bounds) {
         centre = transformPoint((static_cast<double>(model.bounds->minimum_x) +
@@ -1466,6 +2978,20 @@ void updateDynamicLightFrame(
                                     0.5,
                                 object.transform);
       }
+      auto appearance = game::DynamicLightAppearance{};
+      if (model.visual_effect == game::ObjectVisualEffect::billboard_glow ||
+          model.visual_effect == game::ObjectVisualEffect::lamp_fixture) {
+        // HMD back-colour can be distance-cued. Keep the light neutral until
+        // the guest sprite supplies its authored CLUT hue.
+        appearance = dynamicLightAppearance(
+            game::legacyHaloPresentationDescriptor({128U, 128U, 128U}));
+      } else if (*kind == game::DynamicLightKind::steady_fire) {
+        const auto cfire_owned =
+            object.class_id == game::legacy_cfire_a_class &&
+            std::holds_alternative<game::ObjectFireEmitter>(model.geometry);
+        appearance = dynamicLightAppearance(game::legacyCfireVolumeTuning(
+            gameplay.missionIndex(), cfire_owned));
+      }
       persistent.push_back(game::PersistentDynamicLightState{
           *kind,
           {centre.x, centre.y, centre.z},
@@ -1474,6 +3000,7 @@ void updateDynamicLightFrame(
           true,
           gameplay.displayedObjectModel(object_index) != nullptr,
           gameplay.objectDestroyed(object_index),
+          appearance,
       });
     }
 
@@ -1481,45 +3008,15 @@ void updateDynamicLightFrame(
     transient.reserve(weapon_edges.size() + retail_muzzle_flashes.size() +
                       native_muzzle_flashes.size() + gameplay.effects().size() +
                       presentation.projectiles.size() +
-                      gameplay.legacyExplParticles().size());
+                      presentation.expl_particles.size() +
+                      game::maximum_flamethrower_dynamic_light_samples);
 
     // Retail SPFX particles are the authoritative explosion/fire presentation
     // once the guest renderer is active. Group the child sprites by controller
     // and recover one bounded light at their common centre; otherwise native
     // explosion effects are correctly suppressed but their illumination also
     // disappears.
-    auto &legacy_lights = scratch.legacy_lights;
-    legacy_lights.clear();
-    legacy_lights.reserve(gameplay.legacyExplParticles().size());
-    for (const auto &particle : gameplay.legacyExplParticles()) {
-      if (particle.family != game::LegacyEffectSpriteFamily::explosion &&
-          particle.family != game::LegacyEffectSpriteFamily::fire) {
-        continue;
-      }
-      auto accumulator = std::ranges::find_if(
-          legacy_lights, [&](const LegacyLightAccumulator &candidate) {
-            return candidate.controller == particle.controller &&
-                   candidate.source_slot == particle.source_slot &&
-                   candidate.family == particle.family;
-          });
-      if (accumulator == legacy_lights.end()) {
-        legacy_lights.push_back(LegacyLightAccumulator{
-            particle.controller,
-            particle.source_slot,
-            particle.family,
-        });
-        accumulator = std::prev(legacy_lights.end());
-      }
-      accumulator->x += static_cast<double>(particle.x);
-      accumulator->y += static_cast<double>(particle.y);
-      accumulator->z += static_cast<double>(particle.z);
-      accumulator->maximum_scale =
-          std::max(accumulator->maximum_scale,
-                   static_cast<double>(particle.scale_byte) / 57.0);
-      accumulator->earliest_frame =
-          std::min(accumulator->earliest_frame, particle.frame);
-      ++accumulator->count;
-    }
+    rebuildLegacyLightAccumulators(presentation.expl_particles, legacy_lights);
     for (const auto &source : legacy_lights) {
       if (source.count == 0U) {
         continue;
@@ -1529,7 +3026,14 @@ void updateDynamicLightFrame(
           source.earliest_frame >= layout.frame_count) {
         continue;
       }
-      const auto fire = source.family == game::LegacyEffectSpriteFamily::fire;
+      const auto cfire_owned =
+          source.family == game::LegacyEffectSpriteFamily::explosion &&
+          source.controller <
+              scratch.legacy_cfire_owner_by_controller.size() &&
+          scratch.legacy_cfire_owner_by_controller[source.controller] >= 0;
+      const auto fire =
+          source.family == game::LegacyEffectSpriteFamily::fire ||
+          cfire_owned;
       const auto total = static_cast<std::uint16_t>(layout.frame_count);
       const auto remaining =
           fire ? std::uint16_t{1U}
@@ -1541,17 +3045,41 @@ void updateDynamicLightFrame(
                : game::GameplayEffectType::explosion,
           {source.x * inverse_count, source.y * inverse_count,
            source.z * inverse_count},
-          static_cast<std::uint32_t>(
-              0x20000000U ^
-              (static_cast<std::uint32_t>(source.controller) << 8U) ^
-              static_cast<std::uint16_t>(source.source_slot) ^
-              static_cast<std::uint32_t>(source.family)),
+          legacyDynamicLightSourceId(source),
           std::clamp(source.maximum_scale, 0.5, 3.0),
           remaining,
           fire ? std::uint16_t{1U} : total,
           true,
+          legacyParticleLightAppearance(source, gameplay.missionIndex(),
+                                        cfire_owned),
       });
     }
+    const auto park2_flame_translation =
+        park2GirdeuxFlameTranslation(gameplay, actor_animations, presentation)
+            .value_or(game::DynamicLightPoint{});
+    auto &flamethrower_segments = scratch.flamethrower_segments;
+    flamethrower_segments.clear();
+    flamethrower_segments.reserve(
+        gameplay.legacyPark2FlamethrowerRibbons().size());
+    for (const auto &ribbon : gameplay.legacyPark2FlamethrowerRibbons()) {
+      auto world =
+          park2FlameWorldGeometry(ribbon, presentation.guest_packet_camera);
+      if (!world) {
+        continue;
+      }
+      sf::platform::translatePark2FlameWorldGeometry(*world,
+                                                     park2_flame_translation);
+      flamethrower_segments.push_back(game::FlamethrowerLightSegment{
+          world->centres[0],
+          world->centres[1],
+          static_cast<std::uint32_t>(0x60000000U | ribbon.slot),
+      });
+    }
+    const auto flame_lights =
+        game::flamethrowerDynamicLightSamples(flamethrower_segments);
+    const auto active_flame_lights = flame_lights.active();
+    transient.insert(transient.end(), active_flame_lights.begin(),
+                     active_flame_lights.end());
     for (const auto &edge : weapon_edges) {
       const auto weapon = static_cast<game::WeaponId>(edge.weapon);
       if (edge.type != game::LegacyWeaponEventType::shot ||
@@ -1681,6 +3209,74 @@ void updateDynamicLightFrame(
           true,
       });
     }
+
+    // Volume depth rejection and point-light visibility must agree. Limit
+    // candidates before collision: at most 32 transient plus 32 persistent
+    // queries (64 total) once per 20 Hz tick, while the final frame remains
+    // capped at 32 lights.
+    const auto observer = game::DynamicLightPoint{
+        presentation.camera.x, presentation.camera.y,
+        presentation.camera.z};
+    retainVisiblePointLights(
+        transient,
+        [](const game::TransientDynamicLightState &source) {
+          return source.position_confirmed &&
+                 std::isfinite(source.scale) && source.scale > 0.0 &&
+                 source.total_updates != 0U &&
+                 source.remaining_updates != 0U &&
+                 source.remaining_updates <= source.total_updates;
+        },
+        gameplay, observer, game::maximum_dynamic_lights);
+    retainVisiblePointLights(
+        persistent,
+        [](const game::PersistentDynamicLightState &source) {
+          return source.identity_confirmed && source.active &&
+                 source.resident && !source.destroyed;
+        },
+        gameplay, observer, game::maximum_dynamic_lights);
+  }
+
+  // The source roster and collision visibility are guest-tick decisions, but
+  // its presentation positions use the same display-rate interpolation as the
+  // volumes. This prevents a 20 Hz light from lagging behind smooth SPFX/GMD.
+  if (!refresh_guest_sources) {
+    rebuildLegacyLightAccumulators(presentation.expl_particles, legacy_lights);
+  }
+  for (const auto &source : legacy_lights) {
+    if (source.count == 0U) {
+      continue;
+    }
+    const auto light = std::ranges::find(
+        transient, legacyDynamicLightSourceId(source),
+        &game::TransientDynamicLightState::source_id);
+    if (light == transient.end()) {
+      continue;
+    }
+    const auto inverse_count = 1.0 / static_cast<double>(source.count);
+    light->position = {source.x * inverse_count, source.y * inverse_count,
+                       source.z * inverse_count};
+  }
+  for (auto &light : persistent) {
+    if (light.source_id >= presentation.objects.size()) {
+      continue;
+    }
+    const auto &object = presentation.objects[light.source_id];
+    if (object.model >= gameplay.objectModels().size()) {
+      continue;
+    }
+    const auto &model = gameplay.objectModels()[object.model];
+    auto centre = transformPoint(0.0, 0.0, 0.0, object.transform);
+    if (model.bounds) {
+      centre = transformPoint(
+          (static_cast<double>(model.bounds->minimum_x) +
+           model.bounds->maximum_x) * 0.5,
+          (static_cast<double>(model.bounds->minimum_y) +
+           model.bounds->maximum_y) * 0.5,
+          (static_cast<double>(model.bounds->minimum_z) +
+           model.bounds->maximum_z) * 0.5,
+          object.transform);
+    }
+    light.position = {centre.x, centre.y, centre.z};
   }
 
   std::array<game::DirectionalDynamicLightState,
@@ -1730,16 +3326,19 @@ void updateDynamicLightFrame(
                                            true};
   }
 
+  const auto light_observer = game::DynamicLightPoint{
+      presentation.camera.x, presentation.camera.y, presentation.camera.z};
   active_dynamic_lights = game::buildDynamicLightFrame(
-      persistent, transient,
-      {presentation.camera.x, presentation.camera.y, presentation.camera.z},
+      persistent, transient, light_observer,
       std::span{directional}.first(directional_count),
       presentation.guest_frame);
   active_baked_world_dynamic_lights =
-      game::dynamicLightFrameForBakedWorld(active_dynamic_lights);
+      game::dynamicLightFrameForBakedWorld(active_dynamic_lights, light_observer);
+  const auto shadow_observer = game::DynamicLightPoint{
+      presentation.player.x, presentation.player.y, presentation.player.z};
   active_dynamic_shadow_lights = game::buildDynamicLightFrame(
       persistent, std::span<const game::TransientDynamicLightState>{},
-      {presentation.camera.x, presentation.camera.y, presentation.camera.z},
+      shadow_observer,
       std::span<const game::DirectionalDynamicLightState>{},
       presentation.guest_frame);
   active_dynamic_light_observer = {presentation.camera.x, presentation.camera.y,
@@ -1791,11 +3390,15 @@ void renderProjectileSprites(const HudTextureAtlas &textures,
 template <std::size_t Count>
 const std::array<VertexColor, 4U> &cachedWorldPolygonLighting(
     WorldPolygonLightingCache &cache, WorldPolygonLightingCacheEntry &entry,
-    const std::array<SVECTOR, Count> &positions,
     const assets::EmdSection &section, const assets::EmdPolygon &polygon,
     std::span<const std::uint16_t> live_colors) {
   if (cache.current(entry)) {
     return entry.colors;
+  }
+  auto positions = std::array<SVECTOR, Count>{};
+  for (auto corner = std::size_t{}; corner < Count; ++corner) {
+    positions[corner] =
+        makeVertex(section.vertices[polygon.vertex_indices[corner]]);
   }
   const auto normal = visibleSurfaceNormal(positions);
   for (auto corner = std::size_t{}; corner < Count; ++corner) {
@@ -1838,7 +3441,9 @@ void applyCachedWorldLighting(
 }
 
 RenderStats renderWorld(
-    const game::GameplaySession &gameplay, const TextureStreamer &textures,
+    const game::GameplaySession &gameplay,
+    std::span<const std::uint16_t> world_render_models,
+    const TextureStreamer &textures,
     const HudTextureAtlas &hud_textures, const FireAnimation &fire_animation,
     const FireTexturePlacement &fire_texture_placement,
     const CombatEffectTextureAtlas &effect_textures,
@@ -1870,21 +3475,31 @@ RenderStats renderWorld(
     DynamicLightFrameScratch &dynamic_light_scratch,
     WorldPolygonLightingCache &world_lighting_cache,
     LocalSceneLightingCache &local_scene_lighting_cache,
-    const WorldChunkAppearance &world_chunk_appearance,
     WeaponEffectsScratch &weapon_effects_scratch, HmdPoseScratch &pose_scratch,
-    PrimitiveBuffer &primitives, bool collect_render_stats) {
+    PrimitiveBuffer &primitives, bool render_retail_scrim,
+    bool collect_render_stats) {
+  const auto scanner_active = presentation.retail_virus_scanner_overlay;
+  const auto svd_active =
+      presentation.first_person_aim && presentation.optic_mode == 3U;
+
   ClearOTagR(reinterpret_cast<u_long *>(ordering_table.data()),
              ordering_table_size);
-  ClearOTagR(reinterpret_cast<u_long *>(optic_trail_ordering_table.data()),
-             ordering_table_size);
-  ClearOTagR(reinterpret_cast<u_long *>(optic_subject_ordering_table.data()),
-             ordering_table_size);
+  if (svd_active) {
+    ClearOTagR(reinterpret_cast<u_long *>(optic_trail_ordering_table.data()),
+               ordering_table_size);
+    ClearOTagR(reinterpret_cast<u_long *>(optic_subject_ordering_table.data()),
+               ordering_table_size);
+  }
   ClearOTagR(reinterpret_cast<u_long *>(shadow_ordering_table.data()),
              ordering_table_size);
-  ClearOTagR(reinterpret_cast<u_long *>(scrim_ordering_table.data()),
-             ordering_table_size);
-  ClearOTagR(reinterpret_cast<u_long *>(scanner_xray_ordering_table.data()),
-             ordering_table_size);
+  if (render_retail_scrim) {
+    ClearOTagR(reinterpret_cast<u_long *>(scrim_ordering_table.data()),
+               ordering_table_size);
+  }
+  if (scanner_active) {
+    ClearOTagR(reinterpret_cast<u_long *>(scanner_xray_ordering_table.data()),
+               ordering_table_size);
+  }
   ClearOTagR(reinterpret_cast<u_long *>(guest_overlay_ordering_table.data()),
              ordering_table_size);
   ClearOTagR(reinterpret_cast<u_long *>(fire_ordering_table.data()),
@@ -1897,17 +3512,15 @@ RenderStats renderWorld(
   world_lighting_cache.beginFrame(
       presentation.guest_frame, gameplay.currentRoom(),
       sf::platform::retailVertexLightPresentationSignature(
-          presentation.vertex_lights, active_retail_light_projection));
+          presentation.vertex_lights, active_retail_light_projection),
+      world_render_models);
   local_scene_lighting_cache.beginFrame(gameplay.currentRoom(),
                                         gameplay.presentationModels(),
                                         presentation.objects.size());
   const auto presented_player_weapon =
       presentation.flashlight_enabled ? game::WeaponId::flashlight
                                       : gameplay.hud().inventory().current();
-  const auto scanner_active = presentation.retail_virus_scanner_overlay;
   constexpr auto scanner_world_color = VertexColor{249U, 135U, 0U};
-  const auto svd_active =
-      presentation.first_person_aim && presentation.optic_mode == 3U;
   if (!svd_active) {
     optic_history.reset();
   }
@@ -1922,6 +3535,7 @@ RenderStats renderWorld(
   // of reusing a zero-sized optic buffer until the next guest tick.
   if (primitives.needsCapacityPlan(presentation.guest_frame,
                                    gameplay.currentRoom(),
+                                   world_render_models,
                                    presentation.first_person_aim,
                                    presentation.optic_mode, scanner_active)) {
     const auto add_to_budget = [](std::size_t &budget, std::size_t amount,
@@ -1934,7 +3548,7 @@ RenderStats renderWorld(
       budget += amount;
     };
     std::size_t polygon_count = 0;
-    for (const auto model_index : gameplay.presentationModels()) {
+    for (const auto model_index : world_render_models) {
       add_to_budget(polygon_count,
                     gameplay.models()[model_index].scene.polygonCount(),
                     "Terrain");
@@ -1970,7 +3584,7 @@ RenderStats renderWorld(
                     triangle_count * receiver_subdivision_triangles,
                     description);
     };
-    if (presentation.scrim.visible) {
+    if (render_retail_scrim) {
       const auto *scrim = gameplay.detachedScrimModel();
       if (scrim == nullptr || !presentation.scrim.transform_valid) {
         throw core::Error{core::ErrorCode::not_found,
@@ -2007,6 +3621,19 @@ RenderStats renderWorld(
     };
     for (const auto object_index : gameplay.activeObjects()) {
       const auto *displayed_model = gameplay.displayedObjectModel(object_index);
+      if (displayed_model != nullptr &&
+          object_index < gameplay.objects().size()) {
+        const auto &object = gameplay.objects()[object_index];
+        if (game::legacyAuthoredObjectPresentationHidden(
+                gameplay.missionIndex(),
+                object_index < gameplay.legacyGuestSlotsBySceneObject().size()
+                    ? gameplay.legacyGuestSlotsBySceneObject()[object_index]
+                    : -1,
+                object.source_index, object.definition_index, object.class_id,
+                displayed_model->name)) {
+          continue;
+        }
+      }
       if (displayed_model == nullptr) {
         continue;
       }
@@ -2056,6 +3683,14 @@ RenderStats renderWorld(
                       std::get<assets::EmdScene>(geometry).polygonCount(),
                       "Object scene");
       }
+    }
+    for (auto object_index = std::size_t{};
+         object_index < gameplay.objects().size(); ++object_index) {
+      if (legacyDistantAuthoredFireEmitter(gameplay, object_index) == nullptr) {
+        continue;
+      }
+      add_to_budget(fire_particle_budget, fire_particle_count,
+                    "Distant authored fire");
     }
     // Scanner bodies and GRGLO/GDF reveals may be script-hidden from
     // activeObjects. Reserve the exact target pair exported by the retail VM.
@@ -2109,7 +3744,7 @@ RenderStats renderWorld(
       }
     }
     const auto legacy_fallback_particle_count = std::ranges::count_if(
-        gameplay.legacyExplParticles(), [&](const auto &particle) {
+        presentation.expl_particles, [&](const auto &particle) {
           return !game::legacyExplParticleHasGuestSprite(
               particle.pool_index, static_cast<std::uint8_t>(particle.family),
               presentation.guest_sprites,
@@ -2180,6 +3815,7 @@ RenderStats renderWorld(
     primitives.combat_effect_lines.reserve(256U);
     primitives.combat_effect_triangles.reserve(256U);
     primitives.effect_sprite_quads.reserve(2048U);
+    primitives.world_decals.reserve(game::legacy_world_decal_capacity);
     primitives.park2_flamethrower_ribbons.reserve(
         gameplay.legacyPark2FlamethrowerRibbons().size());
     std::size_t pickup_sprite_budget{};
@@ -2187,6 +3823,22 @@ RenderStats renderWorld(
       add_to_budget(pickup_sprite_budget,
                     game::droppedItemIconLayers(item.item).size(),
                     "Pickup sprite");
+    }
+    const auto keycard_layers = game::droppedItemIconLayers(
+        static_cast<std::uint16_t>(game::WeaponId::key_card));
+    for (const auto object_index : gameplay.activeObjects()) {
+      if (object_index >= presentation.objects.size() ||
+          object_index >= gameplay.objects().size()) {
+        continue;
+      }
+      const auto &source_object = gameplay.objects()[object_index];
+      const auto *displayed_model = gameplay.displayedObjectModel(object_index);
+      if (displayed_model == nullptr ||
+          !retailKeycardPickupObject(source_object, displayed_model->name)) {
+        continue;
+      }
+      add_to_budget(pickup_sprite_budget, keycard_layers.size(),
+                    "Keycard pickup sprite");
     }
     primitives.pickup_sprites.reserve(pickup_sprite_budget);
     std::size_t projectile_sprite_budget{};
@@ -2249,12 +3901,15 @@ RenderStats renderWorld(
   const auto has_exact_view =
       PGXP_MatrixLookup(&view, exact_rotation.data()) != 0 &&
       PGXP_MatrixLookupTranslation(&view, exact_translation.data()) != 0;
+  // Submit the presentation shell first, followed by its connected lookahead
+  // prefix. addPrim prepends within an OT bin, so farther route packets execute
+  // first and the current shell executes later to close equal-depth interior
+  // boundaries, all through this one original linked-list ordering table.
   // Bound temporary PGXP records so surviving packets retain 16-bit indices.
   auto projection_cache_vertex_budget = std::size_t{8192U};
-  for (const auto model_index : gameplay.presentationModels()) {
-    const auto &scene = gameplay.models()[model_index].scene;
-    const auto chunk_depth_cue_floor =
-        world_chunk_appearance.depthCueFloorQ12(model_index);
+  for (const auto model_index : world_render_models) {
+    const auto &world_model = gameplay.models()[model_index];
+    const auto &scene = world_model.scene;
     const auto texture_bank = scene.textureBank();
     for (auto section_index = std::size_t{};
          section_index < scene.sections().size(); ++section_index) {
@@ -2305,8 +3960,7 @@ RenderStats renderWorld(
                  static_cast<std::int64_t>(view.m[2][2]) * vertex.z) >>
                 12U) +
             view.t[2];
-        depth_cues[vertex_index] = std::max(
-            chunk_depth_cue_floor, retailTerrainDepthCue(integer_depth));
+        depth_cues[vertex_index] = retailTerrainDepthCue(integer_depth);
         if (cache_section_projection) {
           auto source = makeVertex(vertex);
           auto &projected = projected_vertices[vertex_index];
@@ -2354,9 +4008,6 @@ RenderStats renderWorld(
                                         : NearPlaneStatus::intersecting;
         };
         const auto texture_source_page = emdTextureSourcePage(scene, polygon);
-        auto v0 = makeVertex(section.vertices[polygon.vertex_indices[0]]);
-        auto v1 = makeVertex(section.vertices[polygon.vertex_indices[1]]);
-        auto v2 = makeVertex(section.vertices[polygon.vertex_indices[2]]);
         long xy0{};
         long xy1{};
         long xy2{};
@@ -2376,17 +4027,23 @@ RenderStats renderWorld(
         };
 
         if (polygon.quad) {
-          auto v3 = makeVertex(section.vertices[polygon.vertex_indices[3]]);
-          const std::array positions{v0, v1, v2, v3};
           const auto near_status = near_status_for(4U);
           if (near_status == NearPlaneStatus::outside) {
             ++stats.rejected;
             continue;
           }
           if (near_status == NearPlaneStatus::intersecting) {
-            const auto &lit = cachedWorldPolygonLighting(
-                world_lighting_cache, lighting_entry, positions, section,
-                polygon, live_colors);
+            const auto v0 =
+                makeVertex(section.vertices[polygon.vertex_indices[0]]);
+            const auto v1 =
+                makeVertex(section.vertices[polygon.vertex_indices[1]]);
+            const auto v2 =
+                makeVertex(section.vertices[polygon.vertex_indices[2]]);
+            const auto v3 =
+                makeVertex(section.vertices[polygon.vertex_indices[3]]);
+            const auto &lit = cachedWorldPolygonLighting<4U>(
+                world_lighting_cache, lighting_entry, section, polygon,
+                live_colors);
             const auto t0 = cachedWorldTexturedVertex(
                 v0, polygon.uv[0],
                 scanner_active ? scanner_world_color : lit[0]);
@@ -2411,12 +4068,10 @@ RenderStats renderWorld(
             };
             submitClippedTriangle(first_triangle, material, false, false, view,
                                   ordering_table, primitives.triangles, stats,
-                                  worldOrderingDepth, true, true,
-                                  chunk_depth_cue_floor);
+                                  worldOrderingDepth, true, true, 0L);
             submitClippedTriangle(second_triangle, material, false, false, view,
                                   ordering_table, primitives.triangles, stats,
-                                  worldOrderingDepth, true, true,
-                                  chunk_depth_cue_floor);
+                                  worldOrderingDepth, true, true, 0L);
             continue;
           }
           if (cache_section_projection) {
@@ -2440,6 +4095,10 @@ RenderStats renderWorld(
             }
             static_cast<void>(emit_cached_projection(4U));
           } else {
+            auto v0 = makeVertex(section.vertices[polygon.vertex_indices[0]]);
+            auto v1 = makeVertex(section.vertices[polygon.vertex_indices[1]]);
+            auto v2 = makeVertex(section.vertices[polygon.vertex_indices[2]]);
+            auto v3 = makeVertex(section.vertices[polygon.vertex_indices[3]]);
             depth = RotTransPers4(&v0, &v1, &v2, &v3, &xy0, &xy1, &xy2, &xy3,
                                   &depth_cue, &flags);
             if (depth <= 0 || !frontFacing(xy0, xy1, xy2, 4U) ||
@@ -2452,8 +4111,8 @@ RenderStats renderWorld(
           auto &primitive = primitives.quads.emplace_back();
           configurePrimitive(primitive, section, polygon, texture_bank,
                              texture_source_page, live_colors);
-          const auto &lit = cachedWorldPolygonLighting(
-              world_lighting_cache, lighting_entry, positions, section, polygon,
+          const auto &lit = cachedWorldPolygonLighting<4U>(
+              world_lighting_cache, lighting_entry, section, polygon,
               live_colors);
           applyCachedWorldLighting(primitive, lit);
           setProjected(&primitive.x0, xy0);
@@ -2476,21 +4135,27 @@ RenderStats renderWorld(
                     scanner_world_color.green, scanner_world_color.blue);
           }
           addPrim(
-              &ordering_table[std::clamp(depth, 1, ordering_table_size - 1)],
+              &ordering_table[
+                  std::clamp(depth, 1, ordering_table_size - 1)],
               &primitive);
           const std::array projected{xy0, xy1, xy2, xy3};
           submitStats(stats, depth, projected);
         } else {
-          const std::array positions{v0, v1, v2};
           const auto near_status = near_status_for(3U);
           if (near_status == NearPlaneStatus::outside) {
             ++stats.rejected;
             continue;
           }
           if (near_status == NearPlaneStatus::intersecting) {
-            const auto &lit = cachedWorldPolygonLighting(
-                world_lighting_cache, lighting_entry, positions, section,
-                polygon, live_colors);
+            const auto v0 =
+                makeVertex(section.vertices[polygon.vertex_indices[0]]);
+            const auto v1 =
+                makeVertex(section.vertices[polygon.vertex_indices[1]]);
+            const auto v2 =
+                makeVertex(section.vertices[polygon.vertex_indices[2]]);
+            const auto &lit = cachedWorldPolygonLighting<3U>(
+                world_lighting_cache, lighting_entry, section, polygon,
+                live_colors);
             const std::array textured{
                 cachedWorldTexturedVertex(v0, polygon.uv[0],
                                           scanner_active ? scanner_world_color
@@ -2508,8 +4173,9 @@ RenderStats renderWorld(
                                  scanner_active, false,
                                  static_cast<std::uint8_t>(texture_bank),
                                  texture_source_page},
-                false, false, view, ordering_table, primitives.triangles, stats,
-                worldOrderingDepth, true, true, chunk_depth_cue_floor);
+                false, false, view, ordering_table,
+                primitives.triangles, stats, worldOrderingDepth, true, true,
+                0L);
             continue;
           }
           if (cache_section_projection) {
@@ -2531,6 +4197,9 @@ RenderStats renderWorld(
             }
             static_cast<void>(emit_cached_projection(3U));
           } else {
+            auto v0 = makeVertex(section.vertices[polygon.vertex_indices[0]]);
+            auto v1 = makeVertex(section.vertices[polygon.vertex_indices[1]]);
+            auto v2 = makeVertex(section.vertices[polygon.vertex_indices[2]]);
             depth = RotTransPers3(&v0, &v1, &v2, &xy0, &xy1, &xy2, &depth_cue,
                                   &flags);
             if (depth <= 0 || !frontFacing(xy0, xy1, xy2, 3U) ||
@@ -2542,8 +4211,8 @@ RenderStats renderWorld(
           auto &primitive = primitives.triangles.emplace_back();
           configurePrimitive(primitive, section, polygon, texture_bank,
                              texture_source_page, live_colors);
-          const auto &lit = cachedWorldPolygonLighting(
-              world_lighting_cache, lighting_entry, positions, section, polygon,
+          const auto &lit = cachedWorldPolygonLighting<3U>(
+              world_lighting_cache, lighting_entry, section, polygon,
               live_colors);
           applyCachedWorldLighting(primitive, lit);
           setProjected(&primitive.x0, xy0);
@@ -2562,7 +4231,8 @@ RenderStats renderWorld(
                     scanner_world_color.green, scanner_world_color.blue);
           }
           addPrim(
-              &ordering_table[std::clamp(depth, 1, ordering_table_size - 1)],
+              &ordering_table[
+                  std::clamp(depth, 1, ordering_table_size - 1)],
               &primitive);
           const std::array projected{xy0, xy1, xy2};
           submitStats(stats, depth, projected);
@@ -2570,7 +4240,7 @@ RenderStats renderWorld(
       }
     }
   }
-  if (presentation.scrim.visible) {
+  if (render_retail_scrim) {
     const auto *scrim = gameplay.detachedScrimModel();
     if (scrim == nullptr || !presentation.scrim.transform_valid) {
       throw core::Error{core::ErrorCode::not_found,
@@ -2589,6 +4259,9 @@ RenderStats renderWorld(
     renderEmdObject(*scrim, object, scrim->textureBank(), view,
                     scrim_ordering_table, primitives, stats, true);
   }
+  collectWorldObjectShadows(gameplay, presentation,
+                            dynamic_light_scratch.persistent, view,
+                            primitives);
   renderObjects(gameplay, fire_animation, fire_texture_placement,
                 actor_animations, actor_tick, interpolation_amount,
                 presentation, view, ordering_table,
@@ -2617,11 +4290,13 @@ RenderStats renderWorld(
   renderGlassShards(glass_shards, interpolation_amount, view, ordering_table,
                     primitives, stats);
   renderWeaponEffects(gameplay, actor_tick, weapon_edges, retail_muzzle_flashes,
-                      native_muzzle_flashes, retail_lines, combat_particles,
-                      fire_texture_placement, effect_textures, actor_animations,
-                      presentation, view, ordering_table, fire_ordering_table,
-                      primitives, stats, weapon_effects_scratch);
-  renderGuestCameraLists(gameplay, textures, presentation, retained_sprites,
+                      native_muzzle_flashes, guest_presentation.world_decals,
+                      retail_lines, combat_particles, fire_texture_placement,
+                      effect_textures, actor_animations, presentation, view,
+                      ordering_table, fire_ordering_table, primitives, stats,
+                      weapon_effects_scratch);
+  renderGuestCameraLists(gameplay, textures, presentation, actor_animations,
+                         actor_tick, pose_scratch, retained_sprites,
                          retained_raw_packets, view, ordering_table,
                          guest_overlay_ordering_table, primitives, stats);
   renderVirusScannerFallbackObjects(gameplay, presentation, view,

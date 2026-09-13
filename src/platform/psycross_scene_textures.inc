@@ -97,10 +97,35 @@ public:
       : blood_(
             assets::TimImage::parse(mission.specialEffects().file("BLOT.TIM"))),
         blood_mark_(assets::TimImage::parse(
-            mission.specialEffects().file("BBHOLE.TIM"))) {
+            mission.specialEffects().file("BBHOLE.TIM"))),
+        bullet_marks_{
+            assets::TimImage::parse(mission.specialEffects().file("BHOLE.TIM")),
+            assets::TimImage::parse(
+                mission.specialEffects().file("CBHOLE.TIM")),
+            assets::TimImage::parse(
+                mission.specialEffects().file("DBHOLE.TIM")),
+            assets::TimImage::parse(
+                mission.specialEffects().file("WBHOLE3.TIM")),
+            assets::TimImage::parse(
+                mission.specialEffects().file("GBHOLE2.TIM")),
+        } {
     validate(blood_, "BLOT.TIM");
     validate(blood_mark_, "BBHOLE.TIM");
-    if (blood_.clut()->words != blood_mark_.clut()->words) {
+    constexpr std::array<std::string_view, 5U> names{
+        "BHOLE.TIM", "CBHOLE.TIM", "DBHOLE.TIM", "WBHOLE3.TIM", "GBHOLE2.TIM"};
+    for (std::size_t index = 0U; index < bullet_marks_.size(); ++index) {
+      validate(bullet_marks_[index], names[index]);
+      if (bullet_marks_[index].displayWidth() != 16U ||
+          bullet_marks_[index].displayHeight() != 16U) {
+        throw core::Error{core::ErrorCode::invalid_format,
+                          "Unexpected retail bullet-hole dimensions: " +
+                              std::string{names[index]}};
+      }
+    }
+    if (blood_.clut()->words != blood_mark_.clut()->words ||
+        std::ranges::any_of(bullet_marks_, [&](const auto &image) {
+          return blood_.clut()->words != image.clut()->words;
+        })) {
       throw core::Error{core::ErrorCode::invalid_format,
                         "SPFX combat sprites do not share retail palettes"};
     }
@@ -111,6 +136,10 @@ public:
     uploadMuzzleFlash();
     upload(blood_, 80U, effect_resident_secondary_clut_y);
     upload(blood_mark_, 96U, effect_resident_secondary_clut_y);
+    for (std::size_t index = 0U; index < bullet_marks_.size(); ++index) {
+      upload(bullet_marks_[index], bulletMarkU(index),
+             effect_resident_secondary_clut_y, bulletMarkV(index));
+    }
     DrawSync(0);
   }
 
@@ -134,8 +163,61 @@ public:
   [[nodiscard]] EffectSpritePlacement bloodMark() const noexcept {
     return placement(96U, effect_resident_secondary_clut_y, blood_mark_);
   }
+  [[nodiscard]] EffectSpritePlacement bulletMark(
+      const std::array<std::uint32_t, 4U> &material_words) const noexcept {
+    const auto found =
+        std::ranges::find_if(bullet_marks_, [&](const auto &image) {
+          return sourceMaterialMatches(image, material_words);
+        });
+    const auto index =
+        found == bullet_marks_.end()
+            ? 0U
+            : static_cast<std::size_t>(found - bullet_marks_.begin());
+    return placement(bulletMarkU(index), effect_resident_secondary_clut_y,
+                     bullet_marks_[index], 0, bulletMarkV(index));
+  }
 
 private:
+  [[nodiscard]] static constexpr std::uint16_t
+  bulletMarkU(std::size_t index) noexcept {
+    constexpr std::array<std::uint16_t, 5U> coordinates{112U, 96U, 112U, 96U,
+                                                        112U};
+    return coordinates[index];
+  }
+
+  [[nodiscard]] static constexpr std::uint16_t
+  bulletMarkV(std::size_t index) noexcept {
+    constexpr std::array<std::uint16_t, 5U> coordinates{192U, 208U, 208U, 224U,
+                                                        224U};
+    return coordinates[index];
+  }
+
+  [[nodiscard]] static bool
+  sourceMaterialMatches(const assets::TimImage &image,
+                        const std::array<std::uint32_t, 4U> &words) noexcept {
+    const auto page = timTexturePage(image);
+    const auto page_x = (page & 15U) * 64U;
+    const auto page_y = page > 15U ? 256U : 0U;
+    const auto u0 = (static_cast<unsigned int>(image.pixels().x) - page_x) * 2U;
+    const auto v0 = static_cast<unsigned int>(image.pixels().y) - page_y;
+    const auto u1 = u0 + image.displayWidth() - 1U;
+    const auto v1 = v0 + image.displayHeight() - 1U;
+    const std::array<std::uint16_t, 4U> expected{
+        static_cast<std::uint16_t>((v0 << 8U) | u0),
+        static_cast<std::uint16_t>((v0 << 8U) | u1),
+        static_cast<std::uint16_t>((v1 << 8U) | u0),
+        static_cast<std::uint16_t>((v1 << 8U) | u1),
+    };
+    return static_cast<std::uint16_t>(words[0]) == expected[0] &&
+           static_cast<std::uint16_t>(words[1]) == expected[1] &&
+           static_cast<std::uint16_t>(words[2]) == expected[2] &&
+           static_cast<std::uint16_t>(words[3]) == expected[3] &&
+           static_cast<std::uint16_t>(words[0] >> 16U) ==
+               GetClut(image.clut()->x, image.clut()->y) &&
+           static_cast<std::uint16_t>(words[1] >> 16U) ==
+               GetTPage(texturePageMode(image.mode()), 0, page_x, page_y);
+  }
+
   static void uploadMuzzleFlash() {
     static_assert(muzzle_flash_texture::pixels.size() ==
                   muzzle_flash_texture::width_words *
@@ -170,33 +252,34 @@ private:
   }
 
   static void upload(const assets::TimImage &image, std::uint16_t u,
-                     std::uint16_t clut_y) {
+                     std::uint16_t clut_y,
+                     std::uint16_t v = effect_resident_vram_y) {
     uploadTimBlockAt(
         image.pixels(),
-        static_cast<std::uint16_t>(effect_resident_page_x + u / 2U),
-        effect_resident_vram_y);
+        static_cast<std::uint16_t>(effect_resident_page_x + u / 2U), v);
     uploadTimBlockAt(*image.clut(), effect_resident_clut_x, clut_y);
   }
 
   static EffectSpritePlacement
   placement(std::uint16_t u, std::uint16_t clut_y,
-            const assets::TimImage &image) noexcept {
+            const assets::TimImage &image, int abr = 1,
+            std::uint16_t v = effect_resident_vram_y) noexcept {
     const auto width = image.displayWidth();
     const auto height = image.displayHeight();
     return EffectSpritePlacement{
         static_cast<std::uint16_t>(
-            GetTPage(1, 1, effect_resident_page_x, effect_resident_page_y)),
+            GetTPage(1, abr, effect_resident_page_x, effect_resident_page_y)),
         static_cast<std::uint16_t>(GetClut(effect_resident_clut_x, clut_y)),
         static_cast<double>(u),
-        static_cast<double>(effect_resident_vram_y - effect_resident_page_y),
+        static_cast<double>(v - effect_resident_page_y),
         static_cast<double>(u + width - 1U),
-        static_cast<double>(effect_resident_vram_y - effect_resident_page_y +
-                            height - 1U),
+        static_cast<double>(v - effect_resident_page_y + height - 1U),
     };
   }
 
   assets::TimImage blood_;
   assets::TimImage blood_mark_;
+  std::array<assets::TimImage, 5U> bullet_marks_;
 };
 
 FireTexturePlacement
@@ -351,6 +434,13 @@ public:
   [[nodiscard]] bool
   contains(const game::LegacyGuestSpriteBridgeState &sprite) const noexcept {
     return find(sprite) != nullptr;
+  }
+
+  [[nodiscard]] bool
+  isSteam(const game::LegacyGuestSpriteBridgeState &sprite) const noexcept {
+    const auto *entry = find(sprite);
+    return entry != nullptr &&
+           static_cast<std::size_t>(entry - entries_.data()) < 8U;
   }
 
   [[nodiscard]] std::optional<GuestSpriteTexturePlacement>
@@ -626,6 +716,7 @@ public:
         requirementsChanged(gameplay, object_bank, guest_sprite_bank,
                             retained_sprites, glass_shards);
     if (requirements_rebuilt) {
+      admitted_world_lookahead_count_ = 0U;
       required_pages_.fill(unused_bank);
       required_banks_.fill(-1);
       for (auto &sources : required_clut_sources_) {
@@ -894,9 +985,8 @@ public:
           const auto bank = gameplay.displayedObjectTextureBank(object_index);
           if (object_index < gameplay.objects().size()) {
             const auto class_id = gameplay.objects()[object_index].class_id;
-            const auto weapon_crate = object_model->name == "WEPCRATE.GMD" ||
-                                      object_model->name == "WEPCRATX.GMD";
-            if ((class_id == 0x4fU || class_id == 0x50U) && weapon_crate &&
+            if (game::legacyWeaponCratePresentation(class_id,
+                                                    object_model->name) &&
                 bank < 2U) {
               required_crate_banks_[bank] = true;
             }
@@ -1076,6 +1166,146 @@ public:
         required_pages_[available] = environment_page_marker;
         required_banks_[available] = environment_bank;
         append_owner(available);
+      }
+      // Connected portal lookaheads are optional. Admit their cumulative
+      // prefix only after every hard scene user fits, stopping at the first
+      // model whose selectors or palette aliases do not fit exactly. This
+      // prevents a farther room from appearing without its nearer shell.
+      const auto prefetched_models = gameplay.prefetchedModels();
+      for (const auto model_index : prefetched_models) {
+        if (model_index >= models.size()) {
+          break;
+        }
+        const auto &scene = models[model_index].scene;
+        const auto bank = static_cast<int>(scene.textureBank());
+        auto trial_clut_sources = required_clut_sources_;
+        std::array<bool, 32U> trial_pages{};
+        auto valid = bank >= 0 && bank < 2 &&
+                     scene.resolvedTexturePageMask(page_mask_).has_value();
+        if (valid) {
+          for (const auto &section : scene.sections()) {
+            for (const auto &polygon : section.polygons) {
+              if (!polygon.renderable || polygon.degenerate) {
+                continue;
+              }
+              const auto source_page = assets::resolveEmdTexturePageSource(
+                  polygon.texture_page, scene.texturePageMask(), page_mask_);
+              if (!source_page) {
+                valid = false;
+                break;
+              }
+              trial_pages[*source_page] = true;
+              const auto y = static_cast<unsigned int>(polygon.clut >> 6U);
+              if (y >= mission_clut_source_y &&
+                  y < mission_clut_source_y + 32U) {
+                const auto palette_bank = static_cast<std::size_t>(
+                    canonicalMissionTextureBank(
+                        bank, mission_.textureBankCount()));
+                trial_clut_sources[palette_bank]
+                                  [y - mission_clut_source_y] = true;
+              }
+            }
+            if (!valid) {
+              break;
+            }
+          }
+        }
+        if (!valid) {
+          break;
+        }
+        // Optional lookahead must be transactional. Simulate the exact page
+        // allocator against copies first; otherwise an exhausted alias pool
+        // could throw after mutating part of the cumulative prefix.
+        auto trial_required_pages = required_pages_;
+        auto trial_required_banks = required_banks_;
+        const auto reserve_trial_page = [&](unsigned int source_page) {
+          source_page &= 0x1fU;
+          const auto source_bank = texturePageSourceBank(source_page, bank);
+          auto slot = physicalTexturePage(source_page);
+          const auto canonical_slot_reserved = slot == effect_resident_page;
+          if (canonical_slot_reserved ||
+              (trial_required_pages[slot] >= 0 &&
+               (trial_required_pages[slot] !=
+                    static_cast<int>(source_page) ||
+                trial_required_banks[slot] != source_bank))) {
+            auto existing = trial_required_pages.size();
+            for (auto candidate = std::size_t{};
+                 candidate < trial_required_pages.size(); ++candidate) {
+              if (trial_required_pages[candidate] ==
+                      static_cast<int>(source_page) &&
+                  trial_required_banks[candidate] == source_bank) {
+                existing = candidate;
+                break;
+              }
+            }
+            if (existing != trial_required_pages.size()) {
+              slot = static_cast<unsigned int>(existing);
+            } else {
+              const auto available =
+                  std::ranges::find_if(alias_pages, [&](unsigned int page) {
+                    return trial_required_pages[page] < 0;
+                  });
+              if (available == alias_pages.end()) {
+                return false;
+              }
+              slot = *available;
+            }
+          }
+          if (trial_required_pages[slot] < 0) {
+            trial_required_pages[slot] = static_cast<int>(source_page);
+            trial_required_banks[slot] = source_bank;
+            return true;
+          }
+          return trial_required_pages[slot] ==
+                     static_cast<int>(source_page) &&
+                 trial_required_banks[slot] == source_bank;
+        };
+        for (auto page = 0U; page < trial_pages.size(); ++page) {
+          if (trial_pages[page] && !reserve_trial_page(page)) {
+            valid = false;
+            break;
+          }
+        }
+        if (!valid) {
+          break;
+        }
+        constexpr std::size_t lookahead_clut_row_bytes = 256U * 2U;
+        const auto bank_zero_clut = clut_for_bank(0);
+        const auto bank_one_clut = clut_for_bank(1);
+        auto reserved_rows = std::size_t{};
+        auto conflicting_rows = std::size_t{};
+        for (std::size_t row = 0U; row < 32U; ++row) {
+          const auto bank_zero_required = trial_clut_sources[0][row];
+          const auto bank_one_required = trial_clut_sources[1][row];
+          if (!bank_zero_required && !bank_one_required) {
+            continue;
+          }
+          ++reserved_rows;
+          if (!bank_zero_required || !bank_one_required) {
+            continue;
+          }
+          const auto bank_zero = bank_zero_clut.subspan(
+              row * lookahead_clut_row_bytes, lookahead_clut_row_bytes);
+          const auto bank_one = bank_one_clut.subspan(
+              row * lookahead_clut_row_bytes, lookahead_clut_row_bytes);
+          conflicting_rows +=
+              std::equal(bank_zero.begin(), bank_zero.end(), bank_one.begin(),
+                         bank_one.end())
+                  ? 0U
+                  : 1U;
+        }
+        if (conflicting_rows > trial_pages.size() - reserved_rows) {
+          break;
+        }
+        requirement_context =
+            "world-lookahead-" + std::to_string(model_index);
+        for (unsigned int page = 0U; page < trial_pages.size(); ++page) {
+          if (trial_pages[page]) {
+            require_page(page, bank);
+          }
+        }
+        required_clut_sources_ = trial_clut_sources;
+        ++admitted_world_lookahead_count_;
       }
       const auto base_clut = vlfClut(vlf, page_mask_);
       required_clut_.assign(base_clut.begin(), base_clut.end());
@@ -1258,6 +1488,12 @@ public:
     streamed_texture_page_remap = required_page_remap_;
     streamed_clut_row_remap = required_clut_row_remap_;
 
+    // Guest/effect LoadImage and MoveImage traffic may overwrite a native
+    // page while its logical owner remains unchanged. Drop that stale
+    // residency before the upload loop so the authored page is restored in
+    // the same ensure pass instead of leaving foreign VRAM texels on models.
+    invalidateExternallyWrittenResidentPages();
+
     std::array<bool, resident_texture_page_count> capture_expected_pages{};
     auto changed = false;
     for (unsigned int slot = 0; slot < required_pages_.size(); ++slot) {
@@ -1308,7 +1544,9 @@ public:
           page_generations_[*trim_page],
           page_generations_[*top_page],
       };
-      if (crate_overlay_tokens_[bank] != tokens) {
+      if (crate_overlay_tokens_[bank] != tokens ||
+          !crate_overlay_pages_[*trim_page] ||
+          !crate_overlay_pages_[*top_page]) {
         crate_texture_overlay_.upload(*trim_page, *top_page);
         crate_overlay_pages_[*trim_page] = true;
         crate_overlay_pages_[*top_page] = true;
@@ -1338,6 +1576,16 @@ public:
     }
   }
 
+  [[nodiscard]] std::span<const std::uint16_t>
+  worldRenderModels(const game::GameplaySession &gameplay) const noexcept {
+    // ensure() uploads and DrawSyncs every model counted here before this
+    // accessor is consumed. Invalidated residency resets the count, and the
+    // common policy independently rejects a malformed/non-prefix topology.
+    return worldRenderEnvelope(
+        gameplay.presentationModels(), gameplay.terrainModels(),
+        requirements_valid_ ? admitted_world_lookahead_count_ : 0U);
+  }
+
   void invalidate() noexcept {
     // Only resident VRAM ownership is lost here. Source requirements remain
     // valid until requirementsChanged observes an exact gameplay input change.
@@ -1346,6 +1594,7 @@ public:
     requirement_presentation_sequence_ =
         std::numeric_limits<std::uint64_t>::max();
     transient_requirement_inputs_.clear();
+    admitted_world_lookahead_count_ = 0U;
     loaded_pages_.fill(PageState{});
     scrim_dirty_pages_.fill(false);
     crate_overlay_pages_.fill(false);
@@ -1403,7 +1652,6 @@ public:
   [[nodiscard]] std::uint64_t residencyRevision() const noexcept {
     return residency_revision_;
   }
-
 
   [[nodiscard]] std::uint8_t
   residentTextureBankMask(unsigned int logical_page) const noexcept {
@@ -1481,6 +1729,9 @@ public:
     runtime_expected_hash_[physical_page] =
         fingerprint(std::as_bytes(std::span{shared_page_readback_}));
     runtime_expected_hash_valid_[physical_page] = true;
+    // The caller has just committed and captured an intentional runtime
+    // mutation, so subsequent journal scans must start after that write.
+    page_upload_write_sequences_[physical_page] = GR_GetVRAMWriteSequence();
   }
 
   [[nodiscard]] std::optional<game::EffectTextureCopy>
@@ -1534,6 +1785,51 @@ public:
 
   [[nodiscard]] const FireTexturePlacement &firePlacement() const noexcept {
     return fire_placement_;
+  }
+
+  [[nodiscard]] bool guestSpriteIsSteam(
+      const game::LegacyGuestSpriteBridgeState &sprite) const noexcept {
+    return environment_atlas_.isSteam(sprite);
+  }
+
+  [[nodiscard]] std::optional<game::LegacyRgbBridgeState>
+  authoredGuestSpriteHaloColor(
+      const game::LegacyGuestSpriteBridgeState &sprite,
+      int texture_bank) const {
+    if (!sprite.force_fullbright || texture_bank < 0 || texture_bank >= 2) {
+      return std::nullopt;
+    }
+    const auto source_page = static_cast<unsigned int>(sprite.tpage & 0x1fU);
+    const auto retail_tpage = static_cast<std::uint16_t>(
+        source_page | ((sprite.attribute >> 17U) & 0x180U) |
+        ((sprite.attribute >> 23U) & 0x60U));
+    const auto texture_mode =
+        static_cast<unsigned int>((retail_tpage >> 7U) & 0x03U);
+    if (texture_mode > 1U || sprite.center_x < mission_clut_source_x ||
+        sprite.center_y < mission_clut_source_y ||
+        sprite.center_y >= mission_clut_source_y + 32U) {
+      return std::nullopt;
+    }
+    const auto palette_entries = texture_mode == 0U ? 16U : 256U;
+    if (static_cast<unsigned int>(sprite.center_x) + palette_entries >
+        mission_clut_source_x + 256U) {
+      return std::nullopt;
+    }
+    texture_bank = canonicalMissionTextureBank(
+        texture_bank, mission_.textureBankCount());
+    const auto vlf = mission_.archive().file("VLF.RFF");
+    const auto clut = texture_bank == 0
+                          ? vlfClut(vlf, page_mask_)
+                          : mission_.textureBank(
+                                static_cast<std::size_t>(texture_bank))
+                                .file("ZCLUT.BIN");
+    const auto clut_base_word =
+        static_cast<std::size_t>(sprite.center_y - mission_clut_source_y) *
+            256U +
+        static_cast<std::size_t>(sprite.center_x - mission_clut_source_x);
+    return game::legacyIndexedSpriteClutColor(
+        authoredTexturePage(source_page, texture_bank), clut, clut_base_word,
+        texture_mode, sprite.u, sprite.v, sprite.width, sprite.height);
   }
 
   [[nodiscard]] std::optional<GuestSpriteTexturePlacement> relocateGuestSprite(
@@ -1609,6 +1905,7 @@ private:
     object_bank,
     guest_sprite_bank,
     active_model,
+    world_lookahead,
     active_object,
     object_texture_bank,
     displayed_model,
@@ -1655,6 +1952,74 @@ private:
       return "framebuffer";
     default:
       return "unknown";
+    }
+  }
+
+  void invalidateExternallyWrittenResidentPages() noexcept {
+    const auto current_sequence = GR_GetVRAMWriteSequence();
+    auto oldest_baseline = current_sequence;
+    auto has_native_residency = false;
+    for (std::size_t slot = 0U;
+         slot < psx_texture_page_count && slot < required_pages_.size();
+         ++slot) {
+      const auto logical_page = required_pages_[slot];
+      const auto bank = required_banks_[slot];
+      if (logical_page < 0 ||
+          loaded_pages_[slot].logical_page != logical_page ||
+          loaded_pages_[slot].bank != bank) {
+        continue;
+      }
+      has_native_residency = true;
+      oldest_baseline =
+          std::min(oldest_baseline, page_upload_write_sequences_[slot]);
+    }
+    if (!has_native_residency || oldest_baseline >= current_sequence) {
+      return;
+    }
+
+    std::array<GrVRAMWriteEvent, 512U> writes{};
+    const auto write_count = GR_ReadVRAMWriteEvents(
+        oldest_baseline, writes.data(), static_cast<int>(writes.size()));
+    if (write_count <= 0) {
+      return;
+    }
+    const auto first_available_sequence = writes[0].sequence;
+    for (std::size_t slot = 0U;
+         slot < psx_texture_page_count && slot < required_pages_.size();
+         ++slot) {
+      const auto logical_page = required_pages_[slot];
+      const auto bank = required_banks_[slot];
+      if (logical_page < 0 ||
+          loaded_pages_[slot].logical_page != logical_page ||
+          loaded_pages_[slot].bank != bank) {
+        continue;
+      }
+
+      const auto baseline = page_upload_write_sequences_[slot];
+      const auto page_x = static_cast<int>((slot & 15U) * 64U);
+      const auto page_y = slot > 15U ? 256 : 0;
+      // If the bounded journal wrapped past this page's last known-good
+      // sequence, conservatively restore it: an unseen write may have hit it.
+      auto overwritten = first_available_sequence > baseline + 1U;
+      for (auto index = 0; index < write_count && !overwritten; ++index) {
+        const auto &write = writes[static_cast<std::size_t>(index)];
+        if (write.sequence <= baseline) {
+          continue;
+        }
+        overwritten = write.destination_x < page_x + 64 &&
+                      write.destination_x + write.width > page_x &&
+                      write.destination_y < page_y + 256 &&
+                      write.destination_y + write.height > page_y;
+      }
+      page_upload_write_sequences_[slot] = current_sequence;
+      if (!overwritten) {
+        continue;
+      }
+      loaded_pages_[slot] = PageState{};
+      scrim_dirty_pages_[slot] = false;
+      crate_overlay_pages_[slot] = false;
+      runtime_expected_hash_valid_[slot] = false;
+      reported_mismatch_hashes_[slot] = 0U;
     }
   }
 
@@ -1773,8 +2138,69 @@ private:
   };
 
   [[nodiscard]] static bool
+  needsAuthoredDistantFire(const game::GameplaySession &gameplay) noexcept {
+    if (!gameplay.legacyEffectParticlesAuthoritative()) {
+      return false;
+    }
+
+    const auto guest_slots = gameplay.legacyGuestSlotsBySceneObject();
+    const auto connected_resource_route = gameplay.terrainModels();
+    for (auto object_index = std::size_t{};
+         object_index < gameplay.objects().size(); ++object_index) {
+      if (object_index > std::numeric_limits<std::uint16_t>::max()) {
+        break;
+      }
+      const auto scene_index = static_cast<std::uint16_t>(object_index);
+      const auto scene_active =
+          std::ranges::find(gameplay.activeObjects(), scene_index) !=
+          gameplay.activeObjects().end();
+      const auto authored_rooms = gameplay.authoredObjectRooms(scene_index);
+      if (authored_rooms.empty()) {
+        continue;
+      }
+
+      const auto &object = gameplay.objects()[object_index];
+      if (object.model >= gameplay.objectModels().size()) {
+        continue;
+      }
+      const auto cfire_geometry =
+          std::holds_alternative<game::ObjectFireEmitter>(
+              gameplay.objectModels()[object.model].geometry);
+      const auto owner_on_connected_route =
+          std::ranges::any_of(authored_rooms, [&](std::uint16_t room) {
+            return std::ranges::find(connected_resource_route, room) !=
+                   connected_resource_route.end();
+          });
+      const auto destroyed = gameplay.objectDestroyed(scene_index);
+      const auto initially_hidden = gameplay.objectInitiallyHidden(scene_index);
+      if (game::legacyCfireSpritePreloadAllowed(
+              gameplay.missionIndex(), true, cfire_geometry, destroyed,
+              initially_hidden, scene_active, owner_on_connected_route)) {
+        return true;
+      }
+
+      // Preserve the existing non-SUBWAY2 fallback contract: outside the
+      // mission-specific resource preload, a live guest binding is still the
+      // only authority for distant CFIRE residency.
+      if (object_index >= guest_slots.size() || guest_slots[object_index] < 0 ||
+          destroyed || (initially_hidden && !scene_active)) {
+        continue;
+      }
+      if (cfire_geometry) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] static bool
   needsDynamicFire(const game::GameplaySession &gameplay) noexcept {
-    return !gameplay.legacyExplParticles().empty() ||
+    // activeObjects is guest-object residency, not proof that an EXPL flame is
+    // live. Pre-reside SPFX for every eligible authored CFIRE so the current
+    // presentation owner can expose its native fallback without a same-frame
+    // texture race.
+    return needsAuthoredDistantFire(gameplay) ||
+           !gameplay.legacyExplParticles().empty() ||
            !gameplay.legacyPark2FlamethrowerRibbons().empty() ||
            gameplay.hud().inventory().current() ==
                game::WeaponId::flamethrower ||
@@ -1813,6 +2239,11 @@ private:
                      static_cast<std::uintptr_t>(guest_sprite_bank));
     append_transient(RequirementInputKind::active_model,
                      gameplay.presentationModels().size());
+    const auto prefetched_models = gameplay.prefetchedModels();
+    for (const auto model : prefetched_models) {
+      append_transient(RequirementInputKind::world_lookahead,
+                       static_cast<std::uintptr_t>(model));
+    }
     append_transient(RequirementInputKind::active_object,
                      gameplay.activeObjects().size());
     append_transient(
@@ -1883,6 +2314,9 @@ private:
     }
     for (const auto model : gameplay.presentationModels()) {
       append(RequirementInputKind::active_model, model);
+    }
+    for (const auto model : prefetched_models) {
+      append(RequirementInputKind::world_lookahead, model);
     }
     for (const auto object : gameplay.activeObjects()) {
       append(RequirementInputKind::active_object, object);
@@ -2017,6 +2451,7 @@ private:
   std::array<bool, resident_texture_page_count>
       required_scrim_destination_pages_{};
   std::uint32_t scrim_destination_page_mask_{};
+  std::size_t admitted_world_lookahead_count_{};
   bool requirements_valid_{};
   std::array<PageState, resident_texture_page_count> loaded_pages_{};
   std::array<bool, resident_texture_page_count> scrim_dirty_pages_{};
@@ -2160,60 +2595,35 @@ public:
       }
       assets_.push_back(HudTextureAsset{entry.name, std::move(image)});
     }
-    auto armor_pickup = assets::TimImage::parse(
-        mission.specialEffects().file(armor_pickup_texture));
-    const auto secondary_spfx_palette =
-        assets::TimImage::parse(mission.specialEffects().file("BLOT.TIM"));
-    if (armor_pickup.mode() != assets::TimPixelMode::indexed8 ||
-        !armor_pickup.clut() || armor_pickup.displayWidth() != 32U ||
-        armor_pickup.pixels().height != 32U ||
-        armor_pickup.clut()->width_words != 256U ||
-        armor_pickup.clut()->height != 1U ||
-        armor_pickup.clut()->words.empty() || !secondary_spfx_palette.clut() ||
-        armor_pickup.clut()->words != secondary_spfx_palette.clut()->words) {
-      throw core::Error{core::ErrorCode::invalid_format,
-                        "SPFX armour pickup uses an unexpected TIM layout"};
-    }
-    armor_pickup_palette_ = *armor_pickup.clut();
-    armor_pickup_palette_.words.front() = 0U;
-    armor_pickup_pixels_ = armor_pickup.pixels();
-    const auto keep_vest_pixel = [](std::uint16_t x, std::uint16_t y) {
-      if (y < 4U) {
-        return (x >= 7U && x <= 12U) || (x >= 19U && x <= 24U);
-      }
-      if (y < 8U) {
-        return (x >= 4U && x <= 12U) || (x >= 19U && x <= 27U);
-      }
-      if (y < 12U) {
-        return x >= 2U && x <= 29U;
-      }
-      if (y < 26U) {
-        return x >= 5U && x <= 26U;
-      }
-      if (y < 30U) {
-        return x >= 7U && x <= 24U;
-      }
-      return x >= 9U && x <= 22U;
-    };
-    for (std::uint16_t y = 0U; y < armor_pickup_pixels_.height; ++y) {
-      for (std::uint16_t x = 0U; x < armor_pickup.displayWidth(); ++x) {
-        if (keep_vest_pixel(x, y)) {
-          continue;
-        }
-        auto &word =
-            armor_pickup_pixels_.words[static_cast<std::size_t>(y) *
-                                           armor_pickup_pixels_.width_words +
-                                       x / 2U];
-        word = x % 2U == 0U ? static_cast<std::uint16_t>(word & 0xff00U)
-                            : static_cast<std::uint16_t>(word & 0x00ffU);
-      }
-    }
-    assets_.push_back(HudTextureAsset{std::string{armor_pickup_texture},
-                                      std::move(armor_pickup)});
     if (assets_.empty()) {
       throw core::Error{core::ErrorCode::not_found,
                         "INTERFACE HUD atlas is empty"};
     }
+    const auto add_embedded_pickup = [&](std::string_view name,
+                                         std::span<const std::byte> bytes,
+                                         std::uint16_t expected_width,
+                                         std::uint16_t expected_height) {
+      auto pickup = assets::TimImage::parse(bytes);
+      if (pickup.mode() != assets::TimPixelMode::indexed8 || !pickup.clut() ||
+          pickup.displayWidth() != expected_width ||
+          pickup.displayHeight() != expected_height ||
+          pickup.pixels().width_words != expected_width / 2U ||
+          pickup.clut()->width_words != 256U || pickup.clut()->height != 1U ||
+          pickup.clut()->words.empty() || pickup.clut()->words.front() != 0U) {
+        throw core::Error{core::ErrorCode::invalid_format,
+                          "Embedded pickup uses an unexpected TIM layout: " +
+                              std::string{name}};
+      }
+      // Embedded pickups own audited resident rectangles and palettes.
+      // They must never pass through uploadHudPixels().
+      assets_.push_back(HudTextureAsset{std::string{name}, std::move(pickup)});
+    };
+    add_embedded_pickup(armor_pickup_texture,
+                        std::as_bytes(std::span{vest_pickup_texture::bytes}),
+                        32U, 32U);
+    add_embedded_pickup(
+        chopper_gun_pickup_texture,
+        std::as_bytes(std::span{chopper_gun_pickup_texture::bytes}), 64U, 16U);
     static_cast<void>(image("FONTA.TIM"));
     static_cast<void>(image("FONTB.TIM"));
     static_cast<void>(image("FONTC.TIM"));
@@ -2263,6 +2673,7 @@ public:
 
   void restoreGameplay(
       const game::GameplayHud &hud, bool first_person_aim,
+      bool mission_keycard_pickup_active,
       std::span<const game::LegacyDroppedItemBridgeState> dropped_items,
       std::span<const game::GameplayProjectile> projectiles) const {
     const auto weapon = hud.inventory().current();
@@ -2276,6 +2687,10 @@ public:
       } else if (item.item == 0x80U) {
         dropped_item_mask |= std::uint32_t{1U} << game::weapon_slot_count;
       }
+    }
+    if (mission_keycard_pickup_active) {
+      dropped_item_mask |= std::uint32_t{1U} << static_cast<std::size_t>(
+                               game::WeaponId::key_card);
     }
     auto projectile_mask = std::uint32_t{};
     for (const auto &projectile : projectiles) {
@@ -2304,11 +2719,14 @@ public:
 
     auto uploaded = false;
     const auto upload = [&](std::string_view name) {
+      const auto &asset = image(name);
       if (name == armor_pickup_texture) {
-        uploadTimBlockAt(armor_pickup_pixels_, pickup_resident_x,
-                         pickup_resident_y);
+        uploadTimBlockAt(asset.pixels(), pickup_resident_x, pickup_resident_y);
+      } else if (name == chopper_gun_pickup_texture) {
+        uploadTimBlockAt(asset.pixels(), chopper_gun_pickup_resident_x,
+                         chopper_gun_pickup_resident_y);
       } else {
-        uploadHudPixels(image(name).pixels());
+        uploadHudPixels(asset.pixels());
       }
       uploaded = true;
     };
@@ -2352,11 +2770,21 @@ public:
         upload(layer);
       }
     }
-    if ((dropped_item_mask & (std::uint32_t{1U} << game::weapon_slot_count)) !=
-        0U) {
-      upload(armor_pickup_texture);
-      uploadTimBlockAt(armor_pickup_palette_, hud_resident_clut_x,
+    const auto chopper_gun_mask = std::uint32_t{1U} << static_cast<std::size_t>(
+                                      game::WeaponId::chopper_gun);
+    if ((dropped_item_mask & chopper_gun_mask) != 0U) {
+      uploadTimBlockAt(*image(chopper_gun_pickup_texture).clut(),
+                       hud_resident_clut_x, chopper_gun_pickup_resident_clut_y);
+      uploaded = true;
+    }
+    const auto armor_mask = std::uint32_t{1U} << game::weapon_slot_count;
+    if ((dropped_item_mask & armor_mask) != 0U) {
+      for (const auto layer : game::droppedItemIconLayers(0x80U)) {
+        upload(layer);
+      }
+      uploadTimBlockAt(*image(armor_pickup_texture).clut(), hud_resident_clut_x,
                        pickup_resident_clut_y);
+      uploaded = true;
     }
     for (std::size_t weapon_index = 0U; weapon_index < game::weapon_slot_count;
          ++weapon_index) {
@@ -2492,8 +2920,6 @@ private:
   std::vector<HudTextureAsset> assets_;
   std::unique_ptr<PsyCrossFontTexture> native_font_;
   std::unique_ptr<PsyCrossFontTexture> retail_english_font_;
-  assets::TimBlock armor_pickup_pixels_;
-  assets::TimBlock armor_pickup_palette_;
   mutable std::optional<GameplayResidentState> gameplay_state_;
   mutable bool gameplay_font_resident_{};
   mutable bool gameplay_palette_resident_{};

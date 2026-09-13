@@ -28,6 +28,10 @@ struct EmdPolygon {
     // PGXP must not reconstruct those records into visible stretched faces.
     bool degenerate{};
     std::array<std::uint16_t, 4> vertex_indices{};
+    // Exact opaque packet duplicates have identical coverage and material.
+    // Suppressing the later copy prevents depth flicker without changing
+    // authored layered surfaces, which differ in indices, UVs or material.
+    bool duplicate{};
     std::array<EmdUv, 4> uv{};
     std::uint16_t clut{};
     std::uint16_t texture_page{};

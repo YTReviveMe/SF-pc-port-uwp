@@ -18,12 +18,38 @@ if(SF_BUILD_TESTS)
     sf_add_unit_test(sf_tests tests/test_main.cpp LIBRARIES sf::game)
     sf_add_unit_test(sf_pause_menu_tests tests/pause_menu_tests.cpp
         LIBRARIES sf::game)
+    sf_add_unit_test(sf_controller_bindings_tests
+        tests/controller_bindings_tests.cpp LIBRARIES sf::game)
+    if(WIN32)
+        add_executable(sf_launcher_settings_tests
+            tests/launcher_settings_tests.cpp
+            apps/syphon_filter/launcher/settings.cpp)
+        target_include_directories(sf_launcher_settings_tests PRIVATE
+            include apps/syphon_filter/launcher)
+        target_compile_features(sf_launcher_settings_tests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(sf_launcher_settings_tests PRIVATE /utf-8)
+        endif()
+        target_link_libraries(sf_launcher_settings_tests PRIVATE
+            sf::game sf::platform_input)
+        sf_set_project_warnings(sf_launcher_settings_tests)
+        set_target_properties(sf_launcher_settings_tests PROPERTIES FOLDER "Tests")
+        add_test(NAME sf_launcher_settings_tests COMMAND sf_launcher_settings_tests)
+    endif()
     sf_add_unit_test(sf_campaign_tests tests/campaign_tests.cpp
         LIBRARIES sf::game)
     sf_add_unit_test(sf_combat_ai_tests tests/combat_ai_tests.cpp
         LIBRARIES sf::game)
+    sf_add_unit_test(sf_agent_mission_hud_tests tests/agent_mission_hud_tests.cpp
+        LIBRARIES sf::game)
+    sf_add_unit_test(sf_agent_late_mission_rules_tests
+        tests/agent_late_mission_rules_tests.cpp)
     sf_add_unit_test(sf_dynamic_lighting_tests tests/dynamic_lighting_tests.cpp
         LIBRARIES sf::game)
+    sf_add_unit_test(sf_park2_flame_geometry_tests
+        tests/park2_flame_geometry_tests.cpp)
+    sf_add_unit_test(sf_mission_skybox_policy_tests
+        tests/mission_skybox_policy_tests.cpp)
     sf_add_unit_test(sf_player_input_tests tests/player_input_tests.cpp
         LIBRARIES sf::platform_input)
     sf_add_unit_test(sf_audio_output_policy_tests

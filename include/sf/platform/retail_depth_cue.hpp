@@ -8,11 +8,11 @@
 namespace sf::platform {
 
 inline constexpr long retail_depth_cue_q12_one = 4096L;
-inline constexpr double native_depth_cue_distance_scale = 1.35;
+inline constexpr double native_depth_cue_distance_scale = 1.0;
 
-// Native widescreen exposes more of an authored room than the PS1 viewport.
-// Scale camera depth before both retail cue equations so their original far
-// colour and response remain authoritative while the horizon moves outward.
+// Keep one explicit camera-depth contract for both the GTE and terrain paths.
+// Identity scaling restores the dense retail horizon; extending the connected
+// render envelope must not weaken the authored DQA/DQB or terrain DPCS curve.
 [[nodiscard]] inline double nativeDepthCueCameraZ(double camera_z) noexcept {
   return camera_z / native_depth_cue_distance_scale;
 }

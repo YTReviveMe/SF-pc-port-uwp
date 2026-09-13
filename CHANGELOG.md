@@ -3,6 +3,241 @@
 All notable public-test changes are documented here. The project currently uses
 pre-release tags rather than a stable semantic-versioning promise.
 
+## 0.1.0-public-test.29 - 2026-08-13
+
+### Rendering and level presentation
+
+- Restored one sequential PS1-style ordering-table submission while retaining
+  PGXP depth for widescreen geometry, eliminating the custom chunk stencil,
+  split reordering and mid-frame depth clears that exposed interiors through
+  exterior walls.
+- Extended connected-route residency and rendering with fail-closed texture
+  admission and dense retail depth cue, allowing long sight lines without
+  submitting an incomplete resource suffix.
+- Added optional mission skyboxes with original SCRIM/fog fallback and a
+  persistent launcher/INI/CLI toggle.
+- Added depth-aware object shadows, fallback smooth normals for legacy GMD
+  models and palette-safe minification for indexed textures.
+
+### Fire, particles and lighting
+
+- Added oriented depth-aware fire and smoke volumes, display-rate interpolation
+  for retail particles and high-resolution temporal fire frames derived from
+  the original sprite families.
+- Preloads authored CFIRE resources along the admitted route and resolves
+  source-less attached emitters conservatively, so upgraded fire is available
+  across missions without converting ordinary explosions.
+- Synchronized emissive effects and bounded dynamic lights, including authored
+  halo colour, wall-aware light rejection and surface lighting for Girdeux's
+  corrected flamethrower arc.
+- Reduced duplicate authored fire ownership and kept the original mission-2
+  sprite core where its dense retail presentation is required.
+
+### Interface and launcher
+
+- Split the Windows launcher into focused pages, fixed UTF-8 Russian text,
+  reliable INI readback and controller layout sizing, and removed the stale
+  desktop-resolution hint.
+- Restored the ordinary sniper scope's complete 320x160 black mask on all four
+  sides; ordinary HUD elements now hide inside rifle optics and return on the
+  native release edge without animation.
+- Detached retail information messages from the normal HUD pass so mission
+  failure/death text remains visible above letterbox framing.
+- Added a presentation-only C4 callout target while preserving retail mission
+  triggers, collision and pickup state.
+
+### Validation
+
+- Windows x64 PsyCross Release build completed successfully.
+- Full Release CTest suite and release archive audits completed successfully.
+- The release ZIP includes all runtime mission skyboxes and excludes game
+  images, saves, settings, logs, debug symbols and developer artifacts.
+- The interactive game was not launched during automated validation.
+
+## 0.1.0-public-test.28 - 2026-08-07
+
+### Controller stability and configuration
+
+- Added three persistent stick layouts: character-left/camera-right,
+  character-right/camera-left and the original one-stick scheme.
+- Unified stick-layout and vibration settings between the launcher and the
+  in-game controller menu, including reliable retry after a settings-write
+  failure.
+- Made both sticks navigate title and save menus on either axis, with
+  connection baselining and stronger hysteresis to reject DualSense drift.
+- Applied a calibrated camera deadzone in gameplay and first-person aiming
+  while preserving proportional movement outside the deadzone.
+- Fixed native rumble delivery and added working vibration toggles and preview
+  feedback to the launcher and in-game options.
+
+### Menu prompts
+
+- Replaced hard-coded keyboard instructions on the load, difficulty and Agent
+  warning screens with framed prompts for the active input device.
+- Corrected controller-family labels so the displayed confirm and back buttons
+  match the fixed retail menu controls.
+
+### Kazakhstan rendering
+
+- Removed exact helper-shell duplicates over authored rockets and cisterns in
+  the base exterior, bunker and escape missions, eliminating z-fighting and
+  leaked collision-tile textures without changing gameplay or collision.
+
+### Validation
+
+- Windows x64 PsyCross Release build completed successfully.
+- Full PsyCross CTest suite passed: 41/41, including supported-ROM probes.
+- Temporary renderer probes and diagnostic hotkeys were removed before
+  packaging; the interactive game was not launched during automated checks.
+
+## 0.1.0-public-test.27 - 2026-08-07
+
+### Controller navigation
+
+- Increased the title-menu analog deadzone to reject ordinary DualSense stick
+  drift without changing gameplay aiming or movement sensitivity.
+- Resolved opposing-axis priority so the dominant intentional stick movement
+  controls title and campaign-save navigation.
+
+### Agent mission HUD
+
+- Removed the redundant Girdeux `FUEL TANK` meter from Freedom Memorial while
+  preserving the bomb-detonation budget and the tank weak-point mechanics.
+
+### Validation
+
+- Windows x64 PsyCross Release build completed successfully.
+- Full PsyCross CTest suite passed: 41/41, including supported-ROM probes.
+
+## 0.1.0-public-test.26 - 2026-08-07
+
+### Controller support
+
+- Added selectable Automatic, XInput, DirectInput and Raw Input controller
+  backends with stable hot-plug handling and physical-device snapshots.
+- Restored retail vibration commands with safe motor shutdown on pause, focus
+  loss, disconnect, restart and scene teardown.
+- Added physical gamepad rebinding to the launcher and pause menu, including
+  controller-family button labels, conflict swaps and disconnect-safe capture.
+- Unified both rebind interfaces on one canonical action catalog, validation
+  path and `[ControllerBindings]` section in `launcher.ini`.
+- Made Apply/Resume persist the active layout while Cancel, window close and
+  capture cancellation leave the committed layout unchanged. Failed writes
+  remain live in memory and retry across Return to Title.
+- Switched service-message prompts between keyboard/mouse and the active
+  controller family without changing the underlying retail actions.
+
+### Aiming and input timing
+
+- Restored right-stick movement in first-person aiming and calibrated it for a
+  faster response while retaining proportional fine control.
+- Kept native-rate controller samples current between 20 Hz retail updates so
+  held look input and short button edges are not dropped.
+
+### Validation
+
+- Windows x64 PsyCross Release build completed successfully.
+- Full PsyCross CTest suite passed: 41/41, including supported-ROM probes.
+
+## 0.1.0-public-test.25 - 2026-08-06
+
+### Mission presentation and retries
+
+- Completed localized status messages against their canonical source text and
+  made their backdrops follow the rendered width in both supported languages.
+- Kept the final Mission Failed frame visible long enough to complete its text
+  and restored deterministic world, overlay and fade ordering after retries.
+- Added a framed localized Select Difficulty heading in both supported locales.
+- Preserved checkpoint weapons and ammunition across death and mission-failure
+  retries while leaving a full mission restart authoritative.
+
+### World presentation
+
+- Restored distant authored fire in the second mission with stable prefetch,
+  gradual reveal, fog integration and texture residency.
+- Primed active and prefetched world chunks after checkpoint restores to avoid
+  exposed interiors and layered geometry during the first rebuilt frame.
+- Removed the redundant Agent-only bomb-technician health and suspicion meters;
+  the original retail Danger indicator and remaining Agent meters are unchanged.
+
+### Validation
+
+- Windows x64 PsyCross Release build completed successfully.
+- Full PsyCross CTest suite passed: 40/40, including supported-ROM probes.
+
+## 0.1.0-public-test.24 - 2026-08-06
+
+### Difficulty and saves
+
+- Added a localized confirmation screen before starting a new Agent campaign;
+  it identifies Agent as a PC-version addition and briefly explains its higher
+  enemy threat and stricter mission conditions.
+
+- Added a localized three-mode New Game selector: **Normal**, **Hard Mode** and
+  **Agent** (`Оригинал`, `Высокая сложность`, `Агент`).
+- Moved retail Hard Mode out of the cheat list and made it a persistent campaign
+  choice. Agent retains the retail hard-mode behavior, adds 25% incoming player
+  damage, strengthens enemy aim and tracks a fresh target point at medium range.
+- Agent now replaces the recurring Hard notice with its own localized start
+  message. On 20% of new hostile SVD/sniper engagements, the original localized
+  Head Shot leader appears above Gabe. After a one-second grace period, the
+  warned enemy's next ballistic hit is a guaranteed one-shot kill.
+- Agent enemies now alert immediately at twice the retail grenade distance.
+  Unsafe first route edges toward the grenade are rejected while collision,
+  path following and locomotion remain guest-owned.
+- Extended campaign saves to V5 with a per-slot difficulty marker; V1-V4 saves
+  remain compatible and migrate to Normal.
+
+### Agent mission rules
+
+- Added exact mission HUD meters for Destroyed Subway, Main Subway Line,
+  Freedom Memorial, Expo Center Reception and Expo Center Dinorama.
+- Added validated actor-specific overrides: Kravitch carries an ITHACA-37 and
+  uses shorter retail firing pauses with post-shot route changes; Aramov's
+  Main Subway Line movement is 25% faster; Marcos uses fragmentation grenades
+  at a faster cadence; Gabrek carries an M-16 and fragmentation grenades;
+  three exact Stronghold lower-level chapel guards carry shotguns; and active
+  fragmentation-equipped PHARCOM elite guards use a faster grenade cadence.
+- Set the Washington Park Agent timer to 15 minutes and deduct 30 seconds for
+  each damaging player hit on an exact CBDC bomb-technician actor.
+- Added Freedom Memorial's 100% bomb-detonation budget: shotgun hits add 50%,
+  .45 hits 40%, M-16 hits 10%, 9 mm/rifle hits 2%, and an M-79 hit or thrown
+  grenade fills the budget; taser and flashlight events do not affect it.
+- Set Base Escape to 2:24 and Warehouse 76 to 12 minutes, including the
+  Warehouse objective text. In Tunnel Blackout, an active flashlight extends
+  Agent enemy target memory from 80 to 100 game frames.
+
+## 0.1.0-public-test.23 - 2026-08-04
+
+### Graphics
+
+- Added palette-aware, atlas-clamped mip reconstruction with trilinear and
+  mipmapped anisotropic filtering for distant world textures.
+- Upgraded official SMAA 1x to the Ultra preset with combined colour/depth
+  edges, and made it a mutually exclusive alternative to MSAA. The scene-only
+  pass remains before projected overlays, HUD, optics and letterbox.
+
+### Combat and aiming
+
+- Made grenade input reliable across the retail readiness gate.
+- Unified first-person and auto-lock reticles under one rendering path, with
+  distance-based sizing, a smaller calibrated frame and faster display-rate
+  scale response while retaining soft positional follow.
+- Restored reliable first-person bullet impacts, surface-aligned short-lived
+  decals and PS1-style per-vertex wound colouring instead of whole-model flash.
+
+### Presentation
+
+- Preserved the authored night-vision filter across mission-specific tunnel
+  environments.
+- Kept moving-light, flashlight and impact presentation synchronized with the
+  current display rate without changing the original 20 Hz game simulation.
+
+### Validation
+
+- Added regression coverage for retail aim-ray depth, reticle ownership and
+  near/far reticle geometry.
+
 ## 0.1.0-public-test.22 - 2026-08-03
 
 ### Lighting
@@ -73,6 +308,23 @@ pre-release tags rather than a stable semantic-versioning promise.
 
 - Added regression coverage for viewport normalization, display-rate UI
   interpolation, radio state and presentation timing.
+
+## 0.1.0-public-test.17 - 2026-08-02
+
+- Release tag alias for Public Test 16. Both local tags resolve to source
+  revision `7519dc0`; there is no source delta between them.
+
+## 0.1.0-public-test.16 - 2026-08-02
+
+### Optics and validation
+
+- Restored the retail SVD live silhouettes and three 20 Hz pose-history echoes.
+- Rebuilt the virus scanner around the authored target slot and x-ray marker.
+- Isolated optic capture from the visible PGXP stream and reserved packet
+  storage for actor/model changes within a guest frame.
+- Passed the documented MSVC, PsyCross, VRAM/PGXP and package validation gates.
+
+Full notes: [Public Test 16](docs/releases/0.1.0-public-test.16.md).
 
 ## 0.1.0-public-test.15 - 2026-07-31
 
@@ -346,7 +598,7 @@ pre-release tags rather than a stable semantic-versioning promise.
 ### Architecture
 
 - Moved retail cheat definitions, chord detection and state into a dedicated
-  game module shared by the title screen, pause menu and gameplay runtime.
+  game module shared by the pause menu and gameplay runtime.
 - Kept cheat state alive across mission transitions and returns to the title
   screen, with one activation path for both original button codes and menu
   switches.
@@ -460,11 +712,11 @@ pre-release tags rather than a stable semantic-versioning promise.
 
 ### Gameplay presentation
 
-- Restored every documented retail cheat and its original title/pause-menu
-  button context, including PAL aliases, infinite ammunition, hard mode,
-  one-shot kills, weak enemies, stage select and the Georgia Street theater.
+- Restored every documented pause-menu retail cheat and its original button
+  context, including PAL aliases, infinite ammunition, one-shot kills, weak
+  enemies, stage select and the Georgia Street theater.
 - Added the original-style **Options > Cheats** page with synchronized switches
-  for all six restored modes.
+  for all five restored modes.
 - Removed mission selection and cheat controls from the launcher permanently;
   `syphon_filter_cheats` now activates persistent retail cheats directly.
 

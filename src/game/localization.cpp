@@ -20,6 +20,49 @@ using Utf8Translation = std::pair<std::string_view, std::u8string_view>;
 // contains numerous spelling errors and look-alike Latin letters; encode the
 // proofread UTF-8 strings into its one-byte glyph map only at runtime.
 constexpr std::array base_utf8_translations{
+    Utf8Translation{
+        "AGENT MODE",
+        u8"\u0420\u0415\u0416\u0418\u041c \u0410\u0413\u0415\u041d\u0422"},
+    Utf8Translation{"DIFFICULTY",
+                    u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"},
+    Utf8Translation{
+        "A special PC-version mode not present in the original game. Enemies "
+        "are more accurate and aggressive, and some missions have stricter "
+        "conditions.",
+        u8"\u0421\u041f\u0415\u0426\u0418\u0410\u041b\u042c\u041d\u042b\u0419 "
+        u8"\u0420\u0415\u0416\u0418\u041c "
+        u8"\u041f\u041a-\u0412\u0415\u0420\u0421\u0418\u0418, "
+        u8"\u041a\u041e\u0422\u041e\u0420\u041e\u0413\u041e \u041d\u0415 "
+        u8"\u0411\u042b\u041b\u041e \u0412 "
+        u8"\u041e\u0420\u0418\u0413\u0418\u041d\u0410\u041b\u042c\u041d\u041e"
+        u8"\u0419 \u0418\u0413\u0420\u0415. \u0412\u0420\u0410\u0413\u0418 "
+        u8"\u0422\u041e\u0427\u041d\u0415\u0415 \u0418 "
+        u8"\u0410\u0413\u0420\u0415\u0421\u0421\u0418\u0412\u041d\u0415\u0415, "
+        u8"\u0410 \u0412 "
+        u8"\u041d\u0415\u041a\u041e\u0422\u041e\u0420\u042b\u0425 "
+        u8"\u041c\u0418\u0421\u0421\u0418\u042f\u0425 "
+        u8"\u0414\u0415\u0419\u0421\u0422\u0412\u0423\u042e\u0422 "
+        u8"\u0411\u041e\u041b\u0415\u0415 "
+        u8"\u0421\u0422\u0420\u041e\u0413\u0418\u0415 "
+        u8"\u0423\u0421\u041b\u041e\u0412\u0418\u042f."},
+    Utf8Translation{
+        "%x continue   %t back",
+        u8"%x \u041f\u0420\u041e\u0414\u041e\u041b\u0416\u0418\u0422\u042c   "
+        u8"%t \u041d\u0410\u0417\u0410\u0414"},
+    Utf8Translation{
+        "%x - continue; %t - back",
+        u8"%x - \u041f\u0420\u041e\u0414\u041e\u041b\u0416\u0418\u0422\u042c; "
+        u8"%t - \u041d\u0410\u0417\u0410\u0414"},
+    Utf8Translation{"Select Difficulty",
+                    u8"\u0412\u042b\u0411\u0415\u0420\u0418\u0422\u0415 "
+                    u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"},
+    Utf8Translation{"Normal",
+                    u8"\u041e\u0420\u0418\u0413\u0418\u041d\u0410\u041b"},
+    Utf8Translation{"Agent", u8"\u0410\u0413\u0415\u041d\u0422"},
+    Utf8Translation{"Playing Agent mode",
+                    u8"\u0412\u042b\u0411\u0420\u0410\u041d\u041d\u0410\u042f "
+                    u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c: "
+                    u8"\u0410\u0413\u0415\u041d\u0422"},
     Utf8Translation{"Map", u8"КАРТА"},
     Utf8Translation{"Objectives", u8"ЦЕЛИ"},
     Utf8Translation{"Parameters", u8"УСЛОВИЯ"},
@@ -48,6 +91,15 @@ constexpr std::array base_utf8_translations{
     Utf8Translation{"Controller", u8"УПРАВЛЕНИЕ"},
     Utf8Translation{"Controller Configuration:", u8"НАСТРОЙКА УПРАВЛЕНИЯ:"},
     Utf8Translation{"Controller Configuration", u8"НАСТРОЙКА УПРАВЛЕНИЯ"},
+    Utf8Translation{"Stick Layout", u8"РАСКЛАДКА СТИКОВ"},
+    Utf8Translation{"Character Left / Camera Right",
+                    u8"ПЕРСОНАЖ: ЛЕВЫЙ / КАМЕРА: ПРАВЫЙ"},
+    Utf8Translation{"Character Right / Camera Left",
+                    u8"ПЕРСОНАЖ: ПРАВЫЙ / КАМЕРА: ЛЕВЫЙ"},
+    Utf8Translation{
+        "Original (One Stick)",
+        u8"\u041e\u0420\u0418\u0413\u0418\u041d\u0410\u041b\u042c\u041d\u0410"
+        u8"\u042f (\u041e\u0414\u0418\u041d \u0421\u0422\u0418\u041a)"},
     Utf8Translation{"Reset", u8"СБРОСИТЬ"},
     Utf8Translation{"Accept", u8"ПРИНЯТЬ"},
     Utf8Translation{"Cancel", u8"ОТМЕНИТЬ"},
@@ -138,10 +190,8 @@ constexpr std::array base_utf8_translations{
     Utf8Translation{"N/A", u8"Н/Д"},
     Utf8Translation{"Infinite", u8"БЕСКОНЕЧНО"},
     Utf8Translation{"Mission Failed", u8"МИССИЯ ПРОВАЛЕНА"},
-    Utf8Translation{"Mission Parameter Failed",
-                    u8"УСЛОВИЕ МИССИИ НАРУШЕНО"},
-    Utf8Translation{"Mission Objective Failed",
-                    u8"ЦЕЛЬ МИССИИ НЕ ВЫПОЛНЕНА"},
+    Utf8Translation{"Mission Parameter Failed", u8"УСЛОВИЕ МИССИИ НАРУШЕНО"},
+    Utf8Translation{"Mission Objective Failed", u8"ЦЕЛЬ МИССИИ НЕ ВЫПОЛНЕНА"},
     Utf8Translation{"MISSION FAILED", u8"МИССИЯ ПРОВАЛЕНА"},
     Utf8Translation{"FIRE OR ACTION TO RETRY", u8"НАЖМИТЕ ОГОНЬ ИЛИ ДЕЙСТВИЕ"},
     Utf8Translation{"Objective", u8"ЦЕЛЬ"},
@@ -199,6 +249,21 @@ constexpr std::array base_utf8_translations{
 // map at the boundary. Keep the source literals as real UTF-8: pre-encoding
 // them (or saving mojibake here) silently selects unrelated Cyrillic glyphs.
 constexpr std::array utf8_translations{
+    Utf8Translation{
+        "BOMB DETONATION",
+        u8"\u0414\u0415\u0422\u041e\u041d\u0410\u0426\u0418\u042f \u0411\u041e\u041c\u0411\u042b"},
+    Utf8Translation{"BOMB TECH",
+                    u8"\u0421\u0410\u041f\u0401\u0420"},
+    Utf8Translation{
+        "ARAMOV ESCAPE",
+        u8"\u041f\u041e\u0411\u0415\u0413 \u0410\u0420\u0410\u041c\u041e\u0412\u041e\u0419"},
+    Utf8Translation{
+        "SUSPICION",
+        u8"\u041f\u041e\u0414\u041e\u0417\u0420\u0415\u041d\u0418\u0415"},
+    Utf8Translation{"PHAGAN",
+                    u8"\u0424\u042d\u0419\u0413\u0410\u041d"},
+    Utf8Translation{"ARAMOV",
+                    u8"\u0410\u0420\u0410\u041c\u041e\u0412\u0410"},
     Utf8Translation{"ARMOR", u8"БРОНЯ"},
     Utf8Translation{"HEALTH", u8"ЗДОРОВЬЕ"},
     Utf8Translation{"DANGER", u8"ОПАСНОСТЬ"},
@@ -395,6 +460,9 @@ constexpr std::array utf8_translations{
                     u8"ОСВОБОДИТЬ ЗАЛОЖНИКОВ ХИМЗАЩИТЫ"},
     Utf8Translation{"Do not damage the comm. array",
                     u8"НЕ ПОВРЕДИТЬ АНТЕННУ СВЯЗИ"},
+    Utf8Translation{
+        "All bombs must be defused in under 15 minutes",
+        u8"\u041e\u0411\u0415\u0417\u0412\u0420\u0415\u0414\u0418\u0422\u042c \u0412\u0421\u0415 \u0411\u041e\u041c\u0411\u042b \u041c\u0415\u041d\u0415\u0415 \u0427\u0415\u041c \u0417\u0410 15 \u041c\u0418\u041d\u0423\u0422"},
     Utf8Translation{"All bombs must be defused in under 20 minutes",
                     u8"ОБЕЗВРЕДИТЬ ВСЕ БОМБЫ МЕНЕЕ ЧЕМ ЗА 20 МИНУТ"},
     Utf8Translation{"Do not kill any member of the strike team",
@@ -495,6 +563,12 @@ constexpr std::array utf8_translations{
                     u8"ДОБРАТЬСЯ ДО ГРУЗОВОГО ЛИФТА"},
     Utf8Translation{"Get out before the building collapses in 15 minutes",
                     u8"ПОКИНУТЬ ЗДАНИЕ ЗА 15 МИНУТ, ДО ЕГО ОБРУШЕНИЯ"},
+    Utf8Translation{
+        "Get out before the building collapses in 12 minutes",
+        u8"\u041f\u041e\u041a\u0418\u041d\u0423\u0422\u042c "
+        u8"\u0417\u0414\u0410\u041d\u0418\u0415 \u0417\u0410 12 "
+        u8"\u041c\u0418\u041d\u0423\u0422, \u0414\u041e \u0415\u0413\u041e "
+        u8"\u041e\u0411\u0420\u0423\u0428\u0415\u041d\u0418\u042f"},
     Utf8Translation{"Locate and tag %d%s viral carrier%s",
                     u8"НАЙТИ И ПОМЕТИТЬ НОСИТЕЛЕЙ ВИРУСА: %d"},
     Utf8Translation{"Viral carrier tagged. %d remaining",
@@ -1502,7 +1576,8 @@ std::string localizeLine(std::string_view source) {
       std::string_view{"Slot"},          std::string_view{"Active"},
       std::string_view{"Completed"},     std::string_view{"Brightness"},
       std::string_view{"Ammo"},          std::string_view{"Preset config"},
-      std::string_view{"Invert Aim"},    std::string_view{"Vibration"},
+      std::string_view{"Stick Layout"}, std::string_view{"Invert Aim"},
+      std::string_view{"Vibration"},
       std::string_view{"Equipped"},      std::string_view{"Selected"},
       std::string_view{"Power"},         std::string_view{"Accuracy"},
       std::string_view{"Fire Rate"},     std::string_view{"Rate"},
@@ -1569,6 +1644,10 @@ std::string localizeSpacedLine(std::string_view source) {
 }
 
 } // namespace
+
+std::string encodeVitText(std::u8string_view source) {
+  return encodeVit(source);
+}
 
 void setGameLanguage(GameLanguage value) noexcept {
   if (language.exchange(value) != value) {
@@ -1676,9 +1755,6 @@ std::string localizeTextCopy(std::string_view english) {
 
 std::optional<std::string_view>
 completeGameplayTextSource(std::string_view observed) noexcept {
-  if (!russianLanguageActive()) {
-    return std::nullopt;
-  }
   const auto normalized = normalizeMissionText(observed);
   // Short prefixes such as "NO" or "S" are ambiguous with ordinary HUD
   // text. Retail has already shown enough of a status to identify it safely
@@ -1708,6 +1784,8 @@ completeGameplayTextSource(std::string_view observed) noexcept {
       std::string_view{"Scope Pwr On"},
       std::string_view{"No Target Available"},
       std::string_view{"Mission Parameter Failed"},
+      std::string_view{"Mission Failed"},
+      std::string_view{"Playing on HARD difficulty"},
       std::string_view{"Mission Objective Failed"},
       std::string_view{"Sniper Rifle"},
       std::string_view{"Nightvision Rifle"},

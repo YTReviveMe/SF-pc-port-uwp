@@ -35,6 +35,16 @@ struct FireParticle {
   int remaining_ticks{};
   game::LegacyEffectSpriteFamily family{
       game::LegacyEffectSpriteFamily::explosion};
+  int volume_kind_override{-1};
+  game::LegacyCfireVolumeTuning volume_tuning{};
+  bool volume_may_replace_retail_sprite{true};
+  bool retail_expl_frame_volume{};
+  bool retail_fire_frame_volume{};
+  bool persistent_volume{};
+  std::int32_t volume_anchor_x{};
+  std::int32_t volume_anchor_y{};
+  std::int32_t volume_anchor_z{};
+  std::uint32_t volume_seed{};
   std::uint8_t frame{};
   double size{fire_particle_size};
   std::uint8_t red{128U};
@@ -42,8 +52,22 @@ struct FireParticle {
   std::uint8_t blue{128U};
 };
 
+constexpr std::uint64_t world_decal_lifetime_ticks = 5U * 20U;
+constexpr double world_decal_surface_bias = 1.0;
+
+struct WorldDecalPresentationCacheEntry {
+  std::optional<game::LegacyWorldDecalBridgeState> source;
+  std::uint64_t born_tick{};
+  bool expired{};
+};
+
 struct WeaponEffectsScratch {
   std::vector<FireParticle> legacy_particles;
+  std::array<WorldDecalPresentationCacheEntry,
+             game::legacy_world_decal_capacity>
+      world_decals{};
+  std::uint64_t world_decal_last_tick{};
+  bool world_decal_tick_initialized{};
 };
 
 struct FireEmitterState {
@@ -76,6 +100,28 @@ public:
       emitter.start_z = start.vz;
       emitter.random_state =
           0x6d2b79f5U ^ (static_cast<std::uint32_t>(index) * 0x9e3779b9U);
+      const auto volume_tuning = game::legacyCfireVolumeTuning(
+          gameplay.missionIndex(),
+          object.class_id == game::legacy_cfire_a_class);
+      for (auto &particle : emitter.particles) {
+        particle.volume_kind_override = GR_VOLUME_FIRE;
+        particle.volume_tuning = volume_tuning;
+        particle.volume_may_replace_retail_sprite =
+            game::legacyCfireVolumeMayReplaceRetailSprite(
+                gameplay.missionIndex(), true);
+        particle.retail_expl_frame_volume =
+            game::legacyCfireUsesRetailExplFrameVolume(
+                gameplay.missionIndex(), true, particle.family);
+        particle.retail_fire_frame_volume =
+            game::legacyCfireUsesRetailFireFrameVolume(
+                gameplay.missionIndex(), true, particle.family);
+        particle.persistent_volume = true;
+        particle.volume_anchor_x = emitter.start_x;
+        particle.volume_anchor_y = emitter.start_y;
+        particle.volume_anchor_z = emitter.start_z;
+        particle.volume_seed =
+            sf::platform::persistentFireVolumeSeed(index);
+      }
       initialize(emitter);
     }
   }
@@ -230,61 +276,802 @@ legacyEffectFrames(const game::ObjectFireEmitter &fire,
   return nullptr;
 }
 
-std::optional<std::array<Vector3, 4U>>
-park2FlameWorldCorners(const game::LegacyPark2FlamethrowerRibbon &ribbon,
-                       const game::CameraState &authored_camera) {
-  const auto basis = viewBasis(authored_camera);
-  const auto projection =
-      static_cast<double>(std::max(authored_camera.projection, 1));
-  const auto camera =
-      Vector3{authored_camera.x, authored_camera.y, authored_camera.z};
-  const auto depth = [&](const game::LegacyNativePoint &point) {
-    const auto delta = Vector3{static_cast<double>(point.x) - camera.x,
-                               static_cast<double>(point.y) - camera.y,
-                               static_cast<double>(point.z) - camera.z};
-    return delta.x * basis[2].x + delta.y * basis[2].y + delta.z * basis[2].z;
-  };
-  const auto first_depth = depth(ribbon.world_first);
-  const auto second_depth = depth(ribbon.world_second);
-  if (first_depth <= active_near_clip_depth ||
-      second_depth <= active_near_clip_depth) {
+constexpr std::size_t volumetric_halo_reserve = 32U;
+constexpr std::size_t volumetric_effect_budget =
+    game::legacy_effect_particle_capacity + volumetric_halo_reserve;
+constexpr double pgxp_camera_unit = 128.0;
+
+std::optional<int>
+volumetricKind(game::LegacyEffectSpriteFamily family) noexcept {
+  switch (family) {
+  case game::LegacyEffectSpriteFamily::fire:
+    return GR_VOLUME_FIRE;
+  case game::LegacyEffectSpriteFamily::explosion:
+    return GR_VOLUME_EXPLOSION;
+  case game::LegacyEffectSpriteFamily::breath:
+    return GR_VOLUME_SMOKE;
+  case game::LegacyEffectSpriteFamily::vapor:
+    return GR_VOLUME_FOG;
+  }
+  return std::nullopt;
+}
+
+struct PersistentFireEmitterSource {
+  Vector3 anchor{};
+  std::uint32_t seed{};
+  std::size_t identity{};
+};
+
+std::optional<PersistentFireEmitterSource> persistentFireEmitterSource(
+    const game::GameplaySession &gameplay, std::int16_t source_slot) noexcept {
+  if (source_slot < 0) {
+    return std::nullopt;
+  }
+  const auto guest_slots = gameplay.legacyGuestSlotsBySceneObject();
+  const auto objects = gameplay.objects();
+  const auto models = gameplay.objectModels();
+  for (auto index = std::size_t{}; index < objects.size(); ++index) {
+    const auto guest_slot =
+        index < guest_slots.size() ? guest_slots[index] : std::int32_t{-1};
+    if (!sf::platform::persistentFireSourceMatchesSceneObject(
+            gameplay.missionIndex(), source_slot, guest_slot,
+            objects[index].source_index) ||
+        objects[index].model >= models.size() ||
+        !game::legacyFireEmitterPresentation(
+            objects[index].class_id, models[objects[index].model].name) ||
+        !std::holds_alternative<game::ObjectFireEmitter>(
+            models[objects[index].model].geometry)) {
+      continue;
+    }
+    const auto spawn = game::cfireSpawnPoint(objects[index].transform);
+    return PersistentFireEmitterSource{
+        Vector3{static_cast<double>(spawn.x), static_cast<double>(spawn.y),
+                static_cast<double>(spawn.z)},
+        sf::platform::persistentFireVolumeSeed(index), index};
+  }
+  return std::nullopt;
+}
+
+std::optional<PersistentFireEmitterSource> persistentFireEmitterSource(
+    const game::GameplaySession &gameplay,
+    std::span<const game::LegacyExplParticle> particles,
+    const game::LegacyExplParticle &source) noexcept {
+  if (const auto direct =
+          persistentFireEmitterSource(gameplay, source.source_slot)) {
+    return direct;
+  }
+  if (!game::legacyUnboundCfireParticleCandidate(
+          source.family, source.scale_byte,
+          source.attached_explosion_sequence)) {
     return std::nullopt;
   }
 
-  std::array<Vector3, 4U> result{};
-  const auto expand_pair = [&](std::size_t first_corner,
-                               const game::LegacyNativePoint &centre,
-                               double centre_depth) {
-    const auto midpoint_x =
-        (static_cast<double>(ribbon.corners[first_corner].x) +
-         ribbon.corners[first_corner + 1U].x) *
-        0.5;
-    const auto midpoint_y =
-        (static_cast<double>(ribbon.corners[first_corner].y) +
-         ribbon.corners[first_corner + 1U].y) *
-        0.5;
-    for (auto corner = first_corner; corner < first_corner + 2U; ++corner) {
-      const auto horizontal =
-          (static_cast<double>(ribbon.corners[corner].x) - midpoint_x) *
-          centre_depth / projection;
-      const auto vertical =
-          (static_cast<double>(ribbon.corners[corner].y) - midpoint_y) *
-          centre_depth / projection;
-      result[corner] = Vector3{
-          static_cast<double>(centre.x) + basis[0].x * horizontal +
-              basis[1].x * vertical,
-          static_cast<double>(centre.y) + basis[0].y * horizontal +
-              basis[1].y * vertical,
-          static_cast<double>(centre.z) + basis[0].z * horizontal +
-              basis[1].z * vertical,
-      };
+  auto controller_group =
+      std::vector<sf::platform::PersistentFireParticlePoint>{};
+  controller_group.reserve(2U);
+  for (const auto &particle : particles) {
+    if (particle.controller != source.controller) {
+      continue;
     }
+    if (particle.source_slot != source.source_slot ||
+        !game::legacyUnboundCfireParticleCandidate(
+            particle.family, particle.scale_byte,
+            particle.attached_explosion_sequence)) {
+      return std::nullopt;
+    }
+    controller_group.push_back({particle.x, particle.y, particle.z});
+  }
+
+  const auto objects = gameplay.objects();
+  const auto models = gameplay.objectModels();
+  auto candidates =
+      std::vector<sf::platform::PersistentFireEmitterCandidate>{};
+  for (auto index = std::size_t{}; index < objects.size(); ++index) {
+    if (index > std::numeric_limits<std::uint16_t>::max() ||
+        objects[index].model >= models.size()) {
+      continue;
+    }
+    const auto scene_index = static_cast<std::uint16_t>(index);
+    const auto &model = models[objects[index].model];
+    if (!game::legacyFireEmitterPresentation(objects[index].class_id,
+                                              model.name) ||
+        !std::holds_alternative<game::ObjectFireEmitter>(model.geometry) ||
+        gameplay.objectDestroyed(scene_index) ||
+        std::ranges::find(gameplay.activeObjects(), scene_index) ==
+            gameplay.activeObjects().end()) {
+      continue;
+    }
+    const auto rooms = gameplay.authoredObjectRooms(scene_index);
+    const auto presented = std::ranges::any_of(rooms, [&](const auto room) {
+      return std::ranges::find(gameplay.presentationModels(), room) !=
+             gameplay.presentationModels().end();
+    });
+    if (!presented) {
+      continue;
+    }
+    const auto spawn = game::cfireSpawnPoint(objects[index].transform);
+    candidates.push_back({index, {spawn.x, spawn.y, spawn.z}});
+  }
+  const auto match = sf::platform::uniquePersistentFireEmitterMatch(
+      controller_group, candidates);
+  if (!match || *match >= objects.size()) {
+    return std::nullopt;
+  }
+  const auto spawn = game::cfireSpawnPoint(objects[*match].transform);
+  return PersistentFireEmitterSource{
+      Vector3{static_cast<double>(spawn.x), static_cast<double>(spawn.y),
+              static_cast<double>(spawn.z)},
+      sf::platform::persistentFireVolumeSeed(*match), *match};
+}
+
+bool legacyParticleGroupOwnsFireEmitter(
+    const game::GameplaySession &gameplay,
+    std::span<const game::LegacyExplParticle> particles,
+    std::uint16_t controller, std::int16_t source_slot,
+    game::LegacyEffectSpriteFamily family) noexcept {
+  const auto source = std::ranges::find_if(particles, [&](const auto &item) {
+    return item.controller == controller && item.source_slot == source_slot &&
+           item.family == family;
+  });
+  return source != particles.end() &&
+         persistentFireEmitterSource(gameplay, particles, *source).has_value();
+}
+
+bool legacyFireEmitterHasLiveParticle(
+    const game::GameplaySession &gameplay,
+    std::span<const game::LegacyExplParticle> particles,
+    std::size_t emitter_identity) noexcept {
+  for (const auto &particle : particles) {
+    if (!game::legacyExplParticlePresentsAuthoredFire(particle.family)) {
+      continue;
+    }
+    const auto owner =
+        persistentFireEmitterSource(gameplay, particles, particle);
+    if (owner && owner->identity == emitter_identity) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<PersistentFireEmitterSource>
+legacyGuestPersistentFireEmitterSource(
+    const game::GameplaySession &gameplay,
+    std::span<const game::LegacyExplParticle> particles,
+    const game::LegacyGuestSpriteBridgeState &sprite) noexcept {
+  if (sprite.effect_particle < 0 ||
+      sprite.effect_family > static_cast<std::uint8_t>(
+                                 game::LegacyEffectSpriteFamily::vapor)) {
+    return std::nullopt;
+  }
+  const auto family =
+      static_cast<game::LegacyEffectSpriteFamily>(sprite.effect_family);
+  if (!game::legacyExplParticlePresentsAuthoredFire(family)) {
+    return std::nullopt;
+  }
+  const auto source = std::ranges::find_if(particles, [&](const auto &particle) {
+    return particle.pool_index == sprite.effect_particle &&
+           static_cast<std::uint8_t>(particle.family) == sprite.effect_family;
+  });
+  return source != particles.end()
+             ? persistentFireEmitterSource(gameplay, particles, *source)
+             : std::nullopt;
+}
+
+using VolumetricWorldBasis = std::array<Vector3, 3>;
+
+VolumetricWorldBasis orientedVolumetricBasis(Vector3 rise_direction) noexcept {
+  const auto length_squared = rise_direction.x * rise_direction.x +
+                              rise_direction.y * rise_direction.y +
+                              rise_direction.z * rise_direction.z;
+  if (!std::isfinite(length_squared) || length_squared <= 0.000001) {
+    rise_direction = Vector3{0.0, -1.0, 0.0};
+  } else {
+    const auto inverse_length = 1.0 / std::sqrt(length_squared);
+    rise_direction.x *= inverse_length;
+    rise_direction.y *= inverse_length;
+    rise_direction.z *= inverse_length;
+  }
+  // The atlas' negative local Y is the rising/tip direction, so positive
+  // local Y points back towards the emitter.
+  const auto local_y = Vector3{-rise_direction.x, -rise_direction.y,
+                               -rise_direction.z};
+  const auto reference = std::abs(local_y.z) < 0.90
+                             ? Vector3{0.0, 0.0, 1.0}
+                             : Vector3{1.0, 0.0, 0.0};
+  const auto local_x = normalize(cross(local_y, reference));
+  const auto local_z = normalize(cross(local_x, local_y));
+  return {local_x, local_y, local_z};
+}
+
+Vector3 volumetricCameraExtents(const GrVolumetricEffect &effect) noexcept {
+  return {
+      std::abs(effect.axis_x_x) * effect.radius_x +
+          std::abs(effect.axis_y_x) * effect.radius_y +
+          std::abs(effect.axis_z_x) * effect.radius_z,
+      std::abs(effect.axis_x_y) * effect.radius_x +
+          std::abs(effect.axis_y_y) * effect.radius_y +
+          std::abs(effect.axis_z_y) * effect.radius_z,
+      std::abs(effect.axis_x_z) * effect.radius_x +
+          std::abs(effect.axis_y_z) * effect.radius_y +
+          std::abs(effect.axis_z_z) * effect.radius_z,
   };
+}
+
+bool enqueueVolumetricEffect(
+    const Vector3 &world_center, const Vector3 &world_radius, int kind,
+    double red, double green, double blue, double density, double emission,
+    double phase, std::uint32_t seed, const game::CameraState &camera,
+    std::vector<GrVolumetricEffect> &effects,
+    double presentation_amount, const VolumetricWorldBasis *world_basis,
+    unsigned int flags) {
+  const auto available = GR_VolumetricEffectsAvailable();
+  if (available == 0 || !std::isfinite(presentation_amount)) {
+    return false;
+  }
+  presentation_amount = std::clamp(presentation_amount, 0.0, 1.0);
+  if (presentation_amount <= 0.0) {
+    return true;
+  }
+  if (!std::isfinite(world_center.x) || !std::isfinite(world_center.y) ||
+      !std::isfinite(world_center.z) || !std::isfinite(world_radius.x) ||
+      !std::isfinite(world_radius.y) || !std::isfinite(world_radius.z) ||
+      world_radius.x <= 0.0 || world_radius.y <= 0.0 ||
+      world_radius.z <= 0.0) {
+    return false;
+  }
+
+  const auto basis = viewBasis(camera);
+  const auto delta = Vector3{world_center.x - camera.x,
+                             world_center.y - camera.y,
+                             world_center.z - camera.z};
+  const auto camera_depth = delta.x * basis[2].x + delta.y * basis[2].y +
+                            delta.z * basis[2].z;
+  const auto component = [&](const Vector3 &axis) {
+    return (delta.x * axis.x + delta.y * axis.y + delta.z * axis.z) /
+           pgxp_camera_unit;
+  };
+  GrVolumetricEffect effect{};
+  effect.center_x = static_cast<float>(component(basis[0]));
+  effect.center_y = static_cast<float>(component(basis[1]));
+  effect.center_z = static_cast<float>(component(basis[2]));
+  effect.radius_x = static_cast<float>(world_radius.x / pgxp_camera_unit);
+  effect.radius_y = static_cast<float>(world_radius.y / pgxp_camera_unit);
+  effect.radius_z = static_cast<float>(world_radius.z / pgxp_camera_unit);
+  effect.red = static_cast<float>(std::clamp(red, 0.0, 2.0));
+  effect.green = static_cast<float>(std::clamp(green, 0.0, 2.0));
+  effect.blue = static_cast<float>(std::clamp(blue, 0.0, 2.0));
+  const auto emissive = kind == GR_VOLUME_FIRE ||
+                        kind == GR_VOLUME_EXPLOSION ||
+                        kind == GR_VOLUME_LIGHT_HALO;
+  effect.density = static_cast<float>(
+      density * (emissive ? 1.0 : presentation_amount));
+  effect.emission = static_cast<float>(emission * presentation_amount);
+  if (kind == GR_VOLUME_LIGHT_HALO) {
+    const auto fog_visibility = game::legacyHaloFogVisibility(
+        static_cast<std::int32_t>(retailObjectDepthCue(camera_depth)));
+    effect.emission *= static_cast<float>(fog_visibility);
+  }
+  effect.phase = static_cast<float>(phase);
+  effect.seed = static_cast<float>(seed & 0xffffU);
+  effect.axis_x_x = 1.0F;
+  effect.axis_y_y = 1.0F;
+  effect.axis_z_z = 1.0F;
+  if (world_basis != nullptr) {
+    const auto camera_axis = [&](const Vector3 &axis, const Vector3 &row) {
+      return static_cast<float>(axis.x * row.x + axis.y * row.y +
+                                axis.z * row.z);
+    };
+    effect.axis_x_x = camera_axis((*world_basis)[0], basis[0]);
+    effect.axis_x_y = camera_axis((*world_basis)[0], basis[1]);
+    effect.axis_x_z = camera_axis((*world_basis)[0], basis[2]);
+    effect.axis_y_x = camera_axis((*world_basis)[1], basis[0]);
+    effect.axis_y_y = camera_axis((*world_basis)[1], basis[1]);
+    effect.axis_y_z = camera_axis((*world_basis)[1], basis[2]);
+    effect.axis_z_x = camera_axis((*world_basis)[2], basis[0]);
+    effect.axis_z_y = camera_axis((*world_basis)[2], basis[1]);
+    effect.axis_z_z = camera_axis((*world_basis)[2], basis[2]);
+  }
+  effect.kind = kind;
+  effect.flags = flags;
+  const auto camera_extents = volumetricCameraExtents(effect);
+  if (!std::isfinite(effect.center_x) || !std::isfinite(effect.center_y) ||
+      !std::isfinite(effect.center_z) ||
+      effect.center_z + camera_extents.z <= 0.25F ||
+      effect.density <= 0.0F) {
+    return false;
+  }
+  // Do not spend the GPU budget on volumes whose complete projected bounds
+  // are outside the viewport. They are still owned by the volume path, so an
+  // off-screen retail quad cannot consume a later frame's fallback path.
+  const auto projection = static_cast<float>(std::max(camera.projection, 1));
+  const auto center_depth = std::max(effect.center_z, 0.251F);
+  const auto front_depth =
+      std::max(static_cast<double>(effect.center_z) - camera_extents.z, 0.251);
+  const auto center_screen_x = static_cast<float>(screen_width) * 0.5F +
+                               effect.center_x * projection / center_depth;
+  const auto center_screen_y = static_cast<float>(screen_height) * 0.5F +
+                               effect.center_y * projection / center_depth;
+  const auto half_screen_width =
+      (camera_extents.x +
+       std::abs(effect.center_x) * camera_extents.z / center_depth) *
+      projection / front_depth;
+  const auto half_screen_height =
+      (camera_extents.y +
+       std::abs(effect.center_y) * camera_extents.z / center_depth) *
+      projection / front_depth;
+  if (center_screen_x + half_screen_width < 0.0F ||
+      center_screen_x - half_screen_width > static_cast<float>(screen_width) ||
+      center_screen_y + half_screen_height < 0.0F ||
+      center_screen_y - half_screen_height > static_cast<float>(screen_height)) {
+    return true;
+  }
+  if (kind == GR_VOLUME_FIRE &&
+      (flags & GR_VOLUME_FLAG_PERSISTENT_FIRE) != 0U) {
+    const auto same_emitter = [&effect](const GrVolumetricEffect &existing) {
+      if (existing.kind != GR_VOLUME_FIRE ||
+          (existing.flags & GR_VOLUME_FLAG_PERSISTENT_FIRE) == 0U ||
+          existing.seed != effect.seed) {
+        return false;
+      }
+      const auto base = [](const GrVolumetricEffect &candidate) {
+        return std::array{
+            candidate.center_x + candidate.axis_y_x * candidate.radius_y,
+            candidate.center_y + candidate.axis_y_y * candidate.radius_y,
+            candidate.center_z + candidate.axis_y_z * candidate.radius_y,
+        };
+      };
+      const auto existing_base = base(existing);
+      const auto incoming_base = base(effect);
+      const auto close = [](float first, float second) {
+        return std::abs(first - second) <= 0.02F;
+      };
+      return close(existing_base[0], incoming_base[0]) &&
+             close(existing_base[1], incoming_base[1]) &&
+             close(existing_base[2], incoming_base[2]);
+    };
+    if (const auto duplicate = std::ranges::find_if(effects, same_emitter);
+        duplicate != effects.end()) {
+      // A CFIRE controller owns multiple retail particles. They describe one
+      // flame envelope; keep one GPU volume while accepting the broadest
+      // authored sample instead of letting the first 20 Hz packet make it
+      // flat or frame-dependent.
+      if (effect.radius_y > duplicate->radius_y) {
+        // Both candidates share the authored base. Adopt the taller sample's
+        // centre and basis before widening the envelope so its floor contact
+        // cannot slide when retail particle sizes differ.
+        duplicate->center_x = effect.center_x;
+        duplicate->center_y = effect.center_y;
+        duplicate->center_z = effect.center_z;
+        duplicate->axis_x_x = effect.axis_x_x;
+        duplicate->axis_x_y = effect.axis_x_y;
+        duplicate->axis_x_z = effect.axis_x_z;
+        duplicate->axis_y_x = effect.axis_y_x;
+        duplicate->axis_y_y = effect.axis_y_y;
+        duplicate->axis_y_z = effect.axis_y_z;
+        duplicate->axis_z_x = effect.axis_z_x;
+        duplicate->axis_z_y = effect.axis_z_y;
+        duplicate->axis_z_z = effect.axis_z_z;
+      }
+      duplicate->radius_x = std::max(duplicate->radius_x, effect.radius_x);
+      duplicate->radius_y = std::max(duplicate->radius_y, effect.radius_y);
+      duplicate->radius_z = std::max(duplicate->radius_z, effect.radius_z);
+      duplicate->red = std::max(duplicate->red, effect.red);
+      duplicate->green = std::max(duplicate->green, effect.green);
+      duplicate->blue = std::max(duplicate->blue, effect.blue);
+      duplicate->density = std::max(duplicate->density, effect.density);
+      duplicate->emission = std::max(duplicate->emission, effect.emission);
+      return true;
+    }
+  }
+  if (kind == GR_VOLUME_LIGHT_HALO) {
+    const auto same_lamp = [&effect](const GrVolumetricEffect &existing) {
+      if (existing.kind != GR_VOLUME_LIGHT_HALO) {
+        return false;
+      }
+      const auto close_axis = [](float first, float second, float radius) {
+        return std::abs(first - second) <= std::max(radius * 0.18F, 0.08F);
+      };
+      return close_axis(existing.center_x, effect.center_x,
+                        std::min(existing.radius_x, effect.radius_x)) &&
+             close_axis(existing.center_y, effect.center_y,
+                        std::min(existing.radius_y, effect.radius_y)) &&
+             close_axis(existing.center_z, effect.center_z,
+                        std::min(existing.radius_z, effect.radius_z));
+    };
+    if (const auto duplicate = std::ranges::find_if(effects, same_lamp);
+        duplicate != effects.end()) {
+      // Static GMD fixtures and their guest-authored retail halo can describe
+      // the same lamp. Merge the outer glow while retaining the exact sprite
+      // once as the hot core; otherwise two additive volumes look synthetic.
+      duplicate->radius_x = std::max(duplicate->radius_x, effect.radius_x);
+      duplicate->radius_y = std::max(duplicate->radius_y, effect.radius_y);
+      duplicate->radius_z = std::max(duplicate->radius_z, effect.radius_z);
+      const auto incoming_authored =
+          (effect.flags & GR_VOLUME_FLAG_AUTHORED_HALO_COLOR) != 0U;
+      const auto existing_authored =
+          (duplicate->flags & GR_VOLUME_FLAG_AUTHORED_HALO_COLOR) != 0U;
+      if (incoming_authored && !existing_authored) {
+        // The guest sprite owns the actual CLUT hue. The GMD duplicate only
+        // contributes a stable envelope; component-wise MAX mixed its
+        // distance-cued blue back-colour into a magenta corona.
+        duplicate->red = effect.red;
+        duplicate->green = effect.green;
+        duplicate->blue = effect.blue;
+      } else if (!existing_authored) {
+        duplicate->red = std::max(duplicate->red, effect.red);
+        duplicate->green = std::max(duplicate->green, effect.green);
+        duplicate->blue = std::max(duplicate->blue, effect.blue);
+      }
+      duplicate->flags |= effect.flags;
+      duplicate->density = std::max(duplicate->density, effect.density);
+      duplicate->emission = std::max(duplicate->emission, effect.emission);
+      return true;
+    }
+  }
+  // Capacity is presentation ownership, not permission to revive the PS1
+  // sprite. Prefer combat/fire volumes over fog and lamp coronas, then keep
+  // the largest on-screen member inside each class. Keep a hard reserve for
+  // lamp halos so particle-heavy rooms cannot suppress both halo render paths.
+  if (effects.size() >= volumetric_effect_budget) {
+    const auto priority = [](const GrVolumetricEffect &candidate) {
+      const auto tier = candidate.kind == GR_VOLUME_EXPLOSION
+                            ? 5.0
+                        : candidate.kind == GR_VOLUME_FIRE
+                            ? 4.0
+                        : candidate.kind == GR_VOLUME_SMOKE
+                            ? 3.0
+                        : candidate.kind == GR_VOLUME_FOG ? 2.0
+                                                         : 1.0;
+      const auto extents = volumetricCameraExtents(candidate);
+      const auto front = std::max(static_cast<double>(candidate.center_z) - extents.z, 0.251);
+      const auto apparent_area = extents.x * extents.y / (front * front);
+      return tier * 1000.0 + static_cast<double>(apparent_area);
+    };
+    const auto incoming_halo = effect.kind == GR_VOLUME_LIGHT_HALO;
+    auto halo_count = std::size_t{};
+    for (const auto &queued : effects) {
+      if (queued.kind == GR_VOLUME_LIGHT_HALO) {
+        ++halo_count;
+      }
+    }
+    auto victim = effects.end();
+    for (auto candidate = effects.begin(); candidate != effects.end();
+         ++candidate) {
+      const auto candidate_halo =
+          candidate->kind == GR_VOLUME_LIGHT_HALO;
+      const auto eligible = incoming_halo
+                                ? (halo_count < volumetric_halo_reserve
+                                       ? !candidate_halo
+                                       : candidate_halo)
+                                : (!candidate_halo ||
+                                   halo_count > volumetric_halo_reserve);
+      if (!eligible) {
+        continue;
+      }
+      if (victim == effects.end() ||
+          priority(*candidate) < priority(*victim)) {
+        victim = candidate;
+      }
+    }
+    const auto filling_reserved_halo_slot =
+        incoming_halo && halo_count < volumetric_halo_reserve;
+    if (victim != effects.end() &&
+        (filling_reserved_halo_slot ||
+         priority(effect) > priority(*victim))) {
+      *victim = effect;
+    }
+    return true;
+  }
+  effects.push_back(effect);
+  return true;
+}
+
+bool enqueueFireVolumetricEffect(
+    const FireParticle &particle, double half_width, double half_height,
+    std::size_t particle_index, std::size_t frame_count,
+    const game::CameraState &camera,
+    std::vector<GrVolumetricEffect> &effects, double presentation_amount) {
+  const auto family_kind = volumetricKind(particle.family);
+  if ((particle.volume_kind_override < 0 && !family_kind) ||
+      frame_count == 0U) {
+    return false;
+  }
+  const auto kind = particle.volume_kind_override >= 0
+                        ? particle.volume_kind_override
+                        : *family_kind;
+  auto density = 1.0;
+  auto emission = 0.0;
+  auto depth_scale = 0.70;
+  switch (kind) {
+  case GR_VOLUME_FIRE:
+    density = 1.25;
+    emission = 1.20;
+    depth_scale = 0.55;
+    break;
+  case GR_VOLUME_EXPLOSION:
+    density = 1.65;
+    emission = 1.55;
+    depth_scale = 0.82;
+    break;
+  case GR_VOLUME_SMOKE:
+    density = 0.72;
+    depth_scale = 0.48;
+    break;
+  case GR_VOLUME_FOG:
+    density = 0.45;
+    depth_scale = 0.72;
+    break;
+  }
+  if (kind == GR_VOLUME_FIRE && particle.persistent_volume &&
+      !particle.retail_expl_frame_volume &&
+      !particle.retail_fire_frame_volume) {
+    const auto layout = sf::platform::persistentFireVolumeLayout(
+        static_cast<double>(particle.volume_anchor_x),
+        static_cast<double>(particle.volume_anchor_y),
+        static_cast<double>(particle.volume_anchor_z), half_width,
+        half_height, half_width * depth_scale);
+    const auto orientation =
+        orientedVolumetricBasis(Vector3{0.0, -1.0, 0.0});
+    return enqueueVolumetricEffect(
+        Vector3{layout.center_x, layout.center_y, layout.center_z},
+        Vector3{layout.radius_x, layout.radius_y, layout.radius_z}, kind,
+        static_cast<double>(particle.red) / 128.0,
+        static_cast<double>(particle.green) / 128.0,
+        static_cast<double>(particle.blue) / 128.0,
+        density * particle.volume_tuning.density_scale,
+        emission * particle.volume_tuning.emission_scale, 0.0,
+        particle.volume_seed, camera, effects, presentation_amount,
+        &orientation, GR_VOLUME_FLAG_PERSISTENT_FIRE);
+  }
+  // Presentation noise follows the particle instead of re-seeding on every
+  // 20 Hz position/frame update.
+  const auto packed_seed =
+      static_cast<std::uint32_t>(particle.velocity_x) * 73856093U ^
+      static_cast<std::uint32_t>(particle.native_velocity_y_fixed) *
+          19349663U ^
+      static_cast<std::uint32_t>(particle.velocity_z) * 83492791U ^
+      static_cast<std::uint32_t>(particle.total_ticks) * 2654435761U ^
+      static_cast<std::uint32_t>(particle_index) * 2246822519U;
+  const auto rising_direction = Vector3{
+      static_cast<double>(particle.velocity_x),
+      -static_cast<double>(particle.native_velocity_y_fixed +
+                           fire_native_vertical_acceleration) /
+          4096.0,
+      static_cast<double>(particle.velocity_z),
+  };
+  const auto orientation = orientedVolumetricBasis(
+      particle.retail_expl_frame_volume ||
+              particle.retail_fire_frame_volume
+          ? Vector3{0.0, -1.0, 0.0}
+          : rising_direction);
+  const auto *oriented =
+      kind == GR_VOLUME_FIRE || kind == GR_VOLUME_SMOKE ? &orientation
+                                                        : nullptr;
+  return enqueueVolumetricEffect(
+      Vector3{static_cast<double>(particle.x),
+              static_cast<double>(particle.y),
+              static_cast<double>(particle.z)},
+      Vector3{half_width * particle.volume_tuning.radius_scale,
+              half_height * particle.volume_tuning.radius_scale,
+              half_width * depth_scale *
+                  particle.volume_tuning.radius_scale}, kind,
+      static_cast<double>(particle.red) / 128.0,
+      static_cast<double>(particle.green) / 128.0,
+      static_cast<double>(particle.blue) / 128.0,
+      density * particle.volume_tuning.density_scale,
+      emission * particle.volume_tuning.emission_scale,
+      static_cast<double>(particle.frame) / static_cast<double>(frame_count),
+      packed_seed, camera, effects, presentation_amount, oriented,
+      particle.retail_expl_frame_volume
+          ? GR_VOLUME_FLAG_RETAIL_EXPL_FRAME
+          : particle.retail_fire_frame_volume
+                ? GR_VOLUME_FLAG_RETAIL_FIRE_FRAME
+                : GR_VOLUME_FLAG_NONE);
+}
+
+bool enqueueGuestVolumetricEffect(
+    const game::LegacyGuestSpriteBridgeState &sprite,
+    const Vector3 &world_center, const Vector3 &world_radius,
+    const game::CameraState &camera,
+    std::vector<GrVolumetricEffect> &effects, int kind_override = -1,
+    game::LegacyHaloPresentationDescriptor halo_presentation = {},
+    game::LegacyCfireVolumeTuning fire_tuning = {},
+    const PersistentFireEmitterSource *persistent_fire = nullptr,
+    unsigned int retail_frame_volume_flags = GR_VOLUME_FLAG_NONE) {
+  const auto vertical_orientation =
+      orientedVolumetricBasis(Vector3{0.0, -1.0, 0.0});
+  const auto seed = sprite.source_address != 0U
+                        ? sprite.source_address
+                        : static_cast<std::uint32_t>(std::max<std::int32_t>(
+                              sprite.effect_particle, 0));
+  if (sprite.effect_family == 0U) {
+    if (kind_override == GR_VOLUME_SMOKE) {
+      return enqueueVolumetricEffect(
+          world_center, world_radius, GR_VOLUME_SMOKE,
+          static_cast<double>(sprite.color.red) / 128.0,
+          static_cast<double>(sprite.color.green) / 128.0,
+          static_cast<double>(sprite.color.blue) / 128.0, 0.68, 0.0, 0.0, seed,
+          camera, effects, 1.0, &vertical_orientation);
+    }
+    if (!sprite.force_fullbright) {
+      return false;
+    }
+    const auto halo_extent = std::max(world_radius.x, world_radius.y) *
+                             halo_presentation.radius_scale;
+    const auto halo_radius =
+        Vector3{world_radius.x * halo_presentation.radius_scale,
+                world_radius.y * halo_presentation.radius_scale,
+                std::max(halo_extent * volumetric_halo_depth_scale,
+                         volumetric_halo_minimum_depth)};
+    return enqueueVolumetricEffect(
+        world_center, halo_radius, GR_VOLUME_LIGHT_HALO,
+        halo_presentation.red, halo_presentation.green,
+        halo_presentation.blue, halo_presentation.density,
+        halo_presentation.emission, 0.0, seed, camera, effects, 1.0,
+        nullptr, GR_VOLUME_FLAG_AUTHORED_HALO_COLOR);
+  }
+  const auto family =
+      static_cast<game::LegacyEffectSpriteFamily>(sprite.effect_family);
+  const auto family_kind = volumetricKind(family);
+  const auto layout = game::legacyEffectSpriteLayout(family);
+  if ((kind_override < 0 && !family_kind) || layout.frame_count == 0U) {
+    return false;
+  }
+  const auto kind = kind_override >= 0 ? kind_override : *family_kind;
+  auto density = 0.9;
+  auto emission = 0.0;
+  if (kind == GR_VOLUME_FIRE) {
+    density = 1.25;
+    emission = 1.20;
+  } else if (kind == GR_VOLUME_EXPLOSION) {
+    density = 1.65;
+    emission = 1.55;
+  } else if (kind == GR_VOLUME_FOG) {
+    density = 0.45;
+  } else if (kind == GR_VOLUME_SMOKE) {
+    density = 0.72;
+  }
+  const auto *orientation =
+      kind == GR_VOLUME_FIRE || kind == GR_VOLUME_SMOKE
+          ? &vertical_orientation
+          : nullptr;
+  const auto radius_scale =
+      kind == GR_VOLUME_FIRE ? fire_tuning.radius_scale : 1.0;
+  if (kind == GR_VOLUME_FIRE && persistent_fire != nullptr) {
+    const auto persistent_layout = sf::platform::persistentFireVolumeLayout(
+        persistent_fire->anchor.x, persistent_fire->anchor.y,
+        persistent_fire->anchor.z, world_radius.x * radius_scale,
+        world_radius.y * radius_scale, world_radius.z * radius_scale);
+    return enqueueVolumetricEffect(
+        Vector3{persistent_layout.center_x, persistent_layout.center_y,
+                persistent_layout.center_z},
+        Vector3{persistent_layout.radius_x, persistent_layout.radius_y,
+                persistent_layout.radius_z}, kind,
+        static_cast<double>(sprite.color.red) / 128.0,
+        static_cast<double>(sprite.color.green) / 128.0,
+        static_cast<double>(sprite.color.blue) / 128.0,
+        density * fire_tuning.density_scale,
+        emission * fire_tuning.emission_scale, 0.0, persistent_fire->seed,
+        camera, effects, 1.0, orientation,
+        GR_VOLUME_FLAG_PERSISTENT_FIRE);
+  }
+  return enqueueVolumetricEffect(
+      world_center,
+      Vector3{world_radius.x * radius_scale, world_radius.y * radius_scale,
+              world_radius.z * radius_scale}, kind,
+      static_cast<double>(sprite.color.red) / 128.0,
+      static_cast<double>(sprite.color.green) / 128.0,
+      static_cast<double>(sprite.color.blue) / 128.0,
+      density * (kind == GR_VOLUME_FIRE ? fire_tuning.density_scale : 1.0),
+      emission *
+          (kind == GR_VOLUME_FIRE ? fire_tuning.emission_scale : 1.0),
+      static_cast<double>(sprite.effect_frame) /
+          static_cast<double>(layout.frame_count),
+      seed, camera, effects, 1.0, orientation,
+      retail_frame_volume_flags);
+}
+
+std::optional<sf::platform::Park2FlameWorldGeometry>
+park2FlameWorldGeometry(const game::LegacyPark2FlamethrowerRibbon &ribbon,
+                        const game::CameraState &authored_camera) {
+  // PARK2 FT4 coordinates were authored for the 320-pixel retail viewport.
+  // The packet camera is otherwise scaled to the native 384-pixel canvas.
+  constexpr auto retail_width = 320.0;
+  const auto retail_projection =
+      std::max(static_cast<double>(authored_camera.projection) * retail_width /
+                   static_cast<double>(screen_width),
+               1.0);
+  const auto basis = viewBasis(authored_camera);
+  std::array<sf::platform::Park2FlameScreenPoint, 4U> screen_corners{};
+  for (std::size_t corner = 0U; corner < screen_corners.size(); ++corner) {
+    screen_corners[corner] = sf::platform::Park2FlameScreenPoint{
+        static_cast<double>(ribbon.corners[corner].x),
+        static_cast<double>(ribbon.corners[corner].y),
+    };
+  }
   // FUN_80147a8c emits the next/fallback centre into corners 0/1 and the
-  // current chain centre into corners 2/3.
-  expand_pair(0U, ribbon.world_first, first_depth);
-  expand_pair(2U, ribbon.world_second, second_depth);
-  return result;
+  // current chain centre into corners 2/3. Packet XY is centre-origin because
+  // retail applies the 160,120 DR_ENV offset after GTE projection.
+  return sf::platform::recoverPark2FlameWorldGeometry(
+      screen_corners,
+      std::array{
+          game::DynamicLightPoint{static_cast<double>(ribbon.world_first.x),
+                                  static_cast<double>(ribbon.world_first.y),
+                                  static_cast<double>(ribbon.world_first.z)},
+          game::DynamicLightPoint{static_cast<double>(ribbon.world_second.x),
+                                  static_cast<double>(ribbon.world_second.y),
+                                  static_cast<double>(ribbon.world_second.z)},
+      },
+      sf::platform::Park2FlameProjectionBasis{
+          {authored_camera.x, authored_camera.y, authored_camera.z},
+          {basis[0].x, basis[0].y, basis[0].z},
+          {basis[1].x, basis[1].y, basis[1].z},
+          {basis[2].x, basis[2].y, basis[2].z},
+          retail_projection,
+          active_near_clip_depth,
+      });
+}
+
+std::optional<game::DynamicLightPoint>
+park2GirdeuxMuzzleAnchor(const game::GameplaySession &gameplay,
+                         const game::ActorAnimationBank &actor_animations,
+                         const RenderPresentationSnapshot &presentation) {
+  const auto count =
+      std::min(presentation.objects.size(), gameplay.objects().size());
+  for (std::size_t object = 0U; object < count; ++object) {
+    const auto object_index = static_cast<std::uint16_t>(object);
+    if (gameplay.legacyDedicatedActorWeapon(object_index) !=
+        game::WeaponId::flamethrower) {
+      continue;
+    }
+    const auto &presented_object = presentation.objects[object];
+    if (presented_object.model >= gameplay.objectModels().size()) {
+      continue;
+    }
+    const auto *model = std::get_if<assets::HmdModel>(
+        &gameplay.objectModels()[presented_object.model].geometry);
+    if (model == nullptr) {
+      continue;
+    }
+    const auto *state = gameplay.npcState(object_index);
+    const auto pose =
+        state == nullptr
+            ? actor_animations.enemyPose(presentation.guest_frame, object * 7U)
+            : actor_animations.npcPose(
+                  gameplay.npcAnimation(object_index),
+                  state->locomotion_animation_tick, state->animation_tick,
+                  npcAnimationPhase(presented_object, object_index));
+    const auto muzzle = weaponMuzzleAnchor(gameplay, *model, presented_object,
+                                           pose, game::WeaponId::flamethrower);
+    if (muzzle) {
+      return game::DynamicLightPoint{muzzle->x, muzzle->y, muzzle->z};
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<game::DynamicLightPoint>
+park2GirdeuxFlameTranslation(const game::GameplaySession &gameplay,
+                             const game::ActorAnimationBank &actor_animations,
+                             const RenderPresentationSnapshot &presentation) {
+  const auto muzzle =
+      park2GirdeuxMuzzleAnchor(gameplay, actor_animations, presentation);
+  if (!muzzle) {
+    return std::nullopt;
+  }
+  std::vector<game::DynamicLightPoint> centreline;
+  centreline.reserve(gameplay.legacyPark2FlamethrowerRibbons().size() * 2U);
+  for (const auto &ribbon : gameplay.legacyPark2FlamethrowerRibbons()) {
+    const auto geometry =
+        park2FlameWorldGeometry(ribbon, presentation.guest_packet_camera);
+    if (!geometry) {
+      continue;
+    }
+    centreline.insert(centreline.end(), geometry->centres.begin(),
+                      geometry->centres.end());
+  }
+  return sf::platform::park2FlameAnchorTranslation(centreline, *muzzle);
 }
 
 void renderPark2FlamethrowerRibbons(
@@ -292,28 +1079,87 @@ void renderPark2FlamethrowerRibbons(
     const game::ObjectFireEmitter &fire,
     const FireTexturePlacement &texture_placement,
     const game::CameraState &authored_camera, const MATRIX &view,
+    const game::CameraState &presentation_camera,
     std::vector<OT_TAG> &ordering_table, PrimitiveBuffer &primitives,
-    RenderStats &stats) {
+    game::DynamicLightPoint anchor_translation, RenderStats &stats) {
   for (const auto &ribbon : ribbons) {
     if (ribbon.frame >= fire.frames.size()) {
       throw core::Error{core::ErrorCode::invalid_format,
                         "PARK2 flame ribbon has no matching EXPL frame"};
     }
-    const auto frame = fireFrameMaterial(
-        fire.frames[ribbon.frame], texture_placement,
-        game::LegacyEffectSpriteFamily::explosion, ribbon.frame);
-    const auto world = park2FlameWorldCorners(ribbon, authored_camera);
-    if (!world || std::ranges::any_of(*world, [&](const auto &point) {
+    auto world = park2FlameWorldGeometry(ribbon, authored_camera);
+    if (world) {
+      sf::platform::translatePark2FlameWorldGeometry(*world,
+                                                     anchor_translation);
+    }
+    if (!world || std::ranges::any_of(world->corners, [&](const auto &point) {
           return preciseCameraDepth(view, point.x, point.y, point.z) <=
                  active_near_clip_depth;
         })) {
       ++stats.rejected;
       continue;
     }
-    auto v0 = makeVertex((*world)[0].x, (*world)[0].y, (*world)[0].z);
-    auto v1 = makeVertex((*world)[1].x, (*world)[1].y, (*world)[1].z);
-    auto v2 = makeVertex((*world)[2].x, (*world)[2].y, (*world)[2].z);
-    auto v3 = makeVertex((*world)[3].x, (*world)[3].y, (*world)[3].z);
+    auto center = Vector3{};
+    for (const auto &point : world->corners) {
+      center.x += point.x * 0.25;
+      center.y += point.y * 0.25;
+      center.z += point.z * 0.25;
+    }
+    // A retail ribbon is a world-space segment. Keep its analytic volume on
+    // that segment instead of rebuilding an ellipsoid on the current camera.
+    const auto outward = Vector3{
+        world->centres[0].x - world->centres[1].x,
+        world->centres[0].y - world->centres[1].y,
+        world->centres[0].z - world->centres[1].z,
+    };
+    const auto segment_length = std::sqrt(
+        outward.x * outward.x + outward.y * outward.y +
+        outward.z * outward.z);
+    const auto orientation = orientedVolumetricBasis(outward);
+    auto ribbon_radius = 0.0;
+    for (std::size_t pair = 0U; pair < world->centres.size(); ++pair) {
+      for (std::size_t corner = pair * 2U; corner < pair * 2U + 2U;
+           ++corner) {
+        const auto x = world->corners[corner].x - world->centres[pair].x;
+        const auto y = world->corners[corner].y - world->centres[pair].y;
+        const auto z = world->corners[corner].z - world->centres[pair].z;
+        ribbon_radius =
+            std::max(ribbon_radius, std::sqrt(x * x + y * y + z * z));
+      }
+    }
+    ribbon_radius = std::max(ribbon_radius, 24.0);
+    const auto radius = Vector3{
+        ribbon_radius,
+        std::max(segment_length * 0.5 + ribbon_radius * 0.15, 24.0),
+        std::max(ribbon_radius * 0.70, 24.0),
+    };
+    const auto seed =
+        static_cast<std::uint32_t>(ribbon.world_first.x) * 73856093U ^
+        static_cast<std::uint32_t>(ribbon.world_first.y) * 19349663U ^
+        static_cast<std::uint32_t>(ribbon.world_second.z) * 83492791U ^
+        static_cast<std::uint32_t>(ribbon.frame) * 2654435761U;
+    if (enqueueVolumetricEffect(
+            center, radius, GR_VOLUME_FIRE,
+            static_cast<double>(ribbon.red) / 128.0,
+            static_cast<double>(ribbon.green) / 128.0,
+            static_cast<double>(ribbon.blue) / 128.0, 1.15, 1.05,
+            static_cast<double>(ribbon.frame) /
+                static_cast<double>(fire.frames.size()),
+            seed, presentation_camera, primitives.volumetric_effects, 1.0,
+            &orientation, GR_VOLUME_FLAG_FLAME_JET)) {
+      continue;
+    }
+    const auto frame = fireFrameMaterial(
+        fire.frames[ribbon.frame], texture_placement,
+        game::LegacyEffectSpriteFamily::explosion, ribbon.frame);
+    auto v0 = makeVertex(world->corners[0].x, world->corners[0].y,
+                         world->corners[0].z);
+    auto v1 = makeVertex(world->corners[1].x, world->corners[1].y,
+                         world->corners[1].z);
+    auto v2 = makeVertex(world->corners[2].x, world->corners[2].y,
+                         world->corners[2].z);
+    auto v3 = makeVertex(world->corners[3].x, world->corners[3].y,
+                         world->corners[3].z);
     long xy0{};
     long xy1{};
     long xy2{};
@@ -355,24 +1201,31 @@ void renderPark2FlamethrowerRibbons(
 
 TexturedVertex fireVertex(const FireParticle &particle, const Vector3 &right,
                           const Vector3 &up, double horizontal, double vertical,
-                          double u, double v) {
+                          double u, double v,
+                          double presentation_amount = 1.0) {
   return TexturedVertex{
       static_cast<double>(particle.x) + right.x * horizontal + up.x * vertical,
       static_cast<double>(particle.y) + right.y * horizontal + up.y * vertical,
       static_cast<double>(particle.z) + right.z * horizontal + up.z * vertical,
       u,
       v,
-      static_cast<double>(particle.red),
-      static_cast<double>(particle.green),
-      static_cast<double>(particle.blue),
+      static_cast<double>(particle.red) * presentation_amount,
+      static_cast<double>(particle.green) * presentation_amount,
+      static_cast<double>(particle.blue) * presentation_amount,
   };
 }
 
 void renderFireObject(const game::ObjectFireEmitter &fire,
                       std::span<const FireParticle> particles,
                       const FireTexturePlacement &texture_placement,
+                      const game::CameraState &camera,
                       const MATRIX &view, std::vector<OT_TAG> &ordering_table,
-                      PrimitiveBuffer &primitives, RenderStats &stats) {
+                      PrimitiveBuffer &primitives, RenderStats &stats,
+                      double presentation_amount = 1.0,
+                      bool allow_volumetric_effects = true,
+                      std::vector<GrVolumetricEffect> *volume_target = nullptr) {
+  presentation_amount = std::clamp(presentation_amount, 0.0, 1.0);
+  auto &volumes = volume_target != nullptr ? *volume_target : primitives.volumetric_effects;
   const auto right = normalize(Vector3{
       static_cast<double>(view.m[0][0]),
       static_cast<double>(view.m[0][1]),
@@ -383,7 +1236,9 @@ void renderFireObject(const game::ObjectFireEmitter &fire,
       -static_cast<double>(view.m[1][1]),
       -static_cast<double>(view.m[1][2]),
   });
-  for (const auto &particle : particles) {
+  for (std::size_t particle_index = 0U; particle_index < particles.size();
+       ++particle_index) {
+    const auto &particle = particles[particle_index];
     const auto *images = legacyEffectFrames(fire, particle.family);
     if (images == nullptr || particle.frame >= images->size()) {
       continue;
@@ -393,20 +1248,36 @@ void renderFireObject(const game::ObjectFireEmitter &fire,
     const auto half_height = half_width *
                              static_cast<double>(image.displayHeight()) /
                              static_cast<double>(image.displayWidth());
+    const auto volume_requested =
+        particle.volume_may_replace_retail_sprite ||
+        particle.retail_expl_frame_volume ||
+        particle.retail_fire_frame_volume;
+    const auto volume_presented =
+        allow_volumetric_effects && volume_requested &&
+        enqueueFireVolumetricEffect(
+            particle, half_width, half_height, particle_index, images->size(),
+            camera, volumes, presentation_amount);
+    const auto retail_frame_volume = particle.retail_expl_frame_volume ||
+                                     particle.retail_fire_frame_volume;
+    if (game::legacyEffectVolumeConsumesRetailSprite(
+            particle.volume_may_replace_retail_sprite, volume_presented,
+            retail_frame_volume)) {
+      continue;
+    }
     const auto frame = fireFrameMaterial(image, texture_placement,
                                          particle.family, particle.frame);
     const auto top_left =
         fireVertex(particle, right, up, -half_width, half_height,
-                   frame.minimum_u, frame.minimum_v);
+                   frame.minimum_u, frame.minimum_v, presentation_amount);
     const auto top_right =
         fireVertex(particle, right, up, half_width, half_height,
-                   frame.maximum_u, frame.minimum_v);
+                   frame.maximum_u, frame.minimum_v, presentation_amount);
     const auto bottom_left =
         fireVertex(particle, right, up, -half_width, -half_height,
-                   frame.minimum_u, frame.maximum_v);
+                   frame.minimum_u, frame.maximum_v, presentation_amount);
     const auto bottom_right =
         fireVertex(particle, right, up, half_width, -half_height,
-                   frame.maximum_u, frame.maximum_v);
+                   frame.maximum_u, frame.maximum_v, presentation_amount);
     const std::array quad{top_left, top_right, bottom_left, bottom_right};
     const std::array perimeter{top_left, top_right, bottom_right, bottom_left};
     const auto fully_inside = std::all_of(
@@ -581,6 +1452,11 @@ void renderRetailCombatParticles(
       submitStats(stats, depth, projected);
     } else if (particle.kind ==
                game::LegacyCombatParticleKind::blood_impact_triangle) {
+      if (particle.attached_slot >= 0) {
+        // Actor mode9 supplies the exact polygon-selection point above; it is
+        // not an additional camera-facing blood triangle.
+        continue;
+      }
       const auto radius =
           static_cast<double>(particle.scale_byte) * screen_to_world;
       const std::array angles{
@@ -688,6 +1564,165 @@ void renderEffectSpriteInPlane(Vector3 centre, double half_width,
   submitStats(stats, depth, projected);
 }
 
+void renderRetailWorldDecals(
+    std::span<const game::LegacyWorldDecalBridgeState> observed_decals,
+    std::uint64_t tick, WeaponEffectsScratch &scratch,
+    const CombatEffectTextureAtlas &effect_textures, bool nightvision,
+    const MATRIX &view, std::vector<OT_TAG> &ordering_table, PrimitiveBuffer &primitives,
+    RenderStats &stats) {
+  constexpr std::array<std::size_t, 4U> retail_vertex_order{0U, 1U, 3U, 2U};
+  if (scratch.world_decal_tick_initialized &&
+      tick < scratch.world_decal_last_tick) {
+    scratch.world_decals = {};
+  }
+  scratch.world_decal_tick_initialized = true;
+  scratch.world_decal_last_tick = tick;
+
+  std::array<bool, game::legacy_world_decal_capacity> observed_slots{};
+  for (const auto &decal : observed_decals) {
+    if (decal.slot >= scratch.world_decals.size()) {
+      continue;
+    }
+    observed_slots[decal.slot] = true;
+    auto &entry = scratch.world_decals[decal.slot];
+    if (!entry.source || *entry.source != decal) {
+      entry.source = decal;
+      entry.born_tick = tick;
+      entry.expired = false;
+    } else if (tick >= entry.born_tick &&
+               tick - entry.born_tick >= world_decal_lifetime_ticks) {
+      entry.expired = true;
+    }
+  }
+  for (std::size_t slot = 0U; slot < scratch.world_decals.size(); ++slot) {
+    if (!observed_slots[slot]) {
+      scratch.world_decals[slot] = {};
+    }
+  }
+
+  for (const auto &entry : scratch.world_decals) {
+    if (!entry.source || entry.expired) {
+      continue;
+    }
+    const auto &decal = *entry.source;
+    const auto sprite = effect_textures.bulletMark(decal.material_words);
+    const std::array<std::pair<double, double>, 4U> uv{{
+        {sprite.minimum_u, sprite.minimum_v},
+        {sprite.maximum_u, sprite.minimum_v},
+        {sprite.minimum_u, sprite.maximum_v},
+        {sprite.maximum_u, sprite.maximum_v},
+    }};
+    const auto &normal_origin = decal.vertices[0];
+    const auto &normal_first = decal.vertices[1];
+    const auto &normal_second = decal.vertices[3];
+    const auto first_edge = Vector3{
+        static_cast<double>(normal_first.x - normal_origin.x),
+        static_cast<double>(normal_first.y - normal_origin.y),
+        static_cast<double>(normal_first.z - normal_origin.z),
+    };
+    const auto second_edge = Vector3{
+        static_cast<double>(normal_second.x - normal_origin.x),
+        static_cast<double>(normal_second.y - normal_origin.y),
+        static_cast<double>(normal_second.z - normal_origin.z),
+    };
+    auto normal = Vector3{
+        first_edge.y * second_edge.z - first_edge.z * second_edge.y,
+        first_edge.z * second_edge.x - first_edge.x * second_edge.z,
+        first_edge.x * second_edge.y - first_edge.y * second_edge.x,
+    };
+    const auto normal_length = std::sqrt(
+        normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+    if (!std::isfinite(normal_length) || normal_length <= 0.000001) {
+      continue;
+    }
+    normal = {normal.x / normal_length, normal.y / normal_length,
+              normal.z / normal_length};
+    const auto centre = Vector3{
+        (static_cast<double>(decal.vertices[0].x) +
+         static_cast<double>(decal.vertices[1].x) +
+         static_cast<double>(decal.vertices[2].x) +
+         static_cast<double>(decal.vertices[3].x)) *
+            0.25,
+        (static_cast<double>(decal.vertices[0].y) +
+         static_cast<double>(decal.vertices[1].y) +
+         static_cast<double>(decal.vertices[2].y) +
+         static_cast<double>(decal.vertices[3].y)) *
+            0.25,
+        (static_cast<double>(decal.vertices[0].z) +
+         static_cast<double>(decal.vertices[1].z) +
+         static_cast<double>(decal.vertices[2].z) +
+         static_cast<double>(decal.vertices[3].z)) *
+            0.25,
+    };
+    const auto positive_depth = preciseCameraDepth(
+        view, centre.x + normal.x, centre.y + normal.y,
+        centre.z + normal.z);
+    const auto negative_depth = preciseCameraDepth(
+        view, centre.x - normal.x, centre.y - normal.y,
+        centre.z - normal.z);
+    if (positive_depth > negative_depth) {
+      normal = {-normal.x, -normal.y, -normal.z};
+    }
+    const auto biased_centre_depth =
+        std::min(positive_depth, negative_depth);
+    if (!std::isfinite(biased_centre_depth) ||
+        biased_centre_depth <= active_near_clip_depth) {
+      continue;
+    }
+    std::array<SVECTOR, 4U> vertices{};
+    for (std::size_t corner = 0U; corner < vertices.size(); ++corner) {
+      const auto &source = decal.vertices[retail_vertex_order[corner]];
+      vertices[corner] = makeVertex(
+          static_cast<double>(source.x) + normal.x * world_decal_surface_bias,
+          static_cast<double>(source.y) + normal.y * world_decal_surface_bias,
+          static_cast<double>(source.z) + normal.z * world_decal_surface_bias);
+    }
+    long xy0{};
+    long xy1{};
+    long xy2{};
+    long xy3{};
+    long depth_cue{};
+    long flags{};
+    const auto depth =
+        RotTransPers3(&vertices[0], &vertices[1], &vertices[2], &xy0, &xy1,
+                      &xy2, &depth_cue, &flags);
+    if (depth <= 0) {
+      continue;
+    }
+    const auto ordering_depth = depth - 0x32L;
+    if (ordering_depth >= 0x1001L) {
+      continue;
+    }
+    int packed_xy3{};
+    static_cast<void>(RotTransPers(&vertices[3], &packed_xy3, &depth_cue, &flags));
+    xy3 = static_cast<long>(packed_xy3);
+    auto &primitive = primitives.world_decals.emplace_back();
+    setPolyFT4(&primitive);
+    setSemiTrans(&primitive, 1);
+    setRGB0(&primitive, nightvision ? 0U : 40U, 40U,
+            nightvision ? 0U : 40U);
+    setUV4(&primitive, static_cast<std::uint8_t>(uv[0].first),
+           static_cast<std::uint8_t>(uv[0].second),
+           static_cast<std::uint8_t>(uv[1].first),
+           static_cast<std::uint8_t>(uv[1].second),
+           static_cast<std::uint8_t>(uv[2].first),
+           static_cast<std::uint8_t>(uv[2].second),
+           static_cast<std::uint8_t>(uv[3].first),
+           static_cast<std::uint8_t>(uv[3].second));
+    primitive.clut = sprite.clut;
+    primitive.tpage = sprite.texture_page;
+    setProjected(&primitive.x0, xy0);
+    setProjected(&primitive.x1, xy1);
+    setProjected(&primitive.x2, xy2);
+    setProjected(&primitive.x3, xy3);
+    const auto ordering_index = std::clamp(
+        ordering_depth, 1L, static_cast<long>(ordering_table_size - 1));
+    addPrim(&ordering_table[static_cast<std::size_t>(ordering_index)], &primitive);
+    const std::array projected{xy0, xy1, xy2, xy3};
+    submitStats(stats, depth, projected);
+  }
+}
+
 void renderEffectSprite(Vector3 centre, double half_width, double half_height,
                         const EffectSpritePlacement &sprite,
                         const game::CameraState &camera,
@@ -743,6 +1778,7 @@ void renderWeaponEffects(
     std::span<const game::LegacyMuzzleFlashPresentationState>
         retail_muzzle_flashes,
     std::span<const game::GameplayEffect> native_muzzle_flashes,
+    std::span<const game::LegacyWorldDecalBridgeState> world_decals,
     std::span<const game::LegacyLineParticleBridgeState> retail_lines,
     std::span<const game::LegacyCombatParticleBridgeState> combat_particles,
     const FireTexturePlacement &fire_texture_placement,
@@ -759,64 +1795,16 @@ void renderWeaponEffects(
       game::legacyGuestEffectsAuthoritative(
           presentation.guest_camera_lists_captured,
           gameplay.legacyEffectParticlesAuthoritative());
+
+  renderRetailWorldDecals(world_decals, tick, scratch, effect_textures,
+                          presentation.environment.nightvision_enabled,
+                          view, ordering_table, primitives, stats);
   if (!presentation.guest_camera_lists_captured) {
     // Render modes 0/2 are already present as exact raw camera-list packets.
     // This reconstruction remains only for non-retail/fallback presentation.
     renderRetailCombatParticles(gameplay, combat_particles, presentation,
                                 ordering_table, primitives, stats);
   }
-  if (const auto taser_target = gameplay.taserTarget()) {
-    const auto *target = gameplay.npcState(*taser_target);
-    if (target == nullptr) {
-      // A killed/despawned target breaks both the conductor and arc.
-    } else {
-      auto tether_origin = game::GameplayEffect{};
-      tether_origin.x = player.x;
-      tether_origin.y = player.y - 245.0;
-      tether_origin.z = player.z;
-      tether_origin.attachment = game::GameplayEffectAttachment::player_muzzle;
-      const auto start = attachedEffectCentre(gameplay, actor_animations,
-                                              presentation, tether_origin);
-      auto tether_target = game::GameplayEffect{};
-      tether_target.attachment = game::GameplayEffectAttachment::npc_body;
-      tether_target.owner_object = *taser_target;
-      tether_target.attachment_offset_y = -190.0;
-      const auto end = attachedEffectCentre(gameplay, actor_animations,
-                                            presentation, tether_target);
-      auto previous_wire = start;
-      auto previous_arc = start;
-      constexpr std::size_t segment_count = 12U;
-      const auto basis = viewBasis(presentation_camera);
-      for (std::size_t segment = 1U; segment <= segment_count; ++segment) {
-        const auto amount =
-            static_cast<double>(segment) / static_cast<double>(segment_count);
-        const auto wire_point = Vector3{
-            std::lerp(start.x, end.x, amount),
-            std::lerp(start.y, end.y, amount),
-            std::lerp(start.z, end.z, amount),
-        };
-        const auto jitter =
-            segment == segment_count
-                ? 0.0
-                : std::sin(static_cast<double>(tick * 5U + segment * 11U)) *
-                      18.0;
-        const auto arc_point = Vector3{
-            wire_point.x + basis[0].x * jitter,
-            wire_point.y + basis[0].y * jitter,
-            wire_point.z + basis[0].z * jitter,
-        };
-        renderEffectLine(
-            previous_wire, wire_point, VertexColor{104U, 104U, 96U},
-            VertexColor{184U, 176U, 144U}, ordering_table, primitives, stats);
-        renderEffectLine(previous_arc, arc_point, VertexColor{180U, 220U, 255U},
-                         VertexColor{80U, 140U, 255U}, ordering_table,
-                         primitives, stats);
-        previous_wire = wire_point;
-        previous_arc = arc_point;
-      }
-    }
-  }
-
   // Reproject semantic LINE_G2 particles through the native/interpolated
   // camera. Their matching 20 Hz raw packets are suppressed below, otherwise
   // rain splashes and weapon trails slide over walls as screen-space overlays.
@@ -1082,9 +2070,11 @@ void renderWeaponEffects(
           flame_origin.z + forward.z * distance - forward.x * lateral));
       particles[index].frame =
           static_cast<std::uint8_t>((tick + index) % fire.frames.size());
+      particles[index].volume_kind_override = GR_VOLUME_FIRE;
     }
-    renderFireObject(fire, particles, fire_texture_placement, view,
-                     fire_ordering_table, primitives, stats);
+    renderFireObject(fire, particles, fire_texture_placement,
+                     presentation_camera, view, fire_ordering_table, primitives,
+                     stats);
   }
 
   const auto fire_model = std::ranges::find_if(
@@ -1101,8 +2091,8 @@ void renderWeaponEffects(
   // keeps authored fires visible at distance without duplicating near sprites.
   auto &legacy_particles = scratch.legacy_particles;
   legacy_particles.clear();
-  legacy_particles.reserve(gameplay.legacyExplParticles().size());
-  for (const auto &source : gameplay.legacyExplParticles()) {
+  legacy_particles.reserve(presentation.expl_particles.size());
+  for (const auto &source : presentation.expl_particles) {
     if (game::legacyExplParticleHasGuestSprite(
             source.pool_index, static_cast<std::uint8_t>(source.family),
             presentation.guest_sprites,
@@ -1120,6 +2110,38 @@ void renderWeaponEffects(
     particle.y = source.y;
     particle.z = source.z;
     particle.family = source.family;
+    const auto persistent_fire =
+        game::legacyExplParticlePresentsAuthoredFire(source.family)
+            ? persistentFireEmitterSource(gameplay,
+                                          presentation.expl_particles, source)
+            : std::optional<PersistentFireEmitterSource>{};
+    const auto cfire_owned = persistent_fire.has_value();
+    if (persistent_fire) {
+      particle.volume_kind_override = GR_VOLUME_FIRE;
+      // The camera-distance native fallback is still the same authored
+      // CFIRE emitter. Marking it as a transient particle made its volume
+      // jump at 20 Hz and exposed the analytic cone whenever the exact guest
+      // sprite was not linked into the camera list.
+      particle.persistent_volume = true;
+      particle.volume_anchor_x = static_cast<std::int32_t>(
+          std::lround(persistent_fire->anchor.x));
+      particle.volume_anchor_y = static_cast<std::int32_t>(
+          std::lround(persistent_fire->anchor.y));
+      particle.volume_anchor_z = static_cast<std::int32_t>(
+          std::lround(persistent_fire->anchor.z));
+      particle.volume_seed = persistent_fire->seed;
+    }
+    particle.volume_may_replace_retail_sprite =
+        game::legacyCfireVolumeMayReplaceRetailSprite(
+            gameplay.missionIndex(), cfire_owned);
+    particle.retail_expl_frame_volume =
+        game::legacyCfireUsesRetailExplFrameVolume(
+            gameplay.missionIndex(), cfire_owned, particle.family);
+    particle.retail_fire_frame_volume =
+        game::legacyCfireUsesRetailFireFrameVolume(
+            gameplay.missionIndex(), cfire_owned, particle.family);
+    particle.volume_tuning =
+        game::legacyCfireVolumeTuning(gameplay.missionIndex(), cfire_owned);
     particle.frame = source.frame;
     particle.size =
         static_cast<double>(source.scale_byte) * legacy_effect_scale_unit;
@@ -1129,15 +2151,19 @@ void renderWeaponEffects(
     legacy_particles.push_back(particle);
   }
   if (!legacy_particles.empty()) {
-    renderFireObject(fire, legacy_particles, fire_texture_placement, view,
-                     fire_ordering_table, primitives, stats);
+    renderFireObject(fire, legacy_particles, fire_texture_placement,
+                     presentation_camera, view, fire_ordering_table, primitives,
+                     stats);
   }
   // PARK2's FT4 ribbon pool is not part of the +0x90 sprite list and its
   // textured opcode is deliberately absent from the +0x98 whitelist.
-  renderPark2FlamethrowerRibbons(gameplay.legacyPark2FlamethrowerRibbons(),
-                                 fire, fire_texture_placement,
-                                 presentation.guest_packet_camera, view,
-                                 fire_ordering_table, primitives, stats);
+  const auto park2_flame_translation =
+      park2GirdeuxFlameTranslation(gameplay, actor_animations, presentation)
+          .value_or(game::DynamicLightPoint{});
+  renderPark2FlamethrowerRibbons(
+      gameplay.legacyPark2FlamethrowerRibbons(), fire, fire_texture_placement,
+      presentation.guest_packet_camera, view, presentation_camera,
+      fire_ordering_table, primitives, park2_flame_translation, stats);
   if (!guest_effects_authoritative) {
     for (const auto &projectile : gameplay.projectiles()) {
       if (!projectile.active ||
@@ -1161,7 +2187,7 @@ void renderWeaponEffects(
             static_cast<std::uint8_t>(std::min<std::size_t>(
                 projectile.age_updates / 2U, fire.frames.size() - 1U));
       }
-      renderFireObject(fire, particles, fire_texture_placement, view,
+      renderFireObject(fire, particles, fire_texture_placement, presentation_camera, view,
                        fire_ordering_table, primitives, stats);
     }
     for (const auto &effect : gameplay.effects()) {
@@ -1184,8 +2210,9 @@ void renderWeaponEffects(
               std::lround(effect.z + (row - 1.0) * 105.0 * effect.scale));
           particles[index].frame = static_cast<std::uint8_t>(
               (tick / 4U + index * 2U) % fire.frames.size());
+          particles[index].volume_kind_override = GR_VOLUME_FIRE;
         }
-        renderFireObject(fire, particles, fire_texture_placement, view,
+        renderFireObject(fire, particles, fire_texture_placement, presentation_camera, view,
                          fire_ordering_table, primitives, stats);
         continue;
       }
@@ -1207,18 +2234,19 @@ void renderWeaponEffects(
         particles[index].frame = static_cast<std::uint8_t>(
             std::min<std::size_t>(age / 2U, fire.frames.size() - 1U));
       }
-      renderFireObject(fire, particles, fire_texture_placement, view,
+      renderFireObject(fire, particles, fire_texture_placement, presentation_camera, view,
                        fire_ordering_table, primitives, stats);
     }
   }
 }
 
-void renderEmdObject(
-    const assets::EmdScene &scene, const game::SceneObject &object,
-    unsigned int texture_bank, const MATRIX &view,
-    std::vector<OT_TAG> &ordering_table, PrimitiveBuffer &primitives,
-    RenderStats &stats, bool retail_scrim = false,
-    bool force_semi_transparent = false) {
+void renderEmdObject(const assets::EmdScene &scene,
+                     const game::SceneObject &object, unsigned int texture_bank,
+                     const MATRIX &view, std::vector<OT_TAG> &ordering_table,
+                     PrimitiveBuffer &primitives, RenderStats &stats,
+                     bool retail_scrim = false,
+                     bool force_semi_transparent = false,
+                     long depth_cue_floor = 0L) {
   const auto reverse_winding = reversesWinding(object.transform);
   for (auto section_index = std::size_t{};
        section_index < scene.sections().size(); ++section_index) {
@@ -1275,11 +2303,15 @@ void renderEmdObject(
           submitClippedTriangle(first_triangle, material, false,
                                 reverse_winding, view, ordering_table,
                                 primitives.objects, stats, worldOrderingDepth,
-                                false, !retail_scrim);
+                                false,
+                                !retail_scrim && !force_semi_transparent,
+                                depth_cue_floor);
           submitClippedTriangle(second_triangle, material, false,
                                 reverse_winding, view, ordering_table,
                                 primitives.objects, stats, worldOrderingDepth,
-                                false, !retail_scrim);
+                                false,
+                                !retail_scrim && !force_semi_transparent,
+                                depth_cue_floor);
           continue;
         }
         depth = RotTransPers4(&v0, &v1, &v2, &v3, &xy0, &xy1, &xy2, &xy3,
@@ -1301,12 +2333,16 @@ void renderEmdObject(
         setProjected(&primitive.x1, xy1);
         setProjected(&primitive.x2, xy2);
         setProjected(&primitive.x3, xy3);
-        if (!retail_scrim) {
+        if (!retail_scrim && !force_semi_transparent) {
           depthCuePrimitive(primitive,
-                            {retailObjectDepthCue(cameraDepth(view, v0)),
-                             retailObjectDepthCue(cameraDepth(view, v1)),
-                             retailObjectDepthCue(cameraDepth(view, v2)),
-                             retailObjectDepthCue(cameraDepth(view, v3))});
+                            {std::max(depth_cue_floor,
+                                      retailObjectDepthCue(cameraDepth(view, v0))),
+                             std::max(depth_cue_floor,
+                                      retailObjectDepthCue(cameraDepth(view, v1))),
+                             std::max(depth_cue_floor,
+                                      retailObjectDepthCue(cameraDepth(view, v2))),
+                             std::max(depth_cue_floor,
+                                      retailObjectDepthCue(cameraDepth(view, v3)))});
         }
         addPrim(&ordering_table[std::clamp(depth, 1, ordering_table_size - 1)],
                 &primitive);
@@ -1332,7 +2368,8 @@ void renderEmdObject(
                                static_cast<std::uint8_t>(texture_bank),
                                texture_source_page},
               false, reverse_winding, view, ordering_table, primitives.objects,
-              stats, worldOrderingDepth, false, !retail_scrim);
+              stats, worldOrderingDepth, false,
+              !retail_scrim && !force_semi_transparent, depth_cue_floor);
           continue;
         }
         depth =
@@ -1353,11 +2390,14 @@ void renderEmdObject(
         setProjected(&primitive.x0, xy0);
         setProjected(&primitive.x1, xy1);
         setProjected(&primitive.x2, xy2);
-        if (!retail_scrim) {
+        if (!retail_scrim && !force_semi_transparent) {
           depthCuePrimitive(primitive,
-                            {retailObjectDepthCue(cameraDepth(view, v0)),
-                             retailObjectDepthCue(cameraDepth(view, v1)),
-                             retailObjectDepthCue(cameraDepth(view, v2))});
+                            {std::max(depth_cue_floor,
+                                      retailObjectDepthCue(cameraDepth(view, v0))),
+                             std::max(depth_cue_floor,
+                                      retailObjectDepthCue(cameraDepth(view, v1))),
+                             std::max(depth_cue_floor,
+                                      retailObjectDepthCue(cameraDepth(view, v2)))});
         }
         addPrim(&ordering_table[std::clamp(depth, 1, ordering_table_size - 1)],
                 &primitive);

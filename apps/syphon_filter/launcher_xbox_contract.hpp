@@ -6,6 +6,7 @@
 
 namespace sf::game {
 enum class GameLanguage : std::uint8_t;
+struct ControllerButtonBindings;
 }
 
 namespace sf::platform {
@@ -17,7 +18,11 @@ void loadLauncherSettings(
     KeyboardMouseBindings& input,
     game::GameLanguage& language) noexcept;
 
-[[nodiscard]] bool showGraphicsLauncher(
+[[nodiscard]] bool saveLauncherControllerSettings(
+    const game::ControllerButtonBindings& bindings,
+    bool vibration) noexcept;
+
+[[nodiscard]] bool showLauncher(
     GraphicsSettings& settings,
     KeyboardMouseBindings& input,
     game::GameLanguage& language,

@@ -1,10 +1,14 @@
 #pragma once
 
+#include "sf/game/controller_bindings.hpp"
 #include "sf/game/retail_cheats.hpp"
 #include "sf/platform/player_input.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -21,20 +25,38 @@ enum class AspectRatioMode {
   adaptive,
 };
 
+enum class ControllerProtocol {
+  automatic,
+  xinput,
+  direct_input,
+  raw_input,
+};
+
+using ControllerButtonBindings = game::ControllerButtonBindings;
+inline constexpr auto controller_action_binding_count =
+    game::controller_action_count;
+using ControllerSettingsCommitCallback =
+    std::function<bool(const ControllerButtonBindings &, bool vibration)>;
+
 struct GraphicsSettings {
   int width{1280};
   int height{720};
-  // Zero keeps the native target at the window/output extent.  Xbox uses a
-  // lower internal target while retaining a 1080p UWP presentation surface.
   int render_width{};
   int render_height{};
-  int msaa_samples{4};
+  int msaa_samples{};
   bool bilinear_filtering{true};
+  bool trilinear_filtering{true};
   bool anisotropic_filtering{true};
+  bool smaa{true};
+  bool volumetric_effects{};
+  bool mission_skyboxes{true};
   AspectRatioMode aspect_ratio{AspectRatioMode::adaptive};
   bool vsync{true};
   std::uint32_t frame_limit{60U};
   bool fullscreen{};
+  ControllerProtocol controller_protocol{ControllerProtocol::automatic};
+  ControllerButtonBindings controller_bindings;
+  bool controller_vibration{true};
 };
 
 class Host {
@@ -57,12 +79,14 @@ createPsyCrossHost(std::string title, GraphicsSettings graphics = {});
     game::MissionPackage initial_mission, std::filesystem::path cue_path,
     std::string supported_game_serial, GraphicsSettings graphics = {},
     KeyboardMouseBindings input = defaultKeyboardMouseBindings(),
-    game::RetailCheatState cheats = {});
+    game::RetailCheatState cheats = {},
+    ControllerSettingsCommitCallback controller_settings_commit = {});
 
 [[nodiscard]] std::unique_ptr<Host> createPsyCrossSceneHost(
     std::string title, game::MissionPackage mission,
     std::filesystem::path cue_path, GraphicsSettings graphics = {},
     KeyboardMouseBindings input = defaultKeyboardMouseBindings(),
-    game::RetailCheatState cheats = {});
+    game::RetailCheatState cheats = {},
+    ControllerSettingsCommitCallback controller_settings_commit = {});
 
 } // namespace sf::platform

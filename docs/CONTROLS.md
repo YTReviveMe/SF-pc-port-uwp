@@ -1,8 +1,14 @@
-# Keyboard and mouse controls
+# Controls
+
+The single-window launcher's **Controls / Управление** tab configures keyboard,
+mouse and controller input without opening a separate dialog. Changes remain
+staged until **Play / Играть** and are then saved in
+`%LOCALAPPDATA%\SyphonFilterPC\launcher.ini`.
+
+## Keyboard and mouse
 
 The launcher exposes all 31 native gameplay actions. Bindings are captured as
-physical keyboard scancodes or mouse inputs and are saved in
-`%LOCALAPPDATA%\SyphonFilterPC\launcher.ini`.
+physical keyboard scancodes or mouse inputs.
 
 | Action | Default | Runtime meaning |
 | --- | --- | --- |
@@ -23,7 +29,56 @@ physical keyboard scancodes or mouse inputs and are saved in
 | Weapon menu previous / next | Wheel Down / Wheel Up | Open and scroll the retail weapon ribbon |
 | Pause menu | Escape | Open or close pause |
 | Quick weapon 1..10 | 1..9, 0 | Equip the corresponding available quick slot |
+| Performance counter | F6 | Show or hide presentation FPS and frame time |
 
 Mouse movement controls the sight only while Aim is held. Crouch plus movement
 is the stealth locomotion path; Roll plus Strafe selects a side roll. These are
 composed states, not separate bindable actions.
+
+## Controller
+
+Select **Controller** as the input device to edit the nine retail-style actions.
+Button names adapt to Xbox, PlayStation, Nintendo or generic devices. Assigning
+a button that is already in use swaps the two actions, so the controller layout
+always remains valid.
+
+| Action | Default physical control |
+| --- | --- |
+| Change weapon | Select / Back / Share |
+| Fire | Square / X (west face button) |
+| Kneel | Cross / A (south face button) |
+| Roll / zoom out | Circle / B (east face button) |
+| Step right | R2 / right trigger |
+| Step left | L2 / left trigger |
+| Target lock | R1 / right shoulder |
+| Use / zoom in | Triangle / Y (north face button) |
+| Aim | L1 / left shoulder |
+
+The stick-layout row cycles through three schemes:
+
+- **Character left, camera right** is the default modern two-stick layout.
+- **Character right, camera left** swaps the two stick roles.
+- **Original one stick** keeps character movement and camera control on the
+  original shared scheme.
+
+Controller capture accepts face buttons, shoulders, triggers and Select-style
+buttons. Press Escape or the controller's Start button while capture is active
+to cancel without changing the binding.
+
+### Controller backend
+
+The same tab selects the input transport:
+
+- **Automatic** enables SDL's compatible backends and is recommended for most
+  XInput, DualSense/DualShock and generic controllers.
+- **XInput** restricts discovery to the Windows XInput path.
+- **DirectInput** selects legacy DirectInput devices.
+- **Raw Input** selects SDL's Windows Raw Input path.
+
+Changing the backend restarts launcher-side controller discovery while keeping
+the staged bindings. Hot-plugged controllers are detected while the Controls
+tab is visible.
+
+**Controller vibration / Вибрация** enables or disables runtime rumble. The
+toggle and every binding use the same staged settings as the in-game controller
+menu and are persisted together on Play.

@@ -145,6 +145,130 @@ typedef struct
 } GrVertex;
 #pragma pack(pop)
 
+typedef enum
+{
+	GR_VOLUME_FIRE = 0,
+	GR_VOLUME_EXPLOSION = 1,
+	GR_VOLUME_SMOKE = 2,
+	GR_VOLUME_FOG = 3,
+	GR_VOLUME_LIGHT_HALO = 4,
+} GrVolumetricEffectKind;
+
+typedef enum
+{
+	GR_VOLUME_FLAG_NONE = 0,
+	/* One bottom-anchored envelope owns an authored static fire emitter. */
+	GR_VOLUME_FLAG_PERSISTENT_FIRE = 1 << 0,
+	/* Preserve the narrow directional profile of an authored flame jet. */
+	GR_VOLUME_FLAG_FLAME_JET = 1 << 1,
+	/* Guest GsSPRITE hue was resolved from its authored CLUT. */
+	GR_VOLUME_FLAG_AUTHORED_HALO_COLOR = 1 << 2,
+	/* Non-consuming CFIRE volume follows an exact retail EXPL frame. */
+	GR_VOLUME_FLAG_RETAIL_EXPL_FRAME = 1 << 3,
+	/* Non-consuming CFIRE volume follows an exact retail FIRE frame. */
+	GR_VOLUME_FLAG_RETAIL_FIRE_FRAME = 1 << 4,
+} GrVolumetricEffectFlags;
+
+/* Camera-space analytic volume. Coordinates and radii use PGXP camera units
+ * (one unit is 128 guest world units); positive Y projects down the screen.
+ * Retail owns position, size, colour and lifetime. The native renderer only
+ * replaces the camera-facing sprite used to present that state. */
+typedef struct
+{
+	float center_x;
+	float center_y;
+	float center_z;
+	float radius_x;
+	float radius_y;
+	float radius_z;
+	float red;
+	float green;
+	float blue;
+	float density;
+	float emission;
+	float phase;
+	float seed;
+	/* Local volume axes expressed in camera space. A zero/invalid basis is
+	 * treated as identity so older producers retain camera-axis behaviour. */
+	float axis_x_x;
+	float axis_x_y;
+	float axis_x_z;
+	float axis_y_x;
+	float axis_y_y;
+	float axis_y_z;
+	float axis_z_x;
+	float axis_z_y;
+	float axis_z_z;
+	int kind;
+	unsigned int flags;
+} GrVolumetricEffect;
+
+/* Expanded opaque caster geometry in PGXP camera units. The scene owns the
+ * object transform; the backend never derives shadow placement from the
+ * camera. */
+typedef struct
+{
+	float x;
+	float y;
+	float z;
+} GrObjectShadowVertex;
+
+/* Object-local orthographic shadow frustum, expressed in camera space. The
+ * right/up/forward basis must be unit length. Forward points from the light,
+ * through the caster, towards receiving scene geometry. Extents, reach and
+ * center share the same PGXP camera-unit scale as the vertices. */
+typedef struct
+{
+	int first_vertex;
+	int vertex_count;
+	float center_x;
+	float center_y;
+	float center_z;
+	float right_x;
+	float right_y;
+	float right_z;
+	float up_x;
+	float up_y;
+	float up_z;
+	float forward_x;
+	float forward_y;
+	float forward_z;
+	float extent_x;
+	float extent_y;
+	float depth_extent;
+	float maximum_reach;
+	float darkness;
+} GrObjectShadowCaster;
+
+/* Rotation-only view used by the native equirectangular mission background.
+ * It writes colour before SCRIM/world submission and never participates in
+ * scene depth, so authored geometry always owns the visible foreground. */
+typedef struct
+{
+	float right_x;
+	float right_y;
+	float right_z;
+	float down_x;
+	float down_y;
+	float down_z;
+	float forward_x;
+	float forward_y;
+	float forward_z;
+	int projection;
+	int logical_width;
+	int logical_height;
+	float horizon_red;
+	float horizon_green;
+	float horizon_blue;
+	float yaw_offset_turns;
+	float tint_red;
+	float tint_green;
+	float tint_blue;
+	float exposure;
+	float horizon_band;
+	float horizon_strength;
+} GrSkyboxView;
+
 typedef enum 
 {
 	a_position,
@@ -179,6 +303,7 @@ typedef enum
 {
 	TEXTURE_FILTER_NEAREST,
 	TEXTURE_FILTER_BILINEAR,
+	TEXTURE_FILTER_WORLD_TRILINEAR,
 	TEXTURE_FILTER_WORLD_ANISOTROPIC
 } TextureFilterMode;
 
@@ -247,19 +372,33 @@ extern void			GR_Ortho2D(float left, float right, float bottom, float top, float
 extern void			GR_SetBlendMode(BlendMode blendMode);
 extern void			GR_SetPolygonOffset(float slope, float units);
 extern void			GR_SetStencilMode(int drawPrim);
+extern void			GR_EnableStencil(int enable);
 extern void			GR_BeginShadowMask(void);
-extern void			GR_BeginShadowShade(void);
 extern void			GR_EndShadowMask(void);
 extern void			GR_EnableDepth(int enable);
 extern void			GR_SetDepthState(int testEnable, int writeEnable);
-extern void			GR_ClearDepthBuffer(void);
 extern int			GR_UsesWorldDepth(const GrVertex* triangle, int depthRequested);
 extern void			GR_SetScissorState(int enable);
 extern void			GR_SetOffscreenState(const RECT16* offscreenRect, int enable);
 extern void			GR_SetupClipMode(const RECT16* clipRect, int enable);
 extern void			GR_SetViewPort(int x, int y, int width, int height);
 extern TextureFilterMode GR_ResolveTextureFilterMode(TextureFilterMode requestedMode,
-	int bilinearFiltering, int anisotropicFiltering);
+	int bilinearFiltering, int trilinearFiltering, int anisotropicFiltering);
+extern void			GR_ApplySceneSMAA(void);
+extern int			GR_BeginVolumetricFrame(int enable);
+extern int			GR_VolumetricEffectsAvailable(void);
+extern int			GR_UploadVolumetricDensityAtlas(int width, int height,
+	const unsigned char* rgba);
+extern void			GR_DrawVolumetricEffects(const GrVolumetricEffect* effects,
+	int count, int projection, int logicalWidth, int logicalHeight,
+	float timeSeconds);
+extern TextureID	GR_CreateSkyboxTexture(int width, int height,
+	const unsigned char* rgba);
+extern void			GR_DrawSkybox(TextureID texture, const GrSkyboxView* view);
+extern int			GR_ObjectShadowsAvailable(void);
+extern void			GR_DrawObjectShadows(const GrObjectShadowVertex* vertices,
+	int vertexCount, const GrObjectShadowCaster* casters, int casterCount,
+	int projection, int logicalWidth, int logicalHeight);
 extern void			GR_SetTexture(TextureID texture, TexFormat texFormat, TextureFilterMode filterMode);
 extern void			GR_SetTextureBlendMode(BlendMode blendMode);
 extern void			GR_SetOverrideTextureSize(int width, int height);

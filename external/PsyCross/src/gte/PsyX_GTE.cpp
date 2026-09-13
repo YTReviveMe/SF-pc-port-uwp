@@ -910,25 +910,28 @@ int GTE_RotTransPers(int idx, int lm)
 		g_currentExactTranslation.key == TranslationKeyFromGte();
 	if(exactProjection)
 	{
-		double vx = VX(idx);
-		double vy = VY(idx);
-		double vz = VZ(idx);
+		double sourceX = VX(idx);
+		double sourceY = VY(idx);
+		double sourceZ = VZ(idx);
 		if(static_cast<unsigned int>(idx) < g_currentExactVectorValid.size() &&
 		   g_currentExactVectorValid[idx] &&
 		   g_currentExactVectors[idx].key == VectorKeyFromGte(idx))
 		{
-			vx = g_currentExactVectors[idx].exact[0];
-			vy = g_currentExactVectors[idx].exact[1];
-			vz = g_currentExactVectors[idx].exact[2];
+			sourceX = g_currentExactVectors[idx].exact[0];
+			sourceY = g_currentExactVectors[idx].exact[1];
+			sourceZ = g_currentExactVectors[idx].exact[2];
 		}
 		const auto& rotation	= g_currentExactRotation.exact;
 		const auto& translation = g_currentExactTranslation.exact;
 		viewX =
-			translation[0] + rotation[0] * vx + rotation[1] * vy + rotation[2] * vz;
+			translation[0] + rotation[0] * sourceX + rotation[1] * sourceY +
+			rotation[2] * sourceZ;
 		viewY =
-			translation[1] + rotation[3] * vx + rotation[4] * vy + rotation[5] * vz;
+			translation[1] + rotation[3] * sourceX + rotation[4] * sourceY +
+			rotation[5] * sourceZ;
 		viewZ =
-			translation[2] + rotation[6] * vx + rotation[7] * vy + rotation[8] * vz;
+			translation[2] + rotation[6] * sourceX + rotation[7] * sourceY +
+			rotation[8] * sourceZ;
 	}
 
 	const double pgxpViewScale = 1.0 / 128.0;

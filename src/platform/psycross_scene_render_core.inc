@@ -17,12 +17,14 @@ using OpticHistory = sf::platform::RetailOpticHistory<OpticProjectedFrame>;
 
 struct ActorFrameScratch {
   std::vector<Vector3> hmd_world_vertices;
+  std::vector<Vector3> hmd_world_normals;
   std::vector<Vector3> shadow_world_vertices;
   std::vector<ActorShadowTriangle> shadow_triangles;
   std::vector<std::optional<ActorShadowReceiverVertex>> shadow_receivers;
 
   void reset() noexcept {
     hmd_world_vertices.clear();
+    hmd_world_normals.clear();
     shadow_world_vertices.clear();
     shadow_triangles.clear();
     shadow_receivers.clear();
@@ -41,6 +43,36 @@ struct WorldVertexFrameScratch {
   }
 };
 
+constexpr double volumetric_halo_radius_scale = 1.60;
+constexpr double volumetric_halo_depth_scale = 0.26;
+constexpr double volumetric_halo_minimum_depth = 8.0;
+constexpr double volumetric_halo_emission = 1.25;
+
+bool enqueueVolumetricEffect(const Vector3 &world_center,
+                             const Vector3 &world_radius, int kind, double red,
+                             double green, double blue, double density,
+                             double emission, double phase, std::uint32_t seed,
+                             const game::CameraState &camera,
+                             std::vector<GrVolumetricEffect> &effects,
+                             double presentation_amount = 1.0,
+                             const std::array<Vector3, 3> *world_basis = nullptr,
+                             unsigned int flags = GR_VOLUME_FLAG_NONE);
+
+struct WorldObjectShadowBounds {
+  Vector3 center{};
+  double radius{};
+};
+
+struct WorldObjectShadowCandidate {
+  std::size_t object_index{};
+  const game::ObjectModel *model{};
+  const assets::EmdSection *terrain_section{};
+  WorldObjectShadowBounds bounds{};
+  double player_distance_squared{};
+  bool directly_visible{};
+  std::uint64_t stable_key{};
+};
+
 struct PrimitiveBuffer {
   StableFrameVector<POLY_GT3> triangles{"Terrain triangles"};
   StableFrameVector<POLY_GT4> quads{"Terrain quads"};
@@ -54,6 +86,22 @@ struct PrimitiveBuffer {
   StableFrameVector<LINE_F2> combat_effect_lines{"Combat effect lines"};
   StableFrameVector<POLY_F3> combat_effect_triangles{"Combat effect triangles"};
   StableFrameVector<POLY_GT4> effect_sprite_quads{"Effect sprite quads"};
+  std::vector<GrVolumetricEffect> volumetric_effects;
+  std::vector<GrObjectShadowVertex> object_shadow_vertices;
+  std::vector<GrObjectShadowCaster> object_shadow_casters;
+  std::vector<WorldObjectShadowCandidate> object_shadow_candidates;
+  std::vector<Vector3> object_shadow_world_vertices;
+  std::uint16_t object_shadow_logged_room{
+      std::numeric_limits<std::uint16_t>::max()};
+  // This is presentation history, not frame scratch. Retaining the submitted
+  // identities prevents near-equal casters from exchanging the fixed GPU
+  // slots as the player or camera moves through a room boundary.
+  std::vector<std::uint64_t> object_shadow_retained_keys;
+  std::uint32_t object_shadow_retained_mission{
+      std::numeric_limits<std::uint32_t>::max()};
+  std::uint64_t object_shadow_retained_guest_frame{};
+  bool object_shadow_retained_frame_valid{};
+  StableFrameVector<POLY_FT4> world_decals{"Retail world decals"};
   StableFrameVector<POLY_FT4> park2_flamethrower_ribbons{
       "PARK2 flamethrower ribbons"};
   StableFrameVector<POLY_FT4> pickup_sprites{"Retail pickup sprites"};
@@ -76,11 +124,14 @@ struct PrimitiveBuffer {
 
   [[nodiscard]] bool needsCapacityPlan(std::uint64_t guest_frame,
                                        std::uint16_t room,
+                                       std::span<const std::uint16_t>
+                                           world_render_models,
                                        bool first_person_aim,
                                        std::uint8_t optic_mode,
-                                       bool scanner_active) noexcept {
+                                       bool scanner_active) {
     if (capacity_plan_valid_ && capacity_guest_frame_ == guest_frame &&
         capacity_room_ == room &&
+        std::ranges::equal(capacity_world_render_models_, world_render_models) &&
         capacity_first_person_aim_ == first_person_aim &&
         capacity_optic_mode_ == optic_mode &&
         capacity_scanner_active_ == scanner_active) {
@@ -89,6 +140,8 @@ struct PrimitiveBuffer {
     capacity_plan_valid_ = true;
     capacity_guest_frame_ = guest_frame;
     capacity_room_ = room;
+    capacity_world_render_models_.assign(world_render_models.begin(),
+                                         world_render_models.end());
     capacity_first_person_aim_ = first_person_aim;
     capacity_optic_mode_ = optic_mode;
     capacity_scanner_active_ = scanner_active;
@@ -110,6 +163,12 @@ struct PrimitiveBuffer {
     combat_effect_lines.reset();
     combat_effect_triangles.reset();
     effect_sprite_quads.reset();
+    volumetric_effects.clear();
+    object_shadow_vertices.clear();
+    object_shadow_casters.clear();
+    object_shadow_candidates.clear();
+    object_shadow_world_vertices.clear();
+    world_decals.reset();
     park2_flamethrower_ribbons.reset();
     pickup_sprites.reset();
     projectile_sprites.reset();
@@ -140,6 +199,7 @@ struct PrimitiveBuffer {
     combat_effect_lines.lockStorage();
     combat_effect_triangles.lockStorage();
     effect_sprite_quads.lockStorage();
+    world_decals.lockStorage();
     park2_flamethrower_ribbons.lockStorage();
     pickup_sprites.lockStorage();
     projectile_sprites.lockStorage();
@@ -163,6 +223,7 @@ struct PrimitiveBuffer {
            effects.storageStable() && combat_effect_lines.storageStable() &&
            combat_effect_triangles.storageStable() &&
            effect_sprite_quads.storageStable() &&
+           world_decals.storageStable() &&
            park2_flamethrower_ribbons.storageStable() &&
            pickup_sprites.storageStable() &&
            projectile_sprites.storageStable() &&
@@ -181,6 +242,7 @@ private:
   std::uint64_t capacity_guest_frame_{};
   std::uint16_t capacity_room_{};
   std::uint8_t capacity_optic_mode_{};
+  std::vector<std::uint16_t> capacity_world_render_models_;
   bool capacity_first_person_aim_{};
   bool capacity_scanner_active_{};
   bool capacity_plan_valid_{};
@@ -261,15 +323,19 @@ struct WorldPolygonLightingCacheEntry {
 class WorldPolygonLightingCache final {
 public:
   void beginFrame(std::uint64_t guest_frame, std::uint16_t room,
-                  std::uint64_t light_signature) {
+                  std::uint64_t light_signature,
+                  std::span<const std::uint16_t> submission_models) {
     cursor_ = 0U;
     if (valid_ && guest_frame_ == guest_frame && room_ == room &&
-        light_signature_ == light_signature) {
+        light_signature_ == light_signature &&
+        std::ranges::equal(submission_models_, submission_models)) {
       return;
     }
     guest_frame_ = guest_frame;
     room_ = room;
     light_signature_ = light_signature;
+    submission_models_.assign(submission_models.begin(),
+                              submission_models.end());
     valid_ = true;
     ++generation_;
     if (generation_ == 0U) {
@@ -312,6 +378,7 @@ public:
     guest_frame_ = std::numeric_limits<std::uint64_t>::max();
     room_ = std::numeric_limits<std::uint16_t>::max();
     light_signature_ = 0U;
+    submission_models_.clear();
     valid_ = false;
   }
 
@@ -322,6 +389,7 @@ private:
   std::uint64_t generation_{1U};
   std::uint16_t room_{std::numeric_limits<std::uint16_t>::max()};
   std::uint64_t light_signature_{};
+  std::vector<std::uint16_t> submission_models_;
   bool valid_{};
 };
 
@@ -522,23 +590,34 @@ visibleSurfaceNormal(const std::array<SVECTOR, Count> &vertices) noexcept {
   return normal;
 }
 
+void dynamicallyLight(
+    POLY_GT3 &primitive, const std::array<SVECTOR, 3U> &vertices,
+    const std::array<game::DynamicLightPoint, 3U> &normals,
+    const game::DynamicLightFrame &light_frame =
+        active_dynamic_lights) noexcept {
+  const auto first =
+      dynamicallyLit({primitive.r0, primitive.g0, primitive.b0}, vertices[0].vx,
+                     vertices[0].vy, vertices[0].vz, normals[0], light_frame);
+  const auto second =
+      dynamicallyLit({primitive.r1, primitive.g1, primitive.b1}, vertices[1].vx,
+                     vertices[1].vy, vertices[1].vz, normals[1], light_frame);
+  const auto third =
+      dynamicallyLit({primitive.r2, primitive.g2, primitive.b2}, vertices[2].vx,
+                     vertices[2].vy, vertices[2].vz, normals[2], light_frame);
+  setRGB0(&primitive, first.red, first.green, first.blue);
+  setRGB1(&primitive, second.red, second.green, second.blue);
+  setRGB2(&primitive, third.red, third.green, third.blue);
+}
+
 void dynamicallyLight(POLY_GT3 &primitive,
                       const std::array<SVECTOR, 3U> &vertices,
                       const game::DynamicLightFrame &light_frame =
                           active_dynamic_lights) noexcept {
   const auto normal = visibleSurfaceNormal(vertices);
-  const auto first =
-      dynamicallyLit({primitive.r0, primitive.g0, primitive.b0}, vertices[0].vx,
-                     vertices[0].vy, vertices[0].vz, normal, light_frame);
-  const auto second =
-      dynamicallyLit({primitive.r1, primitive.g1, primitive.b1}, vertices[1].vx,
-                     vertices[1].vy, vertices[1].vz, normal, light_frame);
-  const auto third =
-      dynamicallyLit({primitive.r2, primitive.g2, primitive.b2}, vertices[2].vx,
-                     vertices[2].vy, vertices[2].vz, normal, light_frame);
-  setRGB0(&primitive, first.red, first.green, first.blue);
-  setRGB1(&primitive, second.red, second.green, second.blue);
-  setRGB2(&primitive, third.red, third.green, third.blue);
+  dynamicallyLight(primitive, vertices,
+                   std::array<game::DynamicLightPoint, 3U>{normal, normal,
+                                                           normal},
+                   light_frame);
 }
 
 void dynamicallyLight(POLY_GT4 &primitive,

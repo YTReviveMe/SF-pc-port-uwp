@@ -25,6 +25,8 @@ enum class SceneExitReason {
   mission_complete,
   mission_selected,
 };
+[[nodiscard]] InputPromptBindings
+titleControllerInputPromptBindings(int controller_family);
 
 struct SceneViewerResult {
   std::uint16_t previous_buttons{0xffffU};
@@ -49,6 +51,9 @@ public:
   void draw(const game::CampaignSaveMenu &menu,
             const game::TitleSaveSlots &slots);
   void drawLoadSlots(const game::TitleSaveSlots &slots, std::size_t selection);
+  void drawDifficultySelection(const game::TitleMenu &menu);
+  void drawAgentModeWarning();
+  void setInputPromptBindings(InputPromptBindings bindings);
 
 private:
   struct State;
@@ -57,9 +62,18 @@ private:
 
 class PsyCrossSceneViewer final {
 public:
-  PsyCrossSceneViewer(GraphicsSettings &graphics, KeyboardMouseBindings input,
-                      game::RetailCheatState &cheats) noexcept
-      : graphics_(graphics), input_(input), cheats_(cheats) {}
+  PsyCrossSceneViewer(
+      KeyboardMouseBindings input, game::RetailCheatState &cheats,
+      game::CampaignDifficulty difficulty,
+      ControllerButtonBindings controller_bindings = {},
+      bool controller_vibration = true,
+      ControllerSettingsCommitCallback controller_settings_commit = {},
+      bool mission_skyboxes = true) noexcept
+      : input_(input), cheats_(cheats), difficulty_(difficulty),
+        controller_bindings_(controller_bindings),
+        controller_vibration_(controller_vibration),
+        controller_settings_commit_(controller_settings_commit),
+        mission_skyboxes_(mission_skyboxes) {}
 
   [[nodiscard]] SceneViewerResult
   run(const game::MissionPackage &mission, PADRAW &pad,
@@ -69,9 +83,13 @@ public:
       std::unique_ptr<PsyCrossAudioOutput> preloaded_audio = {});
 
 private:
-  GraphicsSettings &graphics_;
   KeyboardMouseBindings input_;
   game::RetailCheatState &cheats_;
+  game::CampaignDifficulty difficulty_{game::CampaignDifficulty::original};
+  ControllerButtonBindings controller_bindings_;
+  bool controller_vibration_{true};
+  ControllerSettingsCommitCallback controller_settings_commit_;
+  bool mission_skyboxes_{true};
   game::PauseSettings pause_settings_;
   bool pause_settings_initialized_{};
 };

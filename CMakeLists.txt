@@ -21,6 +21,20 @@ option(SF_XBOX_UWP "Build the Xbox Dev Mode UWP package" OFF)
 option(SF_XBOX_LTCG "Use link-time code generation for Xbox Release builds" ON)
 option(SF_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(SF_PARALLEL_COMPILE "Compile independent sources in parallel" ON)
+option(SF_ENABLE_RELEASE_IPO "Enable interprocedural optimization in Release builds" ON)
+
+if(SF_ENABLE_RELEASE_IPO AND NOT SF_XBOX_UWP)
+    include(CheckIPOSupported)
+    check_ipo_supported(
+        RESULT SF_RELEASE_IPO_SUPPORTED
+        OUTPUT SF_RELEASE_IPO_ERROR
+        LANGUAGES CXX)
+    if(SF_RELEASE_IPO_SUPPORTED)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    else()
+        message(WARNING "Release IPO is unavailable: ${SF_RELEASE_IPO_ERROR}")
+    endif()
+endif()
 set(SF_PSYCROSS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/PsyCross" CACHE PATH
     "Path to a PsyCross checkout")
 set(SF_SUPPORTED_ROM_CUE "" CACHE FILEPATH
@@ -136,6 +150,7 @@ add_library(sf_game
     src/game/campaign.cpp
     src/game/chase_camera.cpp
     src/game/combat.cpp
+    src/game/controller_bindings.cpp
     src/game/dynamic_lighting.cpp
     src/game/effects.cpp
     src/game/gameplay.cpp
@@ -224,6 +239,7 @@ if(SF_ENABLE_PSYCROSS)
         src/platform/psycross_font_texture.cpp
         src/platform/psycross_host.cpp
         src/platform/psycross_mission_start.cpp
+        src/platform/psycross_mission_skybox.cpp
         src/platform/psycross_movie_player.cpp
         src/platform/psycross_retail_briefing.cpp
         src/platform/psycross_runtime_guards.cpp
@@ -267,7 +283,15 @@ if(SF_ENABLE_PSYCROSS)
         )
     else()
         add_executable(syphon_filter
-            apps/syphon_filter/launcher.cpp
+            apps/syphon_filter/launcher/controls_page.cpp
+            apps/syphon_filter/launcher/controller_capture.cpp
+            apps/syphon_filter/launcher/dossier_page.cpp
+            apps/syphon_filter/launcher/graphics_page.cpp
+            apps/syphon_filter/launcher/launch_page.cpp
+            apps/syphon_filter/launcher/settings.cpp
+            apps/syphon_filter/launcher/shell.cpp
+            apps/syphon_filter/launcher/text.cpp
+            apps/syphon_filter/launcher/theme.cpp
             apps/syphon_filter/main.cpp
         )
     endif()
@@ -297,7 +321,7 @@ if(SF_ENABLE_PSYCROSS)
         target_sources(syphon_filter PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/syphon_filter.rc")
     endif()
-    target_link_libraries(syphon_filter PRIVATE sf::psycross_backend)
+    target_link_libraries(syphon_filter PRIVATE sf::psycross_backend SDL2::SDL2)
     if(SF_XBOX_UWP)
         target_link_libraries(syphon_filter PRIVATE
             sf_xbox_launcher sf::xbox_content SDL2::SDL2)
@@ -389,6 +413,26 @@ if(SF_ENABLE_PSYCROSS)
                 VS_DEPLOYMENT_CONTENT TRUE
                 VS_DEPLOYMENT_LOCATION "${SF_UWP_LOCALE_DEPLOYMENT_LOCATION}")
             target_sources(syphon_filter PRIVATE "${SF_UWP_LOCALE_FILE}")
+        endforeach()
+        set(SF_UWP_SKYBOX_DIRECTORY
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes")
+        set(SF_UWP_SKYBOX_ASSETS
+            dc_night.bmp
+            park_storm.bmp
+            kazakhstan_night.bmp
+            stronghold_dawn.bmp
+            almaty_industrial.bmp)
+        foreach(SF_UWP_SKYBOX_ASSET IN LISTS SF_UWP_SKYBOX_ASSETS)
+            set(SF_UWP_SKYBOX_FILE
+                "${SF_UWP_SKYBOX_DIRECTORY}/${SF_UWP_SKYBOX_ASSET}")
+            if(NOT EXISTS "${SF_UWP_SKYBOX_FILE}")
+                message(FATAL_ERROR "Missing mission skybox: ${SF_UWP_SKYBOX_FILE}")
+            endif()
+            set_source_files_properties("${SF_UWP_SKYBOX_FILE}" PROPERTIES
+                VS_COPY_TO_OUT_DIR Always
+                VS_DEPLOYMENT_CONTENT TRUE
+                VS_DEPLOYMENT_LOCATION "assets/skyboxes")
+            target_sources(syphon_filter PRIVATE "${SF_UWP_SKYBOX_FILE}")
         endforeach()
         foreach(SF_UWP_RUNTIME_FILE IN LISTS SF_UWP_RUNTIME_FILES)
             if(NOT EXISTS "${SF_UWP_RUNTIME_FILE}")

@@ -1,5 +1,7 @@
 #include "launcher.hpp"
+#if defined(SF_XBOX_UWP)
 #include "app_main.hpp"
+#endif
 
 #include "sf/core/error.hpp"
 #include "sf/game/game_disc.hpp"
@@ -38,10 +40,6 @@ std::optional<int> parseInteger(std::string_view text) {
   return value;
 }
 
-bool startsWith(std::string_view text, std::string_view prefix) noexcept {
-  return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
-}
-
 bool parseResolution(std::string_view text,
                      sf::platform::GraphicsSettings &graphics) {
   const auto separator = text.find_first_of("xX");
@@ -75,11 +73,11 @@ parseLaunchRequest(const std::vector<std::string_view> &arguments) {
   if (arguments.empty()) {
     return LaunchRequest{};
   }
-  if (arguments.size() == 1U && !startsWith(arguments.front(), "--")) {
+  if (arguments.size() == 1U && !arguments.front().starts_with("--")) {
     return LaunchRequest{LaunchMode::game,
                          std::filesystem::path{arguments.front()}};
   }
-  if (arguments.size() != 2U || startsWith(arguments[1], "--")) {
+  if (arguments.size() != 2U || arguments[1].starts_with("--")) {
     return std::nullopt;
   }
 
@@ -135,7 +133,7 @@ void loadXboxGraphicsSettings(sf::platform::GraphicsSettings &graphics) noexcept
                  (*value == 720 || *value == 900 || *value == 1080)) {
         graphics.render_height = *value;
       } else if (key == "MSAA" &&
-          (*value == 0 || *value == 2 || *value == 4 || *value == 8)) {
+                 (*value == 0 || *value == 2 || *value == 4 || *value == 8)) {
         graphics.msaa_samples = *value;
       } else if (key == "Bilinear" && (*value == 0 || *value == 1)) {
         graphics.bilinear_filtering = *value != 0;
@@ -153,7 +151,6 @@ void loadXboxGraphicsSettings(sf::platform::GraphicsSettings &graphics) noexcept
       }
     }
   } catch (...) {
-    // Defaults remain active if LocalState is briefly unavailable.
   }
 }
 #endif
@@ -175,25 +172,34 @@ void printUsage() {
       << "Gameplay test option: --all-weapons-test\n"
       << "Graphics options: --fullscreen --no-launcher "
          "--resolution=WIDTHxHEIGHT "
-         "--msaa=0|2|4|8 --bilinear --nearest --anisotropic "
-         "--no-anisotropic --aspect-adaptive --aspect-4-3 "
-         "--vsync --no-vsync --fps-limit=0|20..1000\n";
+         "--msaa=0|2|4|8 --bilinear --nearest --trilinear "
+         "--no-trilinear --anisotropic --no-anisotropic --smaa --no-smaa "
+         "--volumetric-effects --no-volumetric-effects "
+         "--skybox --no-skybox "
+         "--aspect-adaptive --aspect-4-3 "
+         "--vsync --no-vsync --fps-limit=0|20..1000\n"
+      << "Controller options: "
+         "--controller-backend=auto|xinput|dinput|rawinput\n";
   std::cerr << "Language options: --language=en --language=ru\n";
 }
 
 } // namespace
 
+#if defined(SF_XBOX_UWP)
 int syphonFilterMain(int argc, char **argv) {
+#else
+int main(int argc, char **argv) {
+#endif
   try {
     sf::platform::GraphicsSettings graphics;
 #if defined(SF_XBOX_UWP)
     graphics.width = 1920;
     graphics.height = 1080;
-    // Keep the Xbox presentation surface at 1080p and render internally at
-    // 720p by default.
     graphics.render_width = 1280;
     graphics.render_height = 720;
     graphics.msaa_samples = 2;
+    graphics.smaa = false;
+    graphics.trilinear_filtering = false;
     graphics.anisotropic_filtering = false;
     graphics.fullscreen = true;
 #endif
@@ -202,11 +208,12 @@ int syphonFilterMain(int argc, char **argv) {
     auto language = sf::game::GameLanguage::english;
     std::filesystem::path executable_directory;
 #if defined(SF_XBOX_UWP)
-    const auto* installed_location =
+    const auto *installed_location =
         SDL_WinRTGetFSPathUTF8(SDL_WINRT_PATH_INSTALLED_LOCATION);
-    executable_directory = installed_location != nullptr && installed_location[0] != '\0'
-                               ? std::filesystem::path{installed_location}
-                               : std::filesystem::current_path();
+    executable_directory =
+        installed_location != nullptr && installed_location[0] != '\0'
+            ? std::filesystem::path{installed_location}
+            : std::filesystem::current_path();
 #else
     std::error_code executable_path_error;
     const auto executable_path = std::filesystem::absolute(
@@ -238,15 +245,49 @@ int syphonFilterMain(int argc, char **argv) {
         graphics.bilinear_filtering = true;
       } else if (argument == "--nearest") {
         graphics.bilinear_filtering = false;
+      } else if (argument == "--trilinear") {
+        graphics.trilinear_filtering = true;
+      } else if (argument == "--no-trilinear") {
+        graphics.trilinear_filtering = false;
       } else if (argument == "--anisotropic") {
         graphics.anisotropic_filtering = true;
       } else if (argument == "--no-anisotropic") {
         graphics.anisotropic_filtering = false;
+      } else if (argument == "--smaa") {
+        graphics.smaa = true;
+        graphics.msaa_samples = 0;
+      } else if (argument == "--no-smaa") {
+        graphics.smaa = false;
+      } else if (argument == "--volumetric-effects") {
+        graphics.volumetric_effects = true;
+      } else if (argument == "--no-volumetric-effects") {
+        graphics.volumetric_effects = false;
+      } else if (argument == "--skybox" || argument == "--skyboxes") {
+        graphics.mission_skyboxes = true;
+      } else if (argument == "--no-skybox" ||
+                 argument == "--no-skyboxes") {
+        graphics.mission_skyboxes = false;
       } else if (argument == "--vsync") {
         graphics.vsync = true;
       } else if (argument == "--no-vsync") {
         graphics.vsync = false;
-      } else if (startsWith(argument, "--fps-limit=")) {
+      } else if (argument == "--controller-backend=auto") {
+        graphics.controller_protocol =
+            sf::platform::ControllerProtocol::automatic;
+      } else if (argument == "--controller-backend=xinput") {
+        graphics.controller_protocol = sf::platform::ControllerProtocol::xinput;
+      } else if (argument == "--controller-backend=dinput" ||
+                 argument == "--controller-backend=directinput") {
+        graphics.controller_protocol =
+            sf::platform::ControllerProtocol::direct_input;
+      } else if (argument == "--controller-backend=rawinput" ||
+                 argument == "--controller-backend=raw") {
+        graphics.controller_protocol =
+            sf::platform::ControllerProtocol::raw_input;
+      } else if (argument.starts_with("--controller-backend=")) {
+        printUsage();
+        return 64;
+      } else if (argument.starts_with("--fps-limit=")) {
         const auto limit = parseInteger(
             argument.substr(std::string_view{"--fps-limit="}.size()));
         if (!limit || (*limit != 0 && (*limit < 20 || *limit > 1000))) {
@@ -263,14 +304,14 @@ int syphonFilterMain(int argc, char **argv) {
         graphics.aspect_ratio = sf::platform::AspectRatioMode::adaptive;
       } else if (argument == "--aspect-4-3") {
         graphics.aspect_ratio = sf::platform::AspectRatioMode::original_4_3;
-      } else if (startsWith(argument, "--resolution=")) {
+      } else if (argument.starts_with("--resolution=")) {
         if (!parseResolution(
                 argument.substr(std::string_view{"--resolution="}.size()),
                 graphics)) {
           printUsage();
           return 64;
         }
-      } else if (startsWith(argument, "--msaa=")) {
+      } else if (argument.starts_with("--msaa=")) {
         const auto samples =
             parseInteger(argument.substr(std::string_view{"--msaa="}.size()));
         if (!samples || (*samples != 0 && *samples != 2 && *samples != 4 &&
@@ -279,8 +320,9 @@ int syphonFilterMain(int argc, char **argv) {
           return 64;
         }
         graphics.msaa_samples = *samples;
-      } else if (startsWith(argument, "--mission=") ||
-                 startsWith(argument, "--level=")) {
+        graphics.smaa = false;
+      } else if (argument.starts_with("--mission=") ||
+                 argument.starts_with("--level=")) {
         const auto separator = argument.find('=');
         const auto mission_number =
             parseInteger(argument.substr(separator + 1U));
@@ -343,8 +385,8 @@ int syphonFilterMain(int argc, char **argv) {
     }
     auto mission_index = requested_mission.value_or(0U);
     auto cue_path = launch->cue_path;
-    if (show_launcher && !sf::platform::showGraphicsLauncher(
-                             graphics, input, language, cue_path)) {
+    if (show_launcher &&
+        !sf::platform::showLauncher(graphics, input, language, cue_path)) {
       return 0;
     }
     if (!sf::game::localizationPackAvailable(language)) {
@@ -374,6 +416,13 @@ int syphonFilterMain(int argc, char **argv) {
     }
 
     std::unique_ptr<sf::platform::Host> host;
+    const sf::platform::ControllerSettingsCommitCallback
+        persist_controller_settings =
+            [](const sf::platform::ControllerButtonBindings &bindings,
+               bool vibration) {
+              return sf::platform::saveLauncherControllerSettings(bindings,
+                                                                  vibration);
+            };
     if (launch->mode == LaunchMode::game ||
         launch->mode == LaunchMode::title_test) {
       const auto &definition = sf::game::missionDefinition(mission_index);
@@ -394,7 +443,7 @@ int syphonFilterMain(int argc, char **argv) {
                             : "Syphon Filter PC",
           std::move(assets), std::move(movies), std::move(selected_mission),
           std::move(mission_cue_path), std::move(supported_game_serial),
-          graphics, input, retail_cheats);
+          graphics, input, retail_cheats, persist_controller_settings);
     } else if (launch->mode == LaunchMode::scene_test) {
       const auto &definition = sf::game::missionDefinition(mission_index);
       std::cout << "Disc verified. Starting native scene test at mission "
@@ -403,7 +452,7 @@ int syphonFilterMain(int argc, char **argv) {
       host = sf::platform::createPsyCrossSceneHost(
           "Syphon Filter PC - scene test",
           sf::game::MissionPackage::load(disc, mission_index), disc.cuePath(),
-          graphics, input, retail_cheats);
+          graphics, input, retail_cheats, persist_controller_settings);
     } else {
       std::cout << "Disc verified. Starting PsyCross platform test; "
                    "close the window to exit.\n";
@@ -422,9 +471,3 @@ int syphonFilterMain(int argc, char **argv) {
     return 1;
   }
 }
-
-#if !defined(SF_XBOX_UWP)
-int main(int argc, char** argv) {
-  return syphonFilterMain(argc, argv);
-}
-#endif

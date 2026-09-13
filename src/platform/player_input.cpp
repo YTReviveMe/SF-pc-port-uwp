@@ -196,6 +196,23 @@ std::size_t findIgnoringAsciiCase(std::string_view text,
   return std::string_view::npos;
 }
 
+std::string hudPromptName(std::string_view source) {
+  std::string name{source};
+  if (name.empty()) {
+    name = "Unbound";
+  }
+  std::ranges::replace(name, '\t', ' ');
+  std::ranges::transform(name, name.begin(), [](const char value) {
+    const auto raw = static_cast<unsigned char>(value);
+    return raw >= static_cast<unsigned char>('a') &&
+                   raw <= static_cast<unsigned char>('z')
+               ? static_cast<char>(raw - static_cast<unsigned char>('a') +
+                                   static_cast<unsigned char>('A'))
+               : value;
+  });
+  return name;
+}
+
 std::string normalizedRetailPrompt(std::string_view source) {
   std::string result{source};
   for (auto offset = std::size_t{};;) {
@@ -252,18 +269,80 @@ std::string hudInputName(KeyboardMouseInput input) {
   // `s` through the Cyrillic slot and appears as "E\u041bCAPE". This mapping is
   // presentation-only: launcher labels and persisted binding names retain
   // their normal title case.
-  std::ranges::transform(name, name.begin(), [](const char value) {
-    const auto raw = static_cast<unsigned char>(value);
-    return raw >= static_cast<unsigned char>('a') &&
-                   raw <= static_cast<unsigned char>('z')
-               ? static_cast<char>(raw - static_cast<unsigned char>('a') +
-                                   static_cast<unsigned char>('A'))
-               : value;
-  });
-  return name;
+  return hudPromptName(name);
 }
 
 } // namespace
+
+int controllerMenuDirection(std::uint8_t horizontal, std::uint8_t vertical,
+                            int previous_direction) noexcept {
+  constexpr int center = 128;
+  constexpr int engage_deadzone = 56;
+  constexpr int release_deadzone = 40;
+  const auto x = static_cast<int>(horizontal) - center;
+  const auto y = static_cast<int>(vertical) - center;
+  if (previous_direction != 0) {
+    if (std::abs(x) <= release_deadzone && std::abs(y) <= release_deadzone) {
+      return 0;
+    }
+    return previous_direction < 0 ? -1 : 1;
+  }
+  const auto dominant = std::abs(y) >= std::abs(x) ? y : x;
+  if (std::abs(dominant) <= engage_deadzone) {
+    return 0;
+  }
+  return dominant < 0 ? -1 : 1;
+}
+
+std::uint8_t dominantControllerMenuAxis(
+    std::uint8_t right_horizontal, std::uint8_t right_vertical,
+    std::uint8_t left_horizontal, std::uint8_t left_vertical) noexcept {
+  constexpr int center = 128;
+  // Prefer Y on ties so ordinary list navigation remains intuitive, but
+  // accept X as well: the retail title code maps every D-pad direction to
+  // previous/next and controller axis layouts are not part of save data.
+  const std::array candidates{left_vertical, right_vertical, left_horizontal,
+                              right_horizontal};
+  auto selected = std::uint8_t{center};
+  auto selected_magnitude = 0;
+  for (const auto candidate : candidates) {
+    const auto magnitude = std::abs(static_cast<int>(candidate) - center);
+    if (magnitude > selected_magnitude) {
+      selected = candidate;
+      selected_magnitude = magnitude;
+    }
+  }
+  return selected;
+}
+
+ControllerMenuStep
+ControllerMenuNavigator::update(ControllerMenuSample sample) noexcept {
+  if (!sample.connected) {
+    reset();
+    return {};
+  }
+
+  if (!initialized_ || instance_id_ != sample.instance_id) {
+    initialized_ = true;
+    instance_id_ = sample.instance_id;
+    direction_ = controllerMenuDirection(sample.horizontal, sample.vertical, 0);
+    return {};
+  }
+
+  const auto previous_direction = direction_;
+  direction_ = controllerMenuDirection(sample.horizontal, sample.vertical,
+                                       previous_direction);
+  if (previous_direction != 0 || direction_ == 0) {
+    return {};
+  }
+  return ControllerMenuStep{.previous = direction_ < 0, .next = direction_ > 0};
+}
+
+void ControllerMenuNavigator::reset() noexcept {
+  instance_id_ = -1;
+  direction_ = 0;
+  initialized_ = false;
+}
 
 KeyboardMouseBindings defaultKeyboardMouseBindings() noexcept {
   KeyboardMouseBindings result;
@@ -454,9 +533,113 @@ keyboardMouseActionConfigKey(KeyboardMouseAction action) noexcept {
              : std::string_view{};
 }
 
-std::optional<KeyboardMousePromptText>
-keyboardMousePromptText(std::string_view source,
-                        const KeyboardMouseBindings &bindings) {
+std::string_view
+controllerButtonPromptName(ControllerPromptFamily family,
+                           std::uint16_t ps1_active_high_bit) noexcept {
+  static constexpr std::array<std::string_view, 16U> generic_names{
+      "BUTTON 7",     "BUTTON 9",      "BUTTON 10", "BUTTON 8",
+      "DPAD UP",      "DPAD RIGHT",    "DPAD DOWN", "DPAD LEFT",
+      "LEFT TRIGGER", "RIGHT TRIGGER", "BUTTON 5",  "BUTTON 6",
+      "BUTTON 4",     "BUTTON 2",      "BUTTON 1",  "BUTTON 3",
+  };
+  static constexpr std::array<std::string_view, 16U> xbox_names{
+      "VIEW",      "LEFT STICK", "RIGHT STICK", "MENU", "DPAD UP", "DPAD RIGHT",
+      "DPAD DOWN", "DPAD LEFT",  "LT",          "RT",   "LB",      "RB",
+      "Y",         "B",          "A",           "X",
+  };
+  static constexpr std::array<std::string_view, 16U> playstation_names{
+      "SHARE",     "L3",        "R3",    "OPTIONS", "DPAD UP", "DPAD RIGHT",
+      "DPAD DOWN", "DPAD LEFT", "L2",    "R2",      "L1",      "R1",
+      "TRIANGLE",  "CIRCLE",    "CROSS", "SQUARE",
+  };
+  static constexpr std::array<std::string_view, 16U> nintendo_names{
+      "MINUS",     "LEFT STICK", "RIGHT STICK", "PLUS", "DPAD UP", "DPAD RIGHT",
+      "DPAD DOWN", "DPAD LEFT",  "ZL",          "ZR",   "L",       "R",
+      "X",         "A",          "B",           "Y",
+  };
+
+  if (ps1_active_high_bit == 0U ||
+      (ps1_active_high_bit & (ps1_active_high_bit - 1U)) != 0U) {
+    return "UNBOUND";
+  }
+  auto index = std::size_t{};
+  for (auto remaining = ps1_active_high_bit; remaining > 1U;
+       remaining = static_cast<std::uint16_t>(remaining >> 1U)) {
+    ++index;
+  }
+  switch (family) {
+  case ControllerPromptFamily::xbox:
+    return xbox_names[index];
+  case ControllerPromptFamily::playstation:
+    return playstation_names[index];
+  case ControllerPromptFamily::nintendo:
+    return nintendo_names[index];
+  case ControllerPromptFamily::generic:
+  default:
+    return generic_names[index];
+  }
+}
+InputPromptBindings
+keyboardMouseInputPromptBindings(const KeyboardMouseBindings &bindings) {
+  InputPromptBindings result;
+  const auto set = [&](InputPromptAction destination,
+                       KeyboardMouseAction source) {
+    result.values[static_cast<std::size_t>(destination)] =
+        hudInputName(bindings[source]);
+  };
+  set(InputPromptAction::confirm, KeyboardMouseAction::interact);
+  set(InputPromptAction::cancel, KeyboardMouseAction::pause);
+  set(InputPromptAction::pause, KeyboardMouseAction::pause);
+  set(InputPromptAction::interact, KeyboardMouseAction::interact);
+  set(InputPromptAction::fire, KeyboardMouseAction::fire);
+  return result;
+}
+
+InputPromptBindings
+controllerInputPromptBindings(ControllerInputProtocol protocol,
+                              InputPromptBindingNames names) {
+  InputPromptBindings result;
+  result.device = InputPromptDevice::controller;
+  result.controller_protocol = protocol;
+  const std::array<std::string_view, input_prompt_action_count> labels{{
+      names.confirm,
+      names.cancel,
+      names.pause,
+      names.interact,
+      names.fire,
+  }};
+  for (std::size_t index = 0U; index < labels.size(); ++index) {
+    result.values[index] = hudPromptName(labels[index]);
+  }
+  return result;
+}
+
+InputPromptBindings retailMenuControllerInputPromptBindings(
+    ControllerPromptFamily family) noexcept {
+  constexpr std::uint16_t start_button = 0x0008U;
+  constexpr std::uint16_t circle_button = 0x2000U;
+  constexpr std::uint16_t cross_button = 0x4000U;
+  constexpr std::uint16_t square_button = 0x8000U;
+  const auto name = [family](std::uint16_t button) {
+    return controllerButtonPromptName(family, button);
+  };
+  return controllerInputPromptBindings(
+      ControllerInputProtocol::unknown,
+      InputPromptBindingNames{.confirm = name(cross_button),
+                              .cancel = name(circle_button),
+                              .pause = name(start_button),
+                              .interact = name(cross_button),
+                              .fire = name(square_button)});
+}
+
+std::string_view inputPromptLabel(const InputPromptBindings &bindings,
+                                  InputPromptAction action) noexcept {
+  const auto label = bindings[action];
+  return label.empty() ? std::string_view{"UNBOUND"} : label;
+}
+
+std::optional<InputPromptText>
+inputPromptText(std::string_view source, const InputPromptBindings &bindings) {
   constexpr std::string_view press_prefix = "Press ";
   constexpr std::string_view contact_suffix = " to Contact ";
   auto retail = normalizedRetailPrompt(source);
@@ -464,14 +647,20 @@ keyboardMousePromptText(std::string_view source,
     return std::nullopt;
   }
 
-  auto action = KeyboardMouseAction::interact;
-  auto token_begin = press_prefix.size();
+  auto action = InputPromptAction::confirm;
+  const auto token_begin = press_prefix.size();
   auto token_end = std::string::npos;
-  if (startsWithIgnoringAsciiCase(std::string_view{retail}.substr(token_begin),
-                                  "START") &&
-      (retail.size() == token_begin + 5U ||
-       std::isspace(static_cast<unsigned char>(retail[token_begin + 5U])))) {
-    action = KeyboardMouseAction::pause;
+  if (const auto contact =
+          findIgnoringAsciiCase(retail, contact_suffix, token_begin);
+      contact != std::string::npos && contact > token_begin) {
+    action = InputPromptAction::interact;
+    token_end = contact;
+  } else if (startsWithIgnoringAsciiCase(
+                 std::string_view{retail}.substr(token_begin), "START") &&
+             (retail.size() == token_begin + 5U ||
+              std::isspace(
+                  static_cast<unsigned char>(retail[token_begin + 5U])))) {
+    action = InputPromptAction::pause;
     token_end = token_begin + 5U;
   } else if (startsWithIgnoringAsciiCase(
                  std::string_view{retail}.substr(token_begin), "CROSS") &&
@@ -485,10 +674,6 @@ keyboardMousePromptText(std::string_view source,
               std::isspace(
                   static_cast<unsigned char>(retail[token_begin + 1U])))) {
     token_end = token_begin + 1U;
-  } else if (const auto contact =
-                 findIgnoringAsciiCase(retail, contact_suffix, token_begin);
-             contact != std::string::npos && contact > token_begin) {
-    token_end = contact;
   }
   if (token_end == std::string::npos) {
     return std::nullopt;
@@ -496,24 +681,23 @@ keyboardMousePromptText(std::string_view source,
 
   auto bound = retail;
   bound.replace(token_begin, token_end - token_begin,
-                hudInputName(bindings[action]));
-  return KeyboardMousePromptText{std::move(retail), std::move(bound)};
+                inputPromptLabel(bindings, action));
+  return InputPromptText{std::move(retail), std::move(bound), action};
 }
 
-std::string keyboardMouseHintText(std::string_view source,
-                                  const KeyboardMouseBindings &bindings) {
+std::string inputHintText(std::string_view source,
+                          const InputPromptBindings &bindings,
+                          InputPromptTokenActions tokens) {
   std::string result;
   result.reserve(source.size());
   for (auto index = std::size_t{}; index < source.size(); ++index) {
     if (source[index] == '%' && index + 1U < source.size()) {
       const auto token = asciiLower(source[index + 1U]);
-      const auto action = token == 'x'
-                              ? std::optional{KeyboardMouseAction::interact}
-                          : token == 't'
-                              ? std::optional{KeyboardMouseAction::pause}
-                              : std::nullopt;
+      const auto action = token == 'x'   ? std::optional{tokens.x}
+                          : token == 't' ? std::optional{tokens.t}
+                                         : std::nullopt;
       if (action) {
-        result.append(hudInputName(bindings[*action]));
+        result.append(inputPromptLabel(bindings, *action));
         ++index;
         continue;
       }
@@ -521,6 +705,19 @@ std::string keyboardMouseHintText(std::string_view source,
     result.push_back(source[index] == '\t' ? ' ' : source[index]);
   }
   return result;
+}
+
+std::optional<KeyboardMousePromptText>
+keyboardMousePromptText(std::string_view source,
+                        const KeyboardMouseBindings &bindings) {
+  return inputPromptText(source, keyboardMouseInputPromptBindings(bindings));
+}
+
+std::string keyboardMouseHintText(std::string_view source,
+                                  const KeyboardMouseBindings &bindings) {
+  return inputHintText(source, keyboardMouseInputPromptBindings(bindings),
+                       InputPromptTokenActions{.x = InputPromptAction::interact,
+                                               .t = InputPromptAction::pause});
 }
 
 KeyboardMouseActionSnapshot
@@ -700,9 +897,9 @@ FirstPersonAimInput firstPersonAimInput(const PlayerInput &input) noexcept {
       },
       PlayerLookSample{
           std::clamp(finiteOrZero(input.controller_look_yaw), -1.0, 1.0) *
-              retail_first_person_yaw_units_per_tick,
+              controller_first_person_yaw_units_per_tick,
           std::clamp(finiteOrZero(input.controller_look_pitch), -1.0, 1.0) *
-              retail_first_person_pitch_units_per_tick,
+              controller_first_person_pitch_units_per_tick,
       },
       std::clamp(finiteOrZero(input.move_forward), -1.0, 1.0),
       std::clamp(finiteOrZero(input.turn), -1.0, 1.0),

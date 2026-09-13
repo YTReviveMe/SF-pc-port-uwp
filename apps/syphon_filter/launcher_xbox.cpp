@@ -142,7 +142,12 @@ bool importExternalGameImage(const XboxGameImagePaths &paths) {
 void loadLauncherSettings(
     GraphicsSettings &, KeyboardMouseBindings &, game::GameLanguage &) noexcept {}
 
-bool showGraphicsLauncher(
+bool saveLauncherControllerSettings(const game::ControllerButtonBindings &,
+                                    bool) noexcept {
+  return true;
+}
+
+bool showLauncher(
     GraphicsSettings &, KeyboardMouseBindings &, game::GameLanguage &,
     std::filesystem::path &cue_path) {
   const auto paths = xboxGameImagePaths(localStatePath());

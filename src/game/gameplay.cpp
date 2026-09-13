@@ -10,7 +10,6 @@
 #include <array>
 #include <bit>
 #include <cctype>
-#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numbers>
@@ -868,6 +867,7 @@ std::optional<ActorAimHit> actorAimHit(const ActorAimRay &ray, double actor_x,
 }
 
 GameplaySession::GameplaySession(const MissionPackage &mission,
+                                 bool initial_agent_difficulty,
                                  LoadProgressCallback load_progress)
     : mission_(mission) {
   const auto report_load = [&](std::uint8_t percent) {
@@ -960,13 +960,25 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
         geometry);
     const auto model_index = static_cast<std::uint16_t>(object_models_.size());
     const auto visual_effect = [&] {
+      const auto gmd_effect_geometry =
+          std::holds_alternative<assets::GmdModel>(geometry);
+      if (gmd_effect_geometry && legacyFireVolumeModel(class_id, stem)) {
+        return ObjectVisualEffect::fire_volume;
+      }
+      if (legacySmokeVolumeModel(resource.name)) {
+        return ObjectVisualEffect::smoke_volume;
+      }
+      if (gmd_effect_geometry && legacyFogVolumeModel(class_id, stem)) {
+        return ObjectVisualEffect::fog_volume;
+      }
       if (class_id == police_lightbar_class && stem == "LIGHT") {
         return ObjectVisualEffect::police_lightbar;
       }
       // GLIT/YLIT are the original lamp-brightness halo sprite. Their
       // authored planar mesh supplies size and UVs, but gameplay turns it
       // toward the viewer and keeps it emissive.
-      if (legacyLampBillboardModel(stem)) {
+      if (gmd_effect_geometry &&
+          legacyLampBillboardPresentation(class_id, stem)) {
         return ObjectVisualEffect::billboard_glow;
       }
       if (legacyLampEmitterModel(class_id, stem)) {
@@ -1203,6 +1215,14 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
     weapon_models_[index] =
         load_model(std::string{stem}, *resources->second.gmd, 0U);
   }
+  const auto armor_stem = droppedItemWorldModel(0x80U);
+  const auto armor = object_entries.find(std::string{armor_stem});
+  if (armor == object_entries.end() || armor->second.gmd == nullptr) {
+    throw core::Error{core::ErrorCode::not_found,
+                      "Retail VEST.GMD pickup model is missing"};
+  }
+  armor_pickup_model_ =
+      load_model(std::string{armor_stem}, *armor->second.gmd, 0U);
 
   // SPFX is a global retail particle atlas. Several overlays, including
   // PARK/PARK2, emit effects without placing a class-0x30 CFIRE object.
@@ -1400,7 +1420,7 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
   current_room_ = mission.layout().initialRoom();
   rebuildActiveModels();
   legacy_first_mission_ = std::make_unique<LegacyFirstMissionRuntime>(
-      mission.definition(), mission.legacyImage());
+      mission.definition(), mission.legacyImage(), initial_agent_difficulty);
   reset();
   report_load(100U);
 }
@@ -1455,6 +1475,28 @@ bool GameplaySession::applyCampaignCarryState(
   return !legacy_runtime_faulted_;
 }
 
+bool GameplaySession::applyRetryInventoryState(
+    const CampaignCarryState &state) noexcept {
+  if (!legacy_first_mission_ || !validCampaignCarry(state) ||
+      !legacy_first_mission_->applyRetryInventoryState(state)) {
+    return false;
+  }
+  // The checkpoint may have been captured mid-switch. Its queued retail tape
+  // transaction belongs to the old checkpoint inventory and must not replace
+  // the post-checkpoint weapon restored above on the next guest tick.
+  pending_equipped_weapon_.reset();
+  pending_guest_weapon_requests_.clear();
+  pending_guest_weapon_.reset();
+  pending_guest_weapon_steps_.clear();
+  guest_weapon_in_flight_direction_ = 0;
+  guest_weapon_in_flight_expected_.reset();
+  pending_guest_weapon_menu_ = false;
+  guest_quick_weapon_pending_ = false;
+  legacy_last_synced_guest_frame_.reset();
+  syncLegacyGameplayBridge();
+  return !legacy_runtime_faulted_;
+}
+
 bool GameplaySession::activateRetailAllWeaponsCheat() noexcept {
   if (!legacy_first_mission_ ||
       !legacy_first_mission_->activateRetailAllWeaponsCheat()) {
@@ -1479,6 +1521,23 @@ bool GameplaySession::setRetailAllWeaponsCheat(bool enabled) noexcept {
 bool GameplaySession::setRetailHardMode(bool enabled) noexcept {
   return legacy_first_mission_ &&
          legacy_first_mission_->setRetailHardMode(enabled);
+}
+
+bool GameplaySession::setAgentDifficulty(bool enabled) noexcept {
+  return legacy_first_mission_ &&
+         legacy_first_mission_->setAgentDifficulty(enabled);
+}
+
+bool GameplaySession::agentHeadshotThreatActive() const noexcept {
+  return legacy_first_mission_ &&
+         legacy_first_mission_->agentHeadshotThreatActive();
+}
+
+std::optional<std::uint8_t>
+GameplaySession::agentPark2BombDetonationPercent() const noexcept {
+  return legacy_first_mission_
+             ? legacy_first_mission_->agentPark2BombDetonationPercent()
+             : std::nullopt;
 }
 
 bool GameplaySession::setRetailOneShotKills(bool enabled) noexcept {
@@ -1507,6 +1566,11 @@ bool GameplaySession::setAudioVolumes(
       .music = legacyRetailAudioVolumeFromPercent(volumes.music),
       .voice_over = legacyRetailAudioVolumeFromPercent(volumes.voice_over),
   });
+}
+
+bool GameplaySession::setVibrationEnabled(bool enabled) noexcept {
+  return legacy_first_mission_ &&
+         legacy_first_mission_->setRetailVibrationEnabled(enabled);
 }
 
 std::optional<GameplayAudioVolumes>
@@ -1597,6 +1661,8 @@ void GameplaySession::reset() {
   aim_target_.reset();
   headshot_targeted_ = false;
   locked_target_.reset();
+  target_lock_presentation_active_ = false;
+  target_lock_guest_slot_.reset();
   last_shot_ = {};
   effects_.clear();
   legacy_expl_particles_.clear();
@@ -1661,6 +1727,8 @@ void GameplaySession::reset() {
   guest_weapon_in_flight_expected_.reset();
   pending_guest_weapon_menu_ = false;
   guest_quick_weapon_pending_ = false;
+  pending_grenade_throw_down_ = false;
+  pending_grenade_throw_down_staged_ = false;
   host_manual_aim_ = false;
   retail_host_aim_active_ = false;
   first_person_aim_roll_block_updates_ = 0U;
@@ -1828,7 +1896,8 @@ bool GameplaySession::restartCheckpoint() {
   player_controller_ = checkpoint_player_controller_;
   current_room_ = checkpoint_room_;
   active_models_ = checkpoint_active_models_;
-  rebuildPresentationModels();
+  presentation_models_ = checkpoint_presentation_models_;
+  terrain_models_ = checkpoint_terrain_models_;
   legacy_world_vertex_colors_ = checkpoint_legacy_world_vertex_colors_;
   hud_ = checkpoint_hud_;
   object_health_ = checkpoint_object_health_;
@@ -1885,6 +1954,8 @@ bool GameplaySession::restartCheckpoint() {
   aim_target_.reset();
   headshot_targeted_ = false;
   locked_target_.reset();
+  target_lock_presentation_active_ = false;
+  target_lock_guest_slot_.reset();
   last_shot_ = checkpoint_last_shot_;
   effects_ = checkpoint_effects_;
   effect_serial_ = checkpoint_effect_serial_;
@@ -1912,6 +1983,8 @@ bool GameplaySession::restartCheckpoint() {
       checkpoint_guest_weapon_in_flight_expected_;
   pending_guest_weapon_menu_ = checkpoint_pending_guest_weapon_menu_;
   guest_quick_weapon_pending_ = checkpoint_guest_quick_weapon_pending_;
+  pending_grenade_throw_down_ = false;
+  pending_grenade_throw_down_staged_ = false;
   host_manual_aim_ = false;
   retail_host_aim_active_ = false;
   first_person_aim_roll_block_updates_ = 0U;
@@ -1957,6 +2030,8 @@ void GameplaySession::captureCheckpoint() {
   checkpoint_player_controller_ = player_controller_;
   checkpoint_room_ = current_room_;
   checkpoint_active_models_ = active_models_;
+  checkpoint_presentation_models_ = presentation_models_;
+  checkpoint_terrain_models_ = terrain_models_;
   checkpoint_legacy_world_vertex_colors_ = legacy_world_vertex_colors_;
   checkpoint_hud_ = hud_;
   checkpoint_last_shot_ = last_shot_;
@@ -2019,6 +2094,15 @@ void GameplaySession::captureCheckpoint() {
   checkpoint_pending_ = false;
 }
 
+std::span<const std::uint16_t>
+GameplaySession::prefetchedModels() const noexcept {
+  if (terrain_models_.size() <= presentation_models_.size()) {
+    return {};
+  }
+  return std::span<const std::uint16_t>{terrain_models_}.subspan(
+      presentation_models_.size());
+}
+
 std::vector<std::uint16_t> GameplaySession::buildActiveModels(
     std::uint16_t room, std::span<const std::uint16_t> retail_traversal) const {
   std::vector<std::uint16_t> result;
@@ -2056,14 +2140,113 @@ std::vector<std::uint16_t> GameplaySession::buildActiveModels(
   return result;
 }
 
+std::vector<std::uint16_t>
+buildWorldPresentationEnvelope(std::span<const std::uint16_t> retained,
+                               std::span<const std::uint16_t> active,
+                               bool reset_for_new_room) {
+  std::vector<std::uint16_t> result;
+  result.reserve((reset_for_new_room ? 0U : retained.size()) + active.size());
+  const auto append_unique = [&result](std::uint16_t model) {
+    if (std::ranges::find(result, model) == result.end()) {
+      result.push_back(model);
+    }
+  };
+  if (!reset_for_new_room) {
+    for (const auto model : retained) {
+      append_unique(model);
+    }
+  }
+  for (const auto model : active) {
+    append_unique(model);
+  }
+  return result;
+}
+
+std::vector<std::uint16_t>
+buildWorldTerrainEnvelope(std::span<const std::uint16_t> visible,
+                          std::span<const std::uint16_t> prefetched,
+                          std::span<const std::uint16_t> portal_candidates) {
+  std::vector<std::uint16_t> result;
+  result.reserve(visible.size() + 1U);
+  for (const auto model : visible) {
+    if (std::ranges::find(result, model) == result.end()) {
+      result.push_back(model);
+    }
+  }
+  const auto unseen = [&result](std::uint16_t model) {
+    return std::ranges::find(result, model) == result.end();
+  };
+  const auto portal_candidate = [portal_candidates](std::uint16_t model) {
+    return std::ranges::find(portal_candidates, model) !=
+           portal_candidates.end();
+  };
+  for (const auto model : prefetched) {
+    if (unseen(model) && portal_candidate(model)) {
+      result.push_back(model);
+      return result;
+    }
+  }
+  for (const auto model : portal_candidates) {
+    if (unseen(model)) {
+      result.push_back(model);
+      return result;
+    }
+  }
+  return result;
+}
+
 void GameplaySession::rebuildActiveModels() {
   active_models_ = buildActiveModels(current_room_);
-  rebuildPresentationModels();
+  rebuildPresentationModels(true);
   rebuildActiveObjects();
 }
 
-void GameplaySession::rebuildPresentationModels() {
-  presentation_models_ = active_models_;
+void GameplaySession::rebuildPresentationModels(bool reset_for_new_room) {
+  presentation_models_ = buildWorldPresentationEnvelope(
+      presentation_models_, active_models_, reset_for_new_room);
+  const auto &layout = mission_.layout();
+  const auto &current_visibility = layout.visibility(current_room_);
+  std::vector<std::uint16_t> portal_candidates;
+  const auto append_candidates = [&](std::span<const std::uint16_t> models) {
+    for (const auto model : models) {
+      if (model < layout.modelCount() &&
+          std::ranges::find(portal_candidates, model) ==
+              portal_candidates.end()) {
+        portal_candidates.push_back(model);
+      }
+    }
+  };
+  append_candidates(current_visibility.active_models);
+  for (const auto room : current_visibility.active_models) {
+    if (room < layout.modelCount()) {
+      append_candidates(layout.visibility(room).active_models);
+    }
+  }
+  terrain_models_ = buildWorldTerrainEnvelope(
+      presentation_models_, current_visibility.prefetched_models,
+      portal_candidates);
+  // Follow the complete first connected route. Choosing another entry from
+  // portal_candidates would add a sibling at the same depth instead of moving
+  // the horizon farther from Gabe. Texture residency independently admits an
+  // exact cumulative prefix, so an invalid or over-capacity model still closes
+  // the render envelope before every model beyond it.
+  while (terrain_models_.size() < layout.modelCount()) {
+    if (terrain_models_.size() <= presentation_models_.size()) {
+      break;
+    }
+    const auto route_model = terrain_models_.back();
+    if (route_model >= layout.modelCount()) {
+      break;
+    }
+    const auto &route_visibility = layout.visibility(route_model);
+    const auto previous_size = terrain_models_.size();
+    terrain_models_ = buildWorldTerrainEnvelope(
+        terrain_models_, route_visibility.prefetched_models,
+        route_visibility.active_models);
+    if (terrain_models_.size() == previous_size) {
+      break;
+    }
+  }
 }
 void GameplaySession::rebuildActiveObjects() {
   active_objects_.clear();
@@ -2406,6 +2589,93 @@ double GameplaySession::traceWorldSegment(double from_x, double from_y,
     }
   }
   return nearest;
+}
+
+std::optional<bool>
+GameplaySession::park2GirdeuxFlameLineOfSight() const noexcept {
+  if (missionIndex() != 4U || !playerAlive()) {
+    return std::nullopt;
+  }
+
+  for (const auto object_index : active_objects_) {
+    if (object_index >= objects_.size() ||
+        legacyDedicatedActorWeapon(object_index) != WeaponId::flamethrower) {
+      continue;
+    }
+    const auto &object = objects_[object_index];
+    if (object.model >= object_models_.size()) {
+      continue;
+    }
+    const auto *model =
+        std::get_if<assets::HmdModel>(&object_models_[object.model].geometry);
+    if (model == nullptr) {
+      continue;
+    }
+    const auto hand =
+        std::ranges::find_if(model->parts(), [](const assets::HmdPart &part) {
+          return part.name.starts_with("RightHan");
+        });
+    if (hand == model->parts().end()) {
+      continue;
+    }
+    const auto hand_index =
+        static_cast<std::size_t>(std::distance(model->parts().begin(), hand));
+    if (hand_index >= object.legacy_hmd_bone_count) {
+      continue;
+    }
+
+    const auto *flamethrower = weaponModel(WeaponId::flamethrower);
+    if (flamethrower == nullptr || !flamethrower->bounds) {
+      continue;
+    }
+    const auto &hand_transform = object.legacy_hmd_bones[hand_index];
+    const auto &bounds = *flamethrower->bounds;
+    const auto local_x =
+        (static_cast<double>(bounds.minimum_x) + bounds.maximum_x) * 0.5;
+    const auto local_y = static_cast<double>(bounds.maximum_y);
+    const auto local_z =
+        (static_cast<double>(bounds.minimum_z) + bounds.maximum_z) * 0.5;
+    const auto component = [&](std::size_t row) {
+      return (static_cast<double>(hand_transform.rotation[row * 3U]) * local_x +
+              static_cast<double>(hand_transform.rotation[row * 3U + 1U]) *
+                  local_y +
+              static_cast<double>(hand_transform.rotation[row * 3U + 2U]) *
+                  local_z) /
+             4096.0;
+    };
+    const auto origin =
+        Point3{static_cast<double>(hand_transform.x) + component(0U),
+               -static_cast<double>(hand_transform.y) + component(1U),
+               static_cast<double>(hand_transform.z) + component(2U)};
+    const auto &target = player();
+    const auto origin_x = static_cast<double>(origin.x);
+    const auto origin_y = static_cast<double>(origin.y);
+    const auto origin_z = static_cast<double>(origin.z);
+    const auto delta_x = target.x - origin_x;
+    const auto delta_z = target.z - origin_z;
+    const auto horizontal_length = std::hypot(delta_x, delta_z);
+    constexpr auto shoulder_offset = 65.0;
+    const auto side_x = horizontal_length > 0.000001
+                            ? -delta_z / horizontal_length * shoulder_offset
+                            : shoulder_offset;
+    const auto side_z = horizontal_length > 0.000001
+                            ? delta_x / horizontal_length * shoulder_offset
+                            : 0.0;
+    const std::array targets{
+        Point3{target.x, target.y - actor_head_height, target.z},
+        Point3{target.x, target.y - 225.0, target.z},
+        Point3{target.x, target.y - actor_target_height, target.z},
+        Point3{target.x + side_x, target.y - 215.0, target.z + side_z},
+        Point3{target.x - side_x, target.y - 215.0, target.z - side_z},
+    };
+    std::array<bool, legacy_park2_flame_visibility_sample_count> visible{};
+    std::ranges::transform(targets, visible.begin(), [&](const Point3 &sample) {
+      return traceWorldSegment(origin_x, origin_y, origin_z, sample.x, sample.y,
+                               sample.z) >= target_visibility_limit;
+    });
+    return legacyPark2FlameDamageVisible(visible);
+  }
+  return std::nullopt;
 }
 
 std::optional<double>
@@ -3698,9 +3968,8 @@ GameplaySession::legacyVirusScannerTargetObject() const noexcept {
     return std::nullopt;
   }
 
-  const auto request = VirusScannerTargetRequest{
-      true,
-      bridge->virus_scanner_target_slot};
+  const auto request =
+      VirusScannerTargetRequest{true, bridge->virus_scanner_target_slot};
   return selectVirusScannerTarget(
       request, objects_.size(),
       [&](std::size_t scene_object) noexcept
@@ -3714,7 +3983,8 @@ GameplaySession::legacyVirusScannerTargetObject() const noexcept {
                 ? legacy_guest_slot_by_scene_object_[scene_object]
                 : -1;
         return VirusScannerTargetCandidate{
-            static_cast<std::uint16_t>(scene_object), guest_slot,
+            static_cast<std::uint16_t>(scene_object),
+            guest_slot,
             object.class_id,
             {object.transform.x, object.transform.y, object.transform.z}};
       },
@@ -3751,10 +4021,12 @@ std::optional<std::uint16_t> GameplaySession::legacyVirusScannerMarkerObject(
                 object_models_[*candidate.destroyed_model].name)) {
           return std::nullopt;
         }
-        return VirusScannerTargetCandidate{
-            static_cast<std::uint16_t>(index), -1, candidate.class_id,
-            {candidate.transform.x, candidate.transform.y,
-             candidate.transform.z}};
+        return VirusScannerTargetCandidate{static_cast<std::uint16_t>(index),
+                                           -1,
+                                           candidate.class_id,
+                                           {candidate.transform.x,
+                                            candidate.transform.y,
+                                            candidate.transform.z}};
       },
       maximum_pair_distance);
 }
@@ -3762,6 +4034,11 @@ std::optional<std::uint16_t> GameplaySession::legacyVirusScannerMarkerObject(
 std::uint64_t GameplaySession::legacyAimRayPatchCount() const noexcept {
   return legacy_first_mission_ ? legacy_first_mission_->hostAimRayPatchCount()
                                : 0U;
+}
+
+LegacyPadMotorState GameplaySession::legacyPadMotorState() const noexcept {
+  return legacy_first_mission_ ? legacy_first_mission_->padMotorState()
+                               : LegacyPadMotorState{};
 }
 
 bool GameplaySession::legacyScriptedCameraActive() const noexcept {
@@ -3837,8 +4114,7 @@ bool GameplaySession::letterboxActive() const noexcept {
 }
 
 void GameplaySession::dismissRadioConversationPresentation() noexcept {
-  if (!legacy_radio_conversation_active_ ||
-      legacy_first_mission_ == nullptr) {
+  if (!legacy_radio_conversation_active_ || legacy_first_mission_ == nullptr) {
     return;
   }
   // Do not hide the HUD/letterbox locally. The same input still reaches the
@@ -4022,6 +4298,8 @@ void GameplaySession::stageNativeFirstPersonAim(const GameplayInput &input) {
 
 void GameplaySession::stageLegacyHostState(const GameplayInput &input) {
   host_manual_aim_ = input.aim;
+  host_target_lock_held_ =
+      !input.aim && (input.target_lock || input.target_lock_held);
   host_manual_aim_strafe_ = input.aim ? input.aim_peek : 0.0;
   if (!input.aim) {
     legacy_manual_aim_neutral_camera_.reset();
@@ -4029,14 +4307,49 @@ void GameplaySession::stageLegacyHostState(const GameplayInput &input) {
   }
   if (!legacyMissionAuthoritative()) {
     retail_host_aim_active_ = false;
+    pending_grenade_throw_down_ = false;
+    pending_grenade_throw_down_staged_ = false;
     return;
   }
-  const auto pad = legacyPadStateFromPlayerInput(input);
+  const auto *aim_bridge = legacy_first_mission_->bridge();
+  const auto weapon = hud_.inventory().current();
+  const auto grenade_weapon = weapon == WeaponId::fragmentation_grenade ||
+                              weapon == WeaponId::gas_grenade;
+  const auto grenade_throw_queue_available = legacyGrenadeThrowQueueAvailable(
+      grenade_weapon,
+      aim_bridge != nullptr && aim_bridge->thrown_projectile.has_value());
+  if (!grenade_throw_queue_available) {
+    pending_grenade_throw_down_ = false;
+    pending_grenade_throw_down_staged_ = false;
+  } else if (input.fire_pressed && !pending_grenade_throw_down_) {
+    pending_grenade_throw_down_ = true;
+    pending_grenade_throw_down_staged_ = false;
+  }
+
+  if (pending_grenade_throw_down_ && pending_grenade_throw_down_staged_ &&
+      aim_bridge != nullptr && !aim_bridge->grenade_input_ready) {
+    // A staged Square-down changed the retail gate from ready to clear: the
+    // guest accepted it. Release the synthetic pulse now so a quick native
+    // click still produces the mandatory Square-up and throws.
+    pending_grenade_throw_down_ = false;
+    pending_grenade_throw_down_staged_ = false;
+  }
+
+  if (pending_grenade_throw_down_ && !pending_grenade_throw_down_staged_ &&
+      aim_bridge != nullptr && aim_bridge->grenade_input_ready) {
+    // Do not hold Square while the controller is unready: wait for its retail
+    // gate, then create a clean down edge on exactly that frame.
+    pending_grenade_throw_down_staged_ = true;
+  }
+  auto pad = legacyPadStateFromPlayerInput(input);
+  if (pending_grenade_throw_down_staged_) {
+    constexpr std::uint16_t square = 0x8000U;
+    pad.buttons = static_cast<std::uint16_t>(pad.buttons | square);
+  }
   // Stage this frame's PAD before invoking the retail L1 transition.  The
   // transition handler reads PAD RAM synchronously; leaving the previous
   // chase-frame axes there lets W/A/S/D kick the sight once as aim opens.
   legacy_first_mission_->setHostPadState(pad);
-  const auto *aim_bridge = legacy_first_mission_->bridge();
   const auto retail_aim_requested =
       input.aim && playerAim() == PlayerAimState::first_person &&
       aim_bridge != nullptr && aim_bridge->player.resident &&
@@ -4949,6 +5262,8 @@ void GameplaySession::syncLegacyGameplayBridge() {
     legacy_player_guest_rotation_.reset();
     aim_target_.reset();
     locked_target_.reset();
+    target_lock_presentation_active_ = false;
+    target_lock_guest_slot_.reset();
     headshot_targeted_ = false;
     legacy_world_callouts_.clear();
     taser_target_.reset();
@@ -5025,6 +5340,7 @@ void GameplaySession::syncLegacyGameplayBridge() {
         particle.red,
         particle.green,
         particle.blue,
+        particle.attached_explosion_sequence,
         particle.pool_index,
     });
   }
@@ -5142,13 +5458,18 @@ void GameplaySession::syncLegacyGameplayBridge() {
   // spawned/rebound object for one frame.
   if (fresh_guest_sample && bridge.player.room >= 0) {
     const auto retail_room = static_cast<std::uint16_t>(bridge.player.room);
+    const auto room_changed = current_room_ != retail_room;
     const auto world_set_changed = active_models_ != native_active_models;
-    if (current_room_ != retail_room || world_set_changed) {
+    if (room_changed || world_set_changed) {
       // Commit the guest-owned room and the native-safe visibility
       // envelope as one transaction before resident-object sync.
       current_room_ = retail_room;
       active_models_ = native_active_models;
-      rebuildPresentationModels();
+      // The visibility bytes describe the original 4:3 camera, not the wider
+      // native viewport. Retain every shell observed while the player remains
+      // in this room; the depth buffer resolves overlaps, while a room change
+      // still releases the previous room's envelope immediately.
+      rebuildPresentationModels(room_changed);
       rebuildActiveObjects();
     }
   }
@@ -5443,6 +5764,7 @@ void GameplaySession::syncLegacyUiProjection(
     const LegacyGameplayBridgeState &bridge, const LegacyUiCommandFrame &ui) {
   aim_target_.reset();
   locked_target_.reset();
+  retail_aim_point_.reset();
   headshot_targeted_ = false;
   legacy_world_callouts_.clear();
   taser_target_.reset();
@@ -5451,11 +5773,48 @@ void GameplaySession::syncLegacyUiProjection(
   hud_.setTargetHealth(std::nullopt);
 
   if (!legacy_mission_bridge_active_) {
+    target_lock_presentation_active_ = false;
+    target_lock_guest_slot_.reset();
     return;
   }
 
   const auto &mission = ui.mission;
-  const auto presentation_scene_for_guest =
+  const auto player_slot_valid =
+      ui.target.guest_slot >= 0 &&
+      static_cast<std::size_t>(ui.target.guest_slot) < bridge.objects.size();
+  const auto *retail_player =
+      player_slot_valid
+          ? &bridge.objects[static_cast<std::size_t>(ui.target.guest_slot)]
+          : nullptr;
+  const auto player_target_controller_ready =
+      retail_player != nullptr && retail_player->target_controller != 0U;
+  const auto player_has_target =
+      retail_player != nullptr && retail_player->has_target;
+  const auto target_slot_valid =
+      ui.target.target_slot >= 0 &&
+      ui.target.target_slot != ui.target.guest_slot &&
+      static_cast<std::size_t>(ui.target.target_slot) < bridge.objects.size();
+  const auto target_alive =
+      target_slot_valid &&
+      bridge.objects[static_cast<std::size_t>(ui.target.target_slot)].health >
+          0;
+  const auto target_lock_signal_active = legacyTargetLockSignalActive(
+      host_target_lock_held_, player_target_controller_ready, player_has_target,
+      target_slot_valid, target_alive);
+  target_lock_presentation_active_ = legacyTargetLockHudPresentationActive(
+      host_manual_aim_, target_lock_signal_active,
+      mission.terminal || mission.failure);
+  if (!target_lock_presentation_active_) {
+    target_lock_guest_slot_.reset();
+  } else {
+    target_lock_guest_slot_ = ui.target.target_slot;
+  }
+
+  if (bridge.aim_target_valid) {
+    retail_aim_point_ = bridge.aim_target;
+  }
+
+  const auto mapped_scene_for_guest =
       [this, &bridge](std::int16_t guest_slot) -> std::optional<std::uint16_t> {
     if (guest_slot < 0 ||
         static_cast<std::size_t>(guest_slot) >= bridge.objects.size()) {
@@ -5473,13 +5832,42 @@ void GameplaySession::syncLegacyUiProjection(
     }
     const auto index = static_cast<std::size_t>(
         std::distance(legacy_guest_slot_by_scene_object_.begin(), mapped));
-    if (index >= objects_.size() || index >= object_script_hidden_.size() ||
-        object_script_hidden_[index] ||
-        std::ranges::find(active_objects_, static_cast<std::uint16_t>(index)) ==
-            active_objects_.end()) {
+    if (index >= objects_.size()) {
       return std::nullopt;
     }
     return static_cast<std::uint16_t>(index);
+  };
+  const auto presentation_scene_for_guest =
+      [this, &mapped_scene_for_guest](
+          std::int16_t guest_slot) -> std::optional<std::uint16_t> {
+    const auto scene = mapped_scene_for_guest(guest_slot);
+    if (!scene || *scene >= object_script_hidden_.size() ||
+        object_script_hidden_[*scene] ||
+        std::ranges::find(active_objects_, *scene) == active_objects_.end()) {
+      return std::nullopt;
+    }
+    return scene;
+  };
+  const auto authored_hidden_callout_scene_for_guest =
+      [this, &mapped_scene_for_guest](
+          std::int16_t guest_slot) -> std::optional<std::uint16_t> {
+    const auto scene = mapped_scene_for_guest(guest_slot);
+    if (!scene) {
+      return std::nullopt;
+    }
+    const auto *model = displayedObjectModel(*scene);
+    if (model == nullptr) {
+      return std::nullopt;
+    }
+    const auto &object = objects_[*scene];
+    if (!legacyAuthoredObjectPresentationHidden(
+            missionIndex(), guest_slot, object.source_index,
+            object.definition_index, object.class_id, model->name)) {
+      return std::nullopt;
+    }
+    // This exact authored prop is deliberately not submitted, but its bounds
+    // remain the retail anchor for the linked C4 interaction callout.
+    return scene;
   };
   const auto scene_for_guest =
       [&bridge, &presentation_scene_for_guest](
@@ -5492,6 +5880,18 @@ void GameplaySession::syncLegacyUiProjection(
     }
     return scene;
   };
+  const auto live_mapped_scene_for_guest =
+      [&bridge, &mapped_scene_for_guest](
+          std::int16_t guest_slot) -> std::optional<std::uint16_t> {
+    const auto scene = mapped_scene_for_guest(guest_slot);
+    if (!scene || guest_slot < 0 ||
+        static_cast<std::size_t>(guest_slot) >= bridge.objects.size() ||
+        bridge.objects[static_cast<std::size_t>(guest_slot)].health <= 0) {
+      return std::nullopt;
+    }
+    // R1 owns the actor even while native chunk admission is one frame late.
+    return scene;
+  };
 
   if (bridge.taserConductorActive()) {
     if (const auto scene = scene_for_guest(bridge.taser_target_slot)) {
@@ -5502,13 +5902,32 @@ void GameplaySession::syncLegacyUiProjection(
     }
   }
 
+  bool c4_callout_present = false;
   for (const auto &callout : ui.world_callouts) {
-    const auto scene = presentation_scene_for_guest(callout.guest_slot);
+    auto scene = presentation_scene_for_guest(callout.guest_slot);
+    const auto authored_c4_scene =
+        authored_hidden_callout_scene_for_guest(callout.guest_slot);
+    if (!scene) {
+      scene = authored_c4_scene;
+    }
     if (!scene || callout.text.empty()) {
       continue;
     }
-    legacy_world_callouts_.push_back(
-        LegacyWorldCallout{*scene, callout.text, callout.headshot});
+    const auto authored_c4_callout =
+        authored_c4_scene && *authored_c4_scene == *scene;
+    legacy_world_callouts_.push_back(LegacyWorldCallout{
+        *scene, authored_c4_callout ? "C4 Explosives" : callout.text,
+        callout.headshot});
+    c4_callout_present = c4_callout_present || authored_c4_callout;
+  }
+
+  if (!c4_callout_present && ui.target.proximity_target_slot == 279) {
+    if (const auto scene = authored_hidden_callout_scene_for_guest(279)) {
+      // The retail proximity slot owns the lifetime. This fallback only
+      // covers frames where its attached TEXT node has not materialized yet.
+      legacy_world_callouts_.push_back(
+          LegacyWorldCallout{*scene, "C4 Explosives", false});
+    }
   }
 
   if (const auto scene = scene_for_guest(ui.target.aimed_target_slot)) {
@@ -5516,19 +5935,22 @@ void GameplaySession::syncLegacyUiProjection(
     headshot_targeted_ = ui.target.hit_result != 0U && ui.target.headshot;
   }
 
-  if (!host_manual_aim_ && ui.target.active &&
-      (ui.target.target_flags & 0x01U) != 0U) {
-    if (const auto scene = scene_for_guest(ui.target.target_slot)) {
-      // A first-person ray hit and the retail R1 lock are independent.
-      // Once lock-on is active its selected actor owns the frame anchor;
-      // retaining the incidental ray hit makes the reticle slide onto a
-      // different object while the camera correctly follows the enemy.
-      aim_target_ = scene;
-      locked_target_ = scene;
-      headshot_targeted_ = headshot_targeted_ &&
-                           ui.target.target_slot == ui.target.aimed_target_slot;
-      hud_.setTargetHealth(static_cast<std::uint8_t>(
-          std::clamp<int>(ui.target.target_meter, 0, 100)));
+  if (target_lock_presentation_active_) {
+    hud_.setTargetHealth(static_cast<std::uint8_t>(
+        std::clamp<int>(ui.target.target_meter, 0, 100)));
+    if (target_lock_guest_slot_) {
+      if (const auto scene =
+              live_mapped_scene_for_guest(*target_lock_guest_slot_)) {
+        // A first-person ray hit and the retail R1 lock are independent.
+        // Once lock-on is active its selected actor owns the frame anchor;
+        // retaining the incidental ray hit makes the reticle slide onto a
+        // different object while the camera correctly follows the enemy.
+        aim_target_ = scene;
+        locked_target_ = scene;
+        headshot_targeted_ =
+            headshot_targeted_ &&
+            *target_lock_guest_slot_ == ui.target.aimed_target_slot;
+      }
     }
   }
 
@@ -5799,6 +6221,8 @@ void GameplaySession::updateCinematic() {
   }
 
   if (legacy_first_mission_->ready() && !legacy_first_mission_->finished()) {
+    legacy_first_mission_->setPark2FlameLineOfSight(
+        park2GirdeuxFlameLineOfSight());
     legacy_first_mission_->advanceHostUpdate();
     syncLegacyGameplayBridge();
   }
@@ -5905,7 +6329,6 @@ bool GameplaySession::npcZoneContains(const NpcState &state, double x,
 }
 
 void GameplaySession::update(const GameplayInput &input) {
-  retail_update_timings_ = {};
   refreshLegacyTargetFollowCameraState();
   refreshLegacyRadioConversationState();
   updateEffects();
@@ -5927,6 +6350,8 @@ void GameplaySession::update(const GameplayInput &input) {
     updateCinematic();
     aim_target_.reset();
     locked_target_.reset();
+    target_lock_presentation_active_ = false;
+    target_lock_guest_slot_.reset();
     headshot_targeted_ = false;
     last_shot_ = {};
     hud_.setDanger(0U);
@@ -5936,24 +6361,10 @@ void GameplaySession::update(const GameplayInput &input) {
   }
 
   if (legacy_first_mission_->ready() && !legacy_first_mission_->finished()) {
-    const auto retail_started = std::chrono::steady_clock::now();
+    legacy_first_mission_->setPark2FlameLineOfSight(
+        park2GirdeuxFlameLineOfSight());
     legacy_first_mission_->advanceHostUpdate();
-    const auto retail_finished = std::chrono::steady_clock::now();
-    retail_update_timings_.retail_milliseconds =
-        std::chrono::duration<double, std::milli>(retail_finished -
-                                                  retail_started)
-            .count();
-    retail_update_timings_.vm_milliseconds =
-        legacy_first_mission_->lastRetailVmMilliseconds();
-    retail_update_timings_.renderer_milliseconds =
-        legacy_first_mission_->lastRetailRendererMilliseconds();
-    const auto bridge_started = std::chrono::steady_clock::now();
     syncLegacyGameplayBridge();
-    const auto bridge_finished = std::chrono::steady_clock::now();
-    retail_update_timings_.bridge_milliseconds =
-        std::chrono::duration<double, std::milli>(bridge_finished -
-                                                  bridge_started)
-            .count();
     refreshLegacyTargetFollowCameraState();
     refreshLegacyRadioConversationState();
   }
@@ -5980,6 +6391,22 @@ const ObjectModel *GameplaySession::weaponModel(WeaponId id) const noexcept {
   const auto model = weapon_models_[static_cast<std::size_t>(id)];
   return model && *model < object_models_.size() ? &object_models_[*model]
                                                  : nullptr;
+}
+
+const ObjectModel *
+GameplaySession::droppedItemModel(std::uint16_t item) const noexcept {
+  if (droppedItemWorldModel(item).empty()) {
+    return nullptr;
+  }
+  if (item == 0x80U) {
+    return armor_pickup_model_ && *armor_pickup_model_ < object_models_.size()
+               ? &object_models_[*armor_pickup_model_]
+               : nullptr;
+  }
+  if (item >= weapon_slot_count) {
+    return nullptr;
+  }
+  return weaponModel(static_cast<WeaponId>(item));
 }
 
 const ObjectModel *
@@ -6115,6 +6542,27 @@ GameplaySession::objectTextureBank(std::uint16_t index) const noexcept {
   return resolveAuthoredObjectTextureBank(
       current_bank, current_is_owner, current_is_spatial_owner,
       spatial_owner_bank_mask, authored_owner_bank_mask);
+}
+
+std::span<const std::uint16_t>
+GameplaySession::authoredObjectRooms(std::uint16_t index) const noexcept {
+  if (index >= objects_.size()) {
+    return {};
+  }
+  const auto source = objects_[index].source_index;
+  if (source >= mission_.objects().objects().size()) {
+    return {};
+  }
+  const auto &authored = mission_.objects().objects()[source];
+  const auto &object = objects_[index];
+  const auto recycled = std::ranges::find(legacy_dynamic_objects_, index) !=
+                        legacy_dynamic_objects_.end();
+  const auto moved = object.transform.x != authored.transform.x ||
+                     object.transform.z != authored.transform.z;
+  if (recycled || moved) {
+    return {};
+  }
+  return mission_.objects().roomsContainingObject(source);
 }
 
 std::uint8_t GameplaySession::displayedObjectTextureBank(

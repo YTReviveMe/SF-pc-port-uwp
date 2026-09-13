@@ -173,9 +173,6 @@ extern "C"
 }
 #endif
 
-extern int PsyX_Pad_InitSystem();
-extern void PsyX_Pad_Event_ControllerRemoved(Sint32 deviceId);
-extern void PsyX_Pad_Event_ControllerAdded(Sint32 deviceId);
 
 extern int GR_InitialisePSX();
 extern int GR_InitialiseRender(char* windowName, int width, int height,
@@ -488,6 +485,7 @@ void PsyX_GetWindowName(char* buffer)
 }
 
 FILE* g_logStream = NULL;
+static int g_logStreamDirty = 0;
 
 // intialise logging
 void PsyX_Log_Initialise()
@@ -499,6 +497,7 @@ void PsyX_Log_Initialise()
 
 	if (!g_logStream)
 		eprinterr("Error - cannot create log file '%s'\n", appLogFilename);
+	g_logStreamDirty = 0;
 }
 
 void PsyX_Log_Finalise()
@@ -509,12 +508,16 @@ void PsyX_Log_Finalise()
 		fclose(g_logStream);
 
 	g_logStream = NULL;
+	g_logStreamDirty = 0;
 }
 
 void PsyX_Log_Flush()
 {
-	if (g_logStream)
+	if (g_logStream && g_logStreamDirty)
+	{
 		fflush(g_logStream);
+		g_logStreamDirty = 0;
+	}
 }
 
 // spew types
@@ -667,7 +670,10 @@ void PrintMessageToOutput(SpewType_t spewtype, char const* pMsgFormat,
 #endif
 
 	if (g_logStream)
+	{
 		fprintf(g_logStream, pTempBuffer);
+		g_logStreamDirty = 1;
+	}
 }
 
 void PsyX_Log(const char* fmt, ...)
@@ -825,11 +831,20 @@ void PsyX_Sys_DoPollEvent()
 	{
 		switch (event.type)
 		{
+		case SDL_JOYDEVICEADDED:
+			PsyX_Pad_DeviceAdded(event.jdevice.which);
+			break;
 		case SDL_CONTROLLERDEVICEADDED:
-			PsyX_Pad_Event_ControllerAdded(event.cdevice.which);
+			PsyX_Pad_DeviceAdded(event.cdevice.which);
+			break;
+		case SDL_JOYDEVICEREMOVED:
+			PsyX_Pad_DeviceRemoved(event.jdevice.which);
 			break;
 		case SDL_CONTROLLERDEVICEREMOVED:
-			PsyX_Pad_Event_ControllerRemoved(event.cdevice.which);
+			PsyX_Pad_DeviceRemoved(event.cdevice.which);
+			break;
+		case SDL_CONTROLLERDEVICEREMAPPED:
+			PsyX_Pad_DeviceRemapped(event.cdevice.which);
 			break;
 		case SDL_QUIT:
 			PsyX_Exit();
@@ -848,6 +863,13 @@ void PsyX_Sys_DoPollEvent()
 				GR_ResetDevice();
 				break;
 #endif
+			case SDL_WINDOWEVENT_FOCUS_GAINED:
+				PsyX_Pad_SetFocus(1);
+				break;
+			case SDL_WINDOWEVENT_FOCUS_LOST:
+				g_altKeyState = 0;
+				PsyX_Pad_SetFocus(0);
+				break;
 			case SDL_WINDOWEVENT_CLOSE:
 				PsyX_Exit();
 				break;
@@ -1233,12 +1255,12 @@ void PsyX_Shutdown()
 		SDL_DestroyMutex(g_intrMutex);
 	}
 
+	PsyX_Pad_ShutdownSystem();
+
 	SDL_DestroyWindow(g_window);
 	g_window = NULL;
 
 	GR_Shutdown();
-	SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
-
 	SDL_Quit();
 
 	UnInstallExceptionHandler();

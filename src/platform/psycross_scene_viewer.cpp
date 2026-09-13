@@ -1,15 +1,19 @@
 #include "psycross_scene_viewer.hpp"
+#include "chopper_gun_pickup_texture.hpp"
 #include "muzzle_flash_texture.hpp"
 #include "psycross_audio_output.hpp"
 #include "psycross_font_texture.hpp"
+#include "psycross_mission_skybox.hpp"
 #include "psycross_movie_player.hpp"
 #include "psycross_runtime_guards.hpp"
 #include "psycross_vram.hpp"
 #include "psycross_window_mode.hpp"
+#include "vest_pickup_texture.hpp"
 
 #include "sf/assets/tim_image.hpp"
 #include "sf/core/error.hpp"
 #include "sf/core/polygon_clipper.hpp"
+#include "sf/game/agent_mission_hud.hpp"
 #include "sf/game/dynamic_lighting.hpp"
 #include "sf/game/effects.hpp"
 #include "sf/game/gameplay.hpp"
@@ -21,16 +25,19 @@
 #include "sf/game/pause_menu_data.hpp"
 #include "sf/game/retail_cheats.hpp"
 #include "sf/platform/actor_shadow_stability.hpp"
+#include "sf/platform/park2_flame_geometry.hpp"
 #include "sf/platform/gameplay_message_reveal_policy.hpp"
 #include "sf/platform/optic_history.hpp"
 #include "sf/platform/player_camera_fade.hpp"
 #include "sf/platform/player_input.hpp"
+#include "sf/platform/persistent_fire_volume.hpp"
 #include "sf/platform/retail_depth_cue.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
 #include "sf/platform/retail_ui_presentation.hpp"
 #include "sf/platform/retail_vertex_light_presentation.hpp"
 #include "sf/platform/stable_frame_vector.hpp"
-#include "sf/platform/world_chunk_appearance.hpp"
+#include "sf/platform/world_render_envelope.hpp"
+#include "sf/platform/world_object_shadow_policy.hpp"
 
 #include <PsyX/PsyX_globals.h>
 #include <PsyX/PsyX_public.h>
@@ -48,7 +55,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -101,13 +107,70 @@ constexpr std::uint16_t effect_resident_secondary_clut_y = 253U;
 constexpr std::uint16_t muzzle_flash_resident_u = 0U;
 constexpr std::uint16_t muzzle_flash_resident_clut_y = 252U;
 constexpr std::uint16_t pickup_resident_clut_y = 248U;
-// Pack the 32x32 vest below YELOSHOT in the already reserved lower half of
-// CFIRE page 5. The previous framebuffer placement overlapped the relocated
-// mission CLUT rows (including Gabe's skin palette).
+// Keep the 32x32 armour sprite in the audited free part of CFIRE page 5.
+// Its independent CLUT avoids corrupting the resident HUD and effect palettes.
 constexpr std::uint16_t pickup_resident_x = 336U;
 constexpr std::uint16_t pickup_resident_y = 224U;
-constexpr std::string_view armor_pickup_texture = "VEST2.TIM";
+constexpr std::string_view armor_pickup_texture = "VEST_PICKUP.TIM";
+// The remaining lower-right strip ends immediately below the bullet marks.
+constexpr std::uint16_t chopper_gun_pickup_resident_clut_y = 249U;
+constexpr std::uint16_t chopper_gun_pickup_resident_x = 352U;
+constexpr std::uint16_t chopper_gun_pickup_resident_y = 240U;
+constexpr std::string_view chopper_gun_pickup_texture = "CHNGUN_PICKUP.TIM";
 constexpr std::uint16_t environment_resident_clut_y = 251U;
+
+ControllerPromptFamily controllerPromptFamily(int family) noexcept {
+  switch (family) {
+  case PSYX_CONTROLLER_FAMILY_XBOX:
+    return ControllerPromptFamily::xbox;
+  case PSYX_CONTROLLER_FAMILY_PLAYSTATION:
+    return ControllerPromptFamily::playstation;
+  case PSYX_CONTROLLER_FAMILY_NINTENDO:
+    return ControllerPromptFamily::nintendo;
+  default:
+    return ControllerPromptFamily::generic;
+  }
+}
+
+InputPromptBindings
+controllerPromptBindings(const PsyXControllerSnapshot &snapshot,
+                         const game::PauseSettings &settings) {
+  constexpr std::uint16_t start_button = 0x0008U;
+  constexpr std::uint16_t triangle_button = 0x1000U;
+  constexpr std::uint16_t cross_button = 0x4000U;
+  constexpr std::uint16_t square_button = 0x8000U;
+  const auto family = controllerPromptFamily(snapshot.family);
+  const auto action_button = [&settings](game::ControllerAction action,
+                                         std::uint16_t fallback) {
+    const auto mapped = game::controllerButtonForAction(settings, action);
+    return static_cast<std::uint16_t>(mapped != 0U ? mapped : fallback);
+  };
+  const auto name = [family](std::uint16_t button) {
+    return controllerButtonPromptName(family, button);
+  };
+  return controllerInputPromptBindings(
+      ControllerInputProtocol::unknown,
+      InputPromptBindingNames{
+          .confirm = name(cross_button),
+          .cancel = name(triangle_button),
+          .pause = name(start_button),
+          .interact = name(action_button(game::ControllerAction::use_zoom_in,
+                                         triangle_button)),
+          .fire =
+              name(action_button(game::ControllerAction::shoot, square_button)),
+      });
+}
+
+std::array<std::string, 16U>
+controllerButtonLabels(const PsyXControllerSnapshot &snapshot) {
+  const auto family = controllerPromptFamily(snapshot.family);
+  auto labels = std::array<std::string, 16U>{};
+  for (std::size_t bit = 0U; bit < labels.size(); ++bit) {
+    labels[bit] = controllerButtonPromptName(
+        family, static_cast<std::uint16_t>(1U << bit));
+  }
+  return labels;
+}
 
 [[nodiscard]] bool textureDiagnosticsEnabled() noexcept {
   static const auto enabled = [] {
@@ -174,6 +237,11 @@ std::uint32_t streamed_vlf_page_mask{};
 #include "psycross_scene_pause.inc"
 // clang-format on
 } // namespace
+
+InputPromptBindings titleControllerInputPromptBindings(int controller_family) {
+  return retailMenuControllerInputPromptBindings(
+      controllerPromptFamily(controller_family));
+}
 
 #include "psycross_scene_runtime.inc"
 #include "psycross_scene_save_renderer.inc"

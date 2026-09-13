@@ -1,7 +1,9 @@
 #pragma once
 
+#include "sf/game/controller_bindings.hpp"
 #include "sf/game/retail_cheats.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -21,7 +23,6 @@ enum class PauseScreen {
   controller_bindings,
   brightness,
   screen_centering,
-  graphics,
   mission_select,
   weapons,
   parameters,
@@ -117,46 +118,6 @@ enum class ControllerPreset {
   custom,
 };
 
-enum class ControllerAction : std::uint32_t {
-  change_weapon,
-  shoot,
-  kneel,
-  roll_zoom_out,
-  step_right,
-  step_left,
-  target_lock,
-  use_zoom_in,
-  aim,
-};
-
-// Native display settings deliberately live alongside the retail pause
-// settings rather than in the guest's MENU.OVL state.  Platforms can opt in
-// through PauseMenuData::graphics_settings_available without changing the
-// original game menu on desktop builds.
-enum class PauseAspectRatio : std::uint8_t {
-  original_4_3,
-  adaptive,
-};
-
-struct PauseGraphicsSettings {
-  int render_width{1280};
-  int render_height{720};
-  int msaa_samples{4};
-  bool bilinear_filtering{true};
-  bool anisotropic_filtering{true};
-  PauseAspectRatio aspect_ratio{PauseAspectRatio::adaptive};
-  bool vsync{true};
-  std::uint32_t frame_limit{60U};
-
-  friend bool operator==(const PauseGraphicsSettings &,
-                         const PauseGraphicsSettings &) = default;
-};
-
-struct ControllerBinding {
-  ControllerAction action{ControllerAction::change_weapon};
-  std::uint32_t button{};
-};
-
 struct PauseSettings {
   std::uint8_t voice_volume{100};
   std::uint8_t music_volume{100};
@@ -167,8 +128,7 @@ struct PauseSettings {
   ControllerPreset controller_preset{ControllerPreset::standard};
   bool invert_aim{};
   bool vibration{true};
-  std::vector<ControllerBinding> bindings;
-  PauseGraphicsSettings graphics;
+  ControllerButtonBindings bindings;
 
   friend bool operator==(const PauseSettings &,
                          const PauseSettings &) = default;
@@ -181,7 +141,6 @@ struct PauseMenuData {
   std::uint32_t current_mission{};
   std::uint32_t maximum_unlocked_mission{};
   RetailCheatState cheats;
-  bool graphics_settings_available{};
 };
 
 struct PauseMenuInput {
@@ -205,13 +164,6 @@ enum class PauseSetting : std::uint32_t {
   invert_aim,
   vibration,
   bindings,
-  graphics_render_resolution,
-  graphics_msaa,
-  graphics_bilinear_filtering,
-  graphics_anisotropic_filtering,
-  graphics_aspect_ratio,
-  graphics_vsync,
-  graphics_frame_limit,
 };
 
 enum class PauseCommandType {
@@ -379,13 +331,18 @@ public:
 
   // Completes a binding request emitted by update(). Zero leaves the binding
   // unchanged, which lets the platform treat disconnect/cancel uniformly.
+  // A conflicting assignment swaps the two actions so every gameplay action
+  // stays reachable on the nine-button retail layout.
   [[nodiscard]] PauseMenuCommand
   completeControllerBinding(std::uint32_t button);
+  void cancelControllerBinding() noexcept { binding_pending_ = false; }
   void showControllerMissing();
+  void setControllerButtonLabels(
+      std::array<std::string, 16U> labels) noexcept;
   void resolveWeaponEquip(std::uint32_t id, bool accepted);
-  // Opens the platform-native display page from an Xbox controller shortcut.
-  // Returns false on platforms that did not opt in for this pause session.
-  [[nodiscard]] bool openGraphicsSettings();
+  [[nodiscard]] bool controllerBindingPending() const noexcept {
+    return binding_pending_;
+  }
   void unlockMissionSelect() noexcept { setMissionSelectUnlocked(true); }
   void setMissionSelectUnlocked(bool enabled) noexcept;
   void setRetailCheatEnabled(RetailCheat cheat, bool enabled) noexcept;
@@ -439,7 +396,6 @@ private:
   [[nodiscard]] PauseMenuCommand updateBindings(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand updateBrightness(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand updateCentering(const PauseMenuInput &input);
-  [[nodiscard]] PauseMenuCommand updateGraphics(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand
   updateMissionSelect(const PauseMenuInput &input);
   [[nodiscard]] PauseMenuCommand updateWeapons(const PauseMenuInput &input);
@@ -459,13 +415,12 @@ private:
   std::size_t pending_binding_{};
   bool binding_pending_{};
   std::string notification_;
+  std::array<std::string, 16U> controller_button_labels_{};
   PauseTransitionState transition_;
   bool mission_select_unlocked_{};
 };
 
 [[nodiscard]] std::string_view pauseScreenName(PauseScreen screen) noexcept;
-[[nodiscard]] std::string_view
-controllerActionName(ControllerAction action) noexcept;
 [[nodiscard]] std::string_view
 controllerPresetName(ControllerPreset preset) noexcept;
 void applyControllerPreset(PauseSettings &settings, ControllerPreset preset);

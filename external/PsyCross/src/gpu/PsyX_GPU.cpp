@@ -68,14 +68,6 @@ GPUDrawSplit g_splits[MAX_DRAW_SPLITS];
 int g_vertexIndex = 0;
 int g_splitIndex  = 0;
 
-// DuckStation's PGXP depth path clears depth when painter order jumps back to
-// substantially farther geometry. PS1 ordering tables allow that jump; a
-// persistent PC depth buffer otherwise cuts camera-dependent triangles out of
-// later transparent surfaces. PGXP Z is in native GTE camera-depth units.
-static const float PGXP_DEPTH_CLEAR_THRESHOLD = 4096.0f;
-static const float PGXP_MAX_DEPTH = 65536.0f;
-static float g_lastPolygonDepth = PGXP_MAX_DEPTH;
-
 void ClearSplits()
 {
 	currentSplitDebugText = nullptr;
@@ -869,21 +861,7 @@ int GR_UsesWorldDepth(const GrVertex* triangle, int depthRequested)
 		triangle[2].scr_h > 0.0f;
 }
 
-static bool SplitUsesOnlyWorldDepth(const GPUDrawSplit& split)
-{
-	if(split.numVerts == 0 || split.numVerts % 3 != 0)
-		return false;
-
-	for(int vertexIndex = split.startVertex;
-		vertexIndex < split.startVertex + split.numVerts; vertexIndex += 3)
-	{
-		if(!GR_UsesWorldDepth(&g_vertexBuffer[vertexIndex], 1))
-			return false;
-	}
-	return true;
-}
-
-void DrawSplit(const GPUDrawSplit& split, bool splitUsesOnlyWorldDepth = false)
+void DrawSplit(const GPUDrawSplit& split)
 {
 	if(split.debugText)
 		GR_PushDebugLabel(split.debugText);
@@ -901,7 +879,6 @@ void DrawSplit(const GPUDrawSplit& split, bool splitUsesOnlyWorldDepth = false)
 	GR_SetOffscreenState(&split.drawenv.clip, !drawOnScreen);
 
 	GR_SetBlendMode(split.blendMode);
-	GR_SetPolygonOffset(0.0f, 0.0f);
 
 	const bool depthRequested = g_RequestedDepthMode != 0;
 	const bool depthWrite = split.blendMode == BM_NONE;
@@ -924,31 +901,16 @@ void DrawSplit(const GPUDrawSplit& split, bool splitUsesOnlyWorldDepth = false)
 	{
 		const GrVertex* triangle = &g_vertexBuffer[vertexIndex];
 		const bool usesDepth =
-			splitUsesOnlyWorldDepth ||
 			GR_UsesWorldDepth(triangle, depthRequested) != 0;
-		float averageDepth = 0.0f;
-		if(usesDepth)
-		{
-			averageDepth =
-				(triangle[0].z + triangle[1].z + triangle[2].z) / 3.0f;
-		}
-		// Transparent geometry consumes the completed opaque depth buffer. It
-		// must never clear that buffer before its test-only draw.
-		const bool clearDepth = depthWrite && usesDepth &&
-			averageDepth - g_lastPolygonDepth >= PGXP_DEPTH_CLEAR_THRESHOLD;
 
-		if(runVertices != 0 && (runUsesDepth != usesDepth || clearDepth))
+		if(runVertices != 0 && runUsesDepth != usesDepth)
 			flushRun();
-		if(clearDepth)
-			GR_ClearDepthBuffer();
 		if(runVertices == 0)
 		{
 			runStart = vertexIndex;
 			runUsesDepth = usesDepth;
 		}
 		runVertices += 3;
-		if(usesDepth)
-			g_lastPolygonDepth = averageDepth;
 	}
 	flushRun();
 
@@ -992,58 +954,18 @@ void DrawAllSplits()
 	}
 #endif // _DEBUG
 
+	// Empty ordering tables carry no drawable state. Avoid a zero-byte VBO
+	// orphan/upload for optional presentation passes.
+	if(g_vertexIndex == 0)
+	{
+		ClearSplits();
+		return;
+	}
 	// next code ideally should be called before EndScene
 	GR_UpdateVertexBuffer(g_vertexBuffer, g_vertexIndex);
 
-	if(g_RequestedDepthMode)
-	{
-		// Depth classification used to rescan every triangle each time the
-		// ordering loop tested the current split. Large world batches could be
-		// traversed two or three times before any draw was submitted, which is
-		// particularly expensive at 120/240 Hz. Classify each split exactly
-		// once and pass the result into DrawSplit so world-only runs also skip
-		// redundant per-triangle scr_h tests.
-		unsigned char worldDepthSplits[MAX_DRAW_SPLITS] = {};
-		for(int splitIndex = 1; splitIndex <= g_splitIndex; ++splitIndex)
-		{
-			worldDepthSplits[splitIndex] =
-				SplitUsesOnlyWorldDepth(g_splits[splitIndex]) ? 1 : 0;
-		}
-		// OT bins prepend packets. A transparent object submitted after its
-		// opaque receiver can therefore execute first when both quantize to the
-		// same bin, then be overwritten because transparent draws do not write Z.
-		// Populate opaque world depth before transparent world geometry, but
-		// never move either across a native screen-space/UI or mixed split. Those
-		// boundaries retain exact PS1 painter order.
-		for(int i = 1; i <= g_splitIndex;)
-		{
-			if(!worldDepthSplits[i])
-			{
-				DrawSplit(g_splits[i++]);
-				continue;
-			}
-
-			const int worldBegin = i;
-			while(i <= g_splitIndex && worldDepthSplits[i])
-				++i;
-
-			for(int splitIndex = worldBegin; splitIndex < i; ++splitIndex)
-			{
-				if(g_splits[splitIndex].blendMode == BM_NONE)
-					DrawSplit(g_splits[splitIndex], true);
-			}
-			for(int splitIndex = worldBegin; splitIndex < i; ++splitIndex)
-			{
-				if(g_splits[splitIndex].blendMode != BM_NONE)
-					DrawSplit(g_splits[splitIndex], true);
-			}
-		}
-	}
-	else
-	{
-		for(int i = 1; i <= g_splitIndex; i++)
-			DrawSplit(g_splits[i]);
-	}
+	for(int i = 1; i <= g_splitIndex; i++)
+		DrawSplit(g_splits[i]);
 
 	ClearSplits();
 }
@@ -1055,7 +977,6 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 {
 	if(!p)
 		return;
-	g_lastPolygonDepth = PGXP_MAX_DEPTH;
 
 	// setup single primitive flag (needed for AddSplits)
 	g_DrawPrimMode = singlePrimitive;

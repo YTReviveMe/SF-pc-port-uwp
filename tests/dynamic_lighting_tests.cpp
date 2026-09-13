@@ -1,4 +1,5 @@
 #include "sf/game/dynamic_lighting.hpp"
+#include "sf/platform/world_object_shadow_policy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -321,22 +322,58 @@ void testDynamicLightCompositionIgnoresSourceOrder() {
   require(sample(sources) == sample(reversed),
           "Dynamic lighting changed when source order was reversed");
 }
-void testBakedWorldRejectsPersistentRelighting() {
+void testBakedWorldRetainsConfirmedEmissiveLighting() {
   auto frame = sf::game::DynamicLightFrame{};
-  frame.count = 4U;
+  frame.count = 5U;
   frame.lights[0].kind = sf::game::DynamicLightKind::street_lamp;
   frame.lights[1].kind = sf::game::DynamicLightKind::muzzle_flash;
   frame.lights[1].transient = true;
   frame.lights[2].kind = sf::game::DynamicLightKind::flashlight;
   frame.lights[2].directional = true;
   frame.lights[3].kind = sf::game::DynamicLightKind::steady_fire;
+  frame.lights[4].kind = sf::game::DynamicLightKind::police_lightbar;
 
-  const auto baked = sf::game::dynamicLightFrameForBakedWorld(frame);
-  require(baked.count == 2U &&
+  const auto baked = sf::game::dynamicLightFrameForBakedWorld(
+      frame, sf::game::DynamicLightPoint{});
+  require(baked.count == frame.count &&
               baked.lights[0].kind ==
-                  sf::game::DynamicLightKind::muzzle_flash &&
-              baked.lights[1].kind == sf::game::DynamicLightKind::flashlight,
-          "Baked world accepted reconstructed persistent illumination");
+                  sf::game::DynamicLightKind::street_lamp &&
+              baked.lights[1].kind == sf::game::DynamicLightKind::muzzle_flash &&
+              baked.lights[2].kind == sf::game::DynamicLightKind::flashlight &&
+              baked.lights[3].kind == sf::game::DynamicLightKind::steady_fire &&
+              baked.lights[4].kind ==
+                  sf::game::DynamicLightKind::police_lightbar,
+          "Baked world discarded a confirmed local emissive source");
+}
+
+void testBakedWorldLightingIsBoundedAndPrioritized() {
+  auto frame = sf::game::DynamicLightFrame{};
+  constexpr auto persistent_count =
+      sf::game::maximum_baked_world_dynamic_lights + 4U;
+  for (std::size_t index = 0U; index < persistent_count; ++index) {
+    auto &light = frame.lights[frame.count++];
+    light.kind = sf::game::DynamicLightKind::street_lamp;
+    light.position = {100.0 + static_cast<double>(index) * 100.0, 0.0, 0.0};
+    light.source_id = static_cast<std::uint32_t>(index);
+  }
+  auto &transient = frame.lights[frame.count++];
+  transient.kind = sf::game::DynamicLightKind::explosion;
+  transient.position = {50000.0, 0.0, 0.0};
+  transient.source_id = 0xf00dU;
+  transient.transient = true;
+
+  const auto baked = sf::game::dynamicLightFrameForBakedWorld(
+      frame, sf::game::DynamicLightPoint{});
+  require(baked.count == sf::game::maximum_baked_world_dynamic_lights,
+          "Baked world light frame ignored its dedicated capacity");
+  require(std::ranges::any_of(baked.active(), [](const auto &light) {
+            return light.source_id == 0xf00dU && light.transient;
+          }),
+          "Baked world light cap discarded a transient explosion");
+  require(std::ranges::none_of(baked.active(), [](const auto &light) {
+            return light.source_id == persistent_count - 1U;
+          }),
+          "Baked world light cap retained a farther lamp over a nearer one");
 }
 
 void testSurfaceLightingRejectsBackFaces() {
@@ -352,6 +389,219 @@ void testSurfaceLightingRejectsBackFaces() {
   require(front.red > front.green && front.green > front.blue &&
               back.red == 0.0 && back.green == 0.0 && back.blue == 0.0,
           "Dynamic light leaked through the back of a surface");
+}
+
+void testFlamethrowerRibbonLightingIsBoundedAndSurfaceAware() {
+  std::array<sf::game::FlamethrowerLightSegment, 9U> segments{};
+  for (std::size_t index = 0U; index < segments.size(); ++index) {
+    const auto x = static_cast<double>(index) * 300.0;
+    segments[index] = {{x, -200.0, 0.0},
+                       {x + 100.0, -200.0, 0.0},
+                       static_cast<std::uint32_t>(0x60000000U | index)};
+  }
+  segments[2].second = segments[2].first;
+  segments[3].first.x = std::numeric_limits<double>::infinity();
+
+  const auto samples = sf::game::flamethrowerDynamicLightSamples(segments);
+  require(samples.count ==
+                  sf::game::maximum_flamethrower_dynamic_light_samples &&
+              samples.active().front().position ==
+                  sf::game::DynamicLightPoint{50.0, -200.0, 0.0} &&
+              samples.active().back().position ==
+                  sf::game::DynamicLightPoint{2450.0, -200.0, 0.0} &&
+              std::ranges::all_of(samples.active(), [](const auto &light) {
+                return light.effect_type ==
+                           sf::game::GameplayEffectType::burning_fire &&
+                       light.position_confirmed &&
+                       light.remaining_updates == 1U &&
+                       light.total_updates == 1U;
+              }),
+          "Flamethrower light samples left the retail ribbon or exceeded cap");
+
+  const auto frame = sf::game::buildDynamicLightFrame(
+      {}, samples.active().first(1U), sf::game::DynamicLightPoint{});
+  require(frame.count == 1U && frame.active().front().transient &&
+              frame.active().front().kind ==
+                  sf::game::DynamicLightKind::steady_fire,
+          "Flamethrower light lost transient steady-fire priority");
+  const auto front = sf::game::sampleDynamicLighting(
+      frame, {50.0, 0.0, 0.0}, {0.0, -1.0, 0.0});
+  const auto back = sf::game::sampleDynamicLighting(
+      frame, {50.0, 0.0, 0.0}, {0.0, 1.0, 0.0});
+  const auto outside =
+      sf::game::sampleDynamicLighting(frame, {50.0, 2000.0, 0.0});
+  require(front.red > front.green && front.green > front.blue &&
+              back.red == 0.0 && back.green == 0.0 && back.blue == 0.0 &&
+              outside.red == 0.0 && outside.green == 0.0 &&
+              outside.blue == 0.0,
+          "Flamethrower light ignored surface orientation or bounded range");
+}
+
+void testWorldObjectShadowCasterEligibilityFailsClosed() {
+  using sf::platform::selectWorldObjectShadowProjection;
+  using sf::platform::worldObjectShadowCasterEligible;
+  using sf::platform::WorldObjectShadowCasterFacts;
+
+  const auto valid = WorldObjectShadowCasterFacts{
+      {120.0, -40.0, 980.0}, 240.0, 36U, true, true, true, false, false};
+  require(!worldObjectShadowCasterEligible(WorldObjectShadowCasterFacts{}),
+          "Default map prop facts did not fail closed");
+  require(worldObjectShadowCasterEligible(valid),
+          "Opaque resident map prop was rejected as a dynamic shadow caster");
+
+  auto rejected = valid;
+  rejected.resident = false;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Non-resident map prop remained a dynamic shadow caster");
+  rejected = valid;
+  rejected.opaque_geometry = false;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Translucent/effect geometry cast a solid dynamic shadow");
+  rejected = valid;
+  rejected.authoritative_transform = false;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Map prop with a stale transform cast a dynamic shadow");
+  rejected = valid;
+  rejected.actor_shadow_owned = true;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Actor geometry was submitted to both dynamic shadow passes");
+  rejected = valid;
+  rejected.embedded_world_geometry = true;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Receiver chunk was also submitted as a separate prop caster");
+  rejected = valid;
+  rejected.triangle_count = 0U;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Empty map prop was accepted as a dynamic shadow caster");
+  rejected = valid;
+  rejected.bounding_radius = 0.0;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Degenerate map prop bounds were accepted for shadow casting");
+  rejected = valid;
+  rejected.bounding_radius = -1.0;
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Negative map prop bounds were accepted for shadow casting");
+  rejected = valid;
+  rejected.bounding_radius = std::numeric_limits<double>::infinity();
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Infinite map prop bounds were accepted for shadow casting");
+  rejected = valid;
+  rejected.bounding_radius = std::numeric_limits<double>::quiet_NaN();
+  require(!worldObjectShadowCasterEligible(rejected),
+          "NaN map prop bounds were accepted for shadow casting");
+  rejected = valid;
+  rejected.anchor.x = std::numeric_limits<double>::infinity();
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Non-finite map prop anchor entered the shadow pass");
+  rejected = valid;
+  rejected.anchor.y = std::numeric_limits<double>::quiet_NaN();
+  require(!worldObjectShadowCasterEligible(rejected),
+          "NaN map prop anchor entered the shadow pass");
+  rejected = valid;
+  rejected.anchor.z = -std::numeric_limits<double>::infinity();
+  require(!worldObjectShadowCasterEligible(rejected),
+          "Infinite map prop anchor entered the shadow pass");
+
+  const std::array sources{lamp(0x40U, valid.anchor.x)};
+  rejected = valid;
+  rejected.opaque_geometry = false;
+  const auto rejected_projection =
+      selectWorldObjectShadowProjection(sources, rejected, {0.0, 1.0, 0.0});
+  require(!rejected_projection.source_driven,
+          "Rejected translucent prop still selected a shadow light");
+}
+
+void testWorldObjectShadowSelectionUsesCasterAboveFrameCapacity() {
+  using sf::platform::selectWorldObjectShadowProjection;
+  using sf::platform::WorldObjectShadowCasterFacts;
+
+  constexpr auto source_count = sf::game::maximum_dynamic_lights + 8U;
+  std::array<sf::game::PersistentDynamicLightState, source_count> sources{};
+  for (std::size_t index = 0U; index < sf::game::maximum_dynamic_lights;
+       ++index) {
+    sources[index] = lamp(static_cast<std::uint32_t>(index),
+                          -20000.0 + static_cast<double>(index) * 10.0);
+  }
+  constexpr auto caster_anchor = sf::game::DynamicLightPoint{8000.0, 0.0, 0.0};
+  for (std::size_t index = sf::game::maximum_dynamic_lights;
+       index < sources.size(); ++index) {
+    sources[index] =
+        lamp(static_cast<std::uint32_t>(index),
+             caster_anchor.x - 280.0 +
+                 static_cast<double>(index - sf::game::maximum_dynamic_lights) *
+                     70.0);
+  }
+  const auto facts = WorldObjectShadowCasterFacts{
+      caster_anchor, 180.0, 24U, true, true, true, false, false};
+
+  // This control demonstrates why the generic camera-observed frame is not
+  // safe for object shadows once the resident source count exceeds capacity.
+  const auto far_camera_frame =
+      sf::game::buildDynamicLightFrame(sources, {}, {-20000.0, 0.0, 0.0});
+  const auto near_camera_frame =
+      sf::game::buildDynamicLightFrame(sources, {}, caster_anchor);
+  const auto far_camera_projection = sf::game::selectDynamicShadowProjection(
+      far_camera_frame, caster_anchor, {0.0, 1.0, 0.0});
+  const auto near_camera_projection = sf::game::selectDynamicShadowProjection(
+      near_camera_frame, caster_anchor, {0.0, 1.0, 0.0});
+  require(!far_camera_projection.source_driven &&
+              near_camera_projection.source_driven,
+          "Object-shadow capacity fixture did not exercise camera selection");
+
+  const auto per_caster =
+      selectWorldObjectShadowProjection(sources, facts, {0.0, 1.0, 0.0}, 37U);
+  std::ranges::reverse(sources);
+  const auto reordered =
+      selectWorldObjectShadowProjection(sources, facts, {0.0, 1.0, 0.0}, 37U);
+  constexpr auto epsilon = 0.0000001;
+  const auto same_projection = [&](const auto &left, const auto &right) {
+    return left.source_driven == right.source_driven &&
+           std::abs(left.ray_direction.x - right.ray_direction.x) < epsilon &&
+           std::abs(left.ray_direction.y - right.ray_direction.y) < epsilon &&
+           std::abs(left.ray_direction.z - right.ray_direction.z) < epsilon &&
+           std::abs(left.darkness - right.darkness) < epsilon;
+  };
+  require(per_caster.source_driven &&
+              same_projection(per_caster, near_camera_projection) &&
+              same_projection(per_caster, reordered),
+          "Map-object shadow selection followed the camera or source order");
+}
+
+void testWorldObjectShadowSelectionIsTranslationCovariant() {
+  using sf::platform::selectWorldObjectShadowProjection;
+  using sf::platform::WorldObjectShadowCasterFacts;
+
+  const std::array original_sources{lamp(0x41U, -260.0), lamp(0x42U, 430.0)};
+  constexpr auto translation =
+      sf::game::DynamicLightPoint{15000.0, -2300.0, 7000.0};
+  auto translated_sources = original_sources;
+  for (auto &source : translated_sources) {
+    source.position.x += translation.x;
+    source.position.y += translation.y;
+    source.position.z += translation.z;
+  }
+  constexpr auto anchor = sf::game::DynamicLightPoint{80.0, 0.0, 35.0};
+  const auto translated_anchor = sf::game::DynamicLightPoint{
+      anchor.x + translation.x, anchor.y + translation.y,
+      anchor.z + translation.z};
+  const auto facts = WorldObjectShadowCasterFacts{anchor, 160.0, 18U,   true,
+                                                  true,   true,  false, false};
+  const auto translated_facts = WorldObjectShadowCasterFacts{
+      translated_anchor, 160.0, 18U, true, true, true, false, false};
+  const auto original = selectWorldObjectShadowProjection(
+      original_sources, facts, {0.0, 1.0, 0.0});
+  const auto translated = selectWorldObjectShadowProjection(
+      translated_sources, translated_facts, {0.0, 1.0, 0.0});
+  constexpr auto epsilon = 0.0000001;
+  require(original.source_driven && translated.source_driven &&
+              std::abs(original.ray_direction.x - translated.ray_direction.x) <
+                  epsilon &&
+              std::abs(original.ray_direction.y - translated.ray_direction.y) <
+                  epsilon &&
+              std::abs(original.ray_direction.z - translated.ray_direction.z) <
+                  epsilon &&
+              std::abs(original.darkness - translated.darkness) < epsilon,
+          "Map-object shadow direction depended on world origin or camera");
 }
 
 void testActorShadowTracksEligibleDynamicLight() {
@@ -521,6 +771,93 @@ void testPersistentAnimationUsesGuestTime() {
           "Fire flicker is host-frame dependent or remains static");
 }
 
+void testAuthoredAppearanceSynchronizesPersistentAndTransientLight() {
+  auto authored_lamp = lamp(0xa11U, 0.0);
+  authored_lamp.appearance = {
+      sf::game::DynamicLightRgb{0.18, 0.72, 1.35}, 0.50, 1.50};
+  const std::array persistent{authored_lamp};
+  const std::array fallback_persistent{lamp(0xa11U, 0.0)};
+  const auto persistent_frame = sf::game::buildDynamicLightFrame(
+      persistent, {}, sf::game::DynamicLightPoint{});
+  const auto fallback_frame = sf::game::buildDynamicLightFrame(
+      fallback_persistent, {}, sf::game::DynamicLightPoint{});
+  require(persistent_frame.count == 1U &&
+              persistent_frame.active().front().color ==
+                  sf::game::DynamicLightRgb{0.18, 0.72, 1.35} &&
+              std::abs(persistent_frame.active().front().radius -
+                       fallback_frame.active().front().radius * 0.50) <
+                  0.000001 &&
+              std::abs(persistent_frame.active().front().intensity -
+                       fallback_frame.active().front().intensity * 1.50) <
+                  0.000001,
+          "Persistent light ignored its authored visual appearance");
+
+  auto authored_explosion = sf::game::TransientDynamicLightState{
+      sf::game::GameplayEffectType::explosion,
+      {10.0, 20.0, 30.0},
+      0xe11U,
+      1.0,
+      1U,
+      1U,
+      true,
+  };
+  authored_explosion.appearance = {
+      sf::game::DynamicLightRgb{0.35, 0.80, 0.22}, 1.75, 0.40};
+  auto fallback_explosion = authored_explosion;
+  fallback_explosion.appearance = {};
+  const std::array transient{authored_explosion};
+  const std::array fallback_transient{fallback_explosion};
+  const auto transient_frame = sf::game::buildDynamicLightFrame(
+      {}, transient, sf::game::DynamicLightPoint{});
+  const auto fallback_transient_frame = sf::game::buildDynamicLightFrame(
+      {}, fallback_transient, sf::game::DynamicLightPoint{});
+  require(transient_frame.count == 1U &&
+              transient_frame.active().front().color ==
+                  sf::game::DynamicLightRgb{0.35, 0.80, 0.22} &&
+              std::abs(transient_frame.active().front().radius -
+                       fallback_transient_frame.active().front().radius *
+                           1.75) < 0.000001 &&
+              std::abs(transient_frame.active().front().intensity -
+                       fallback_transient_frame.active().front().intensity *
+                           0.40) < 0.000001,
+          "Transient light diverged from its authored visual appearance");
+}
+
+void testMalformedAppearanceFallsBackToSafeProfile() {
+  require(sf::game::validDynamicLightAppearance({}),
+          "Neutral dynamic-light appearance was rejected");
+  const auto nan = std::numeric_limits<double>::quiet_NaN();
+  const std::array malformed{
+      sf::game::DynamicLightAppearance{
+          sf::game::DynamicLightRgb{nan, 0.5, 0.5}, 0.5, 1.5},
+      sf::game::DynamicLightAppearance{
+          sf::game::DynamicLightRgb{2.01, 0.5, 0.5}, 1.0, 1.0},
+      sf::game::DynamicLightAppearance{std::nullopt, 0.0, 1.0},
+      sf::game::DynamicLightAppearance{std::nullopt, 1.0,
+                                       std::numeric_limits<double>::infinity()},
+  };
+  require(std::ranges::none_of(malformed,
+                               sf::game::validDynamicLightAppearance),
+          "Malformed dynamic-light appearance passed validation");
+
+  const auto fallback = lamp(0xbadU, 0.0);
+  auto invalid = fallback;
+  invalid.appearance = malformed.front();
+  const std::array fallback_sources{fallback};
+  const std::array invalid_sources{invalid};
+  const auto fallback_frame = sf::game::buildDynamicLightFrame(
+      fallback_sources, {}, sf::game::DynamicLightPoint{});
+  const auto invalid_frame = sf::game::buildDynamicLightFrame(
+      invalid_sources, {}, sf::game::DynamicLightPoint{});
+  require(invalid_frame.count == 1U && fallback_frame.count == 1U &&
+              invalid_frame.active().front().color ==
+                  fallback_frame.active().front().color &&
+              invalid_frame.active().front().radius ==
+                  fallback_frame.active().front().radius &&
+              invalid_frame.active().front().intensity ==
+                  fallback_frame.active().front().intensity,
+          "Malformed appearance poisoned or removed a valid light source");
+}
 void testBoundedSelectionKeepsTransientAndNearestLamps() {
   std::array<sf::game::PersistentDynamicLightState,
              sf::game::maximum_dynamic_lights + 4U>
@@ -761,6 +1098,31 @@ void testRetailVertexLightDirectionAndMalformedRecordsFailClosed() {
           "Oversized retail light list escaped its fixed guest capacity");
 }
 
+void testPreparedRetailVertexLightMatchesExactPath() {
+  auto source = retailLight();
+  source.flags = 1U;
+  const auto prepared = sf::game::prepareRetailVertexLight(source);
+  require(prepared.has_value(), "Valid retail light was not prepared");
+  const std::array raw_lights{source};
+  const std::array prepared_lights{*prepared};
+  constexpr std::array points{
+      sf::game::DynamicLightPoint{10.0, 20.0, -226.0},
+      sf::game::DynamicLightPoint{42.0, 12.0, -98.0},
+      sf::game::DynamicLightPoint{-12.0, 48.0, 286.0},
+  };
+  for (const auto point : points) {
+    require(sf::game::applyRetailVertexLightingPacked(0x00204060U, raw_lights,
+                                                      point, 320) ==
+                sf::game::applyRetailVertexLightingPacked(
+                    0x00204060U, prepared_lights, point, 320),
+            "Prepared retail light changed exact projection output");
+  }
+
+  source.extent = 0;
+  require(!sf::game::prepareRetailVertexLight(source),
+          "Malformed retail light entered the prepared path");
+}
+
 void testRetailVertexLightRayUsesGuestMatrixAndAttachedAxis() {
   auto source = retailLight();
   source.flags = 1U;
@@ -853,14 +1215,21 @@ int main() {
     testOverlappingDynamicLightsGrowWithoutWhitening();
     testDynamicLightCompositionIgnoresSourceOrder();
     testSurfaceLightingRejectsBackFaces();
-    testBakedWorldRejectsPersistentRelighting();
+    testBakedWorldRetainsConfirmedEmissiveLighting();
+    testBakedWorldLightingIsBoundedAndPrioritized();
+    testWorldObjectShadowCasterEligibilityFailsClosed();
+    testWorldObjectShadowSelectionUsesCasterAboveFrameCapacity();
+    testWorldObjectShadowSelectionIsTranslationCovariant();
     testActorShadowTracksEligibleDynamicLight();
+    testFlamethrowerRibbonLightingIsBoundedAndSurfaceAware();
     testActorShadowRejectsLowLightAndMalformedPlane();
     testActorShadowBlendsSourcesAndBoundsStretch();
     testActorShadowIgnoresTransientAndAnimatedLightPulses();
     testActorShadowDarknessDoesNotScaleWithSourceCount();
     testActorShadowTemporalPolicyUsesGuestTime();
     testPersistentAnimationUsesGuestTime();
+    testAuthoredAppearanceSynchronizesPersistentAndTransientLight();
+    testMalformedAppearanceFallsBackToSafeProfile();
     testBoundedSelectionKeepsTransientAndNearestLamps();
     testBoundedSelectionKeepsDirectionalLight();
     testRetailGmdBackColorUsesNeutralTextureScale();
@@ -871,6 +1240,7 @@ int main() {
     testRetailVertexLightShiftSemanticsAreExact();
     testRetailVertexLightThresholdMaskAndSaturation();
     testRetailVertexLightDirectionAndMalformedRecordsFailClosed();
+    testPreparedRetailVertexLightMatchesExactPath();
     testRetailVertexLightRayUsesGuestMatrixAndAttachedAxis();
     testMissionFlashlightRecordLightsItsRetailForwardAxis();
     testCaveFlashlightUsesRetailWorldYAxis();

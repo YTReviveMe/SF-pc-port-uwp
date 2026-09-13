@@ -4,6 +4,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
     std::uint32_t maximum_unlocked_mission,
     std::unique_ptr<game::GameplaySession> preloaded_gameplay,
     std::unique_ptr<PsyCrossAudioOutput> preloaded_audio) {
+  struct ControllerRumbleStop final {
+    ~ControllerRumbleStop() { PsyX_Pad_StopRumble(0); }
+  } controller_rumble_stop;
+  PsyX_Pad_StopRumble(0);
+
   g_cfg_pgxpTextureCorrection = 1;
   g_cfg_pgxpZBuffer = 1;
   InitGeom();
@@ -11,7 +16,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
   SetGeomScreen(320);
 
   if (!preloaded_gameplay) {
-    preloaded_gameplay = std::make_unique<game::GameplaySession>(mission);
+    preloaded_gameplay = std::make_unique<game::GameplaySession>(
+        mission, difficulty_ == game::CampaignDifficulty::agent);
   }
   auto &gameplay = *preloaded_gameplay;
   // The retail terminal transition can retire the live mission/inventory
@@ -19,12 +25,17 @@ SceneViewerResult PsyCrossSceneViewer::run(
   // carry snapshot while those tables are still coherent so campaign flow
   // never depends on reading already-unloaded guest pointers.
   auto latest_campaign_carry = gameplay.campaignCarryState();
-  const auto apply_retail_cheats = [&] {
+  const auto apply_gameplay_modes = [&] {
+    const auto hard_mode = difficulty_ != game::CampaignDifficulty::original;
+    if (!gameplay.setRetailHardMode(hard_mode)) {
+      PsyX_Log_Error("Campaign difficulty hard-mode state failed\n");
+    }
+    const auto agent_mode = difficulty_ == game::CampaignDifficulty::agent;
+    if (!gameplay.setAgentDifficulty(agent_mode)) {
+      PsyX_Log_Error("Campaign Agent policy failed\n");
+    }
     if (cheats_.all_weapons && !gameplay.activateRetailAllWeaponsCheat()) {
       PsyX_Log_Error("Retail all-weapons cheat activation failed\n");
-    }
-    if (cheats_.hard_mode && !gameplay.setRetailHardMode(true)) {
-      PsyX_Log_Error("Retail hard-mode cheat activation failed\n");
     }
     if (cheats_.one_shot_kills && !gameplay.setRetailOneShotKills(true)) {
       PsyX_Log_Error("Retail one-shot cheat activation failed\n");
@@ -33,7 +44,19 @@ SceneViewerResult PsyCrossSceneViewer::run(
       PsyX_Log_Error("Retail weak-enemies cheat activation failed\n");
     }
   };
-  apply_retail_cheats();
+  const auto restart_checkpoint_with_retry_inventory = [&] {
+    const auto retry_inventory = latest_campaign_carry;
+    if (!gameplay.restartCheckpoint()) {
+      return false;
+    }
+    if (retry_inventory &&
+        !gameplay.applyRetryInventoryState(*retry_inventory)) {
+      return false;
+    }
+    latest_campaign_carry = gameplay.campaignCarryState();
+    return true;
+  };
+  apply_gameplay_modes();
   auto gameplay_audio = preloaded_audio
                             ? std::move(preloaded_audio)
                             : std::make_unique<PsyCrossAudioOutput>();
@@ -50,13 +73,18 @@ SceneViewerResult PsyCrossSceneViewer::run(
   CombatEffectTextureAtlas effect_textures{mission};
   PoliceLightbarAnimation police_lightbar_animation;
   RetailScrimAnimation retail_scrim_animation;
+  MissionSkybox mission_skybox{mission.definition().index,
+                               mission_skyboxes_};
   // TextureStreamer already uploaded VLF and the effect atlas occupies a
   // reserved page. Reconcile only bank-specific scene data here; invalidating
   // and restoring both atlases doubled the synchronous startup transfer.
   textures.ensure(gameplay);
-  const auto *world_filter = g_cfg_anisotropicFiltering ? "anisotropic"
-                             : g_cfg_bilinearFiltering  ? "bilinear"
-                                                        : "nearest";
+  const auto *world_filter =
+      g_cfg_anisotropicFiltering
+          ? (g_cfg_trilinearFiltering ? "anisotropic trilinear" : "anisotropic")
+      : g_cfg_trilinearFiltering ? "trilinear"
+      : g_cfg_bilinearFiltering  ? "bilinear"
+                                 : "nearest";
   PsyX_Log_Info("Renderer: stable PGXP geometry, perspective-correct textures, "
                 "%s world filtering, Z-buffer, no PS1 dither\n",
                 world_filter);
@@ -82,16 +110,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
   WorldPolygonLightingCache world_lighting_cache;
   LocalSceneLightingCache local_scene_lighting_cache;
 
-  WorldChunkAppearance world_chunk_appearance;
   WeaponEffectsScratch weapon_effects_scratch;
   HmdPoseScratch hmd_pose_scratch;
   std::vector<WorldCalloutAnchor> world_callout_scratch;
   GameplayHudScratch gameplay_hud_scratch;
   constexpr std::uint16_t pause_button = 0x08U;
-  constexpr std::uint16_t left_stick_button = 0x02U;
-  constexpr std::uint16_t right_stick_button = 0x04U;
-  constexpr std::uint16_t graphics_shortcut_buttons =
-      left_stick_button | right_stick_button;
   constexpr std::uint16_t cancel_button = 0x1000U | 0x2000U;
   constexpr std::uint16_t confirm_button = 0x4000U | 0x8000U;
   constexpr std::uint16_t left_button = 0x80U;
@@ -123,13 +146,13 @@ SceneViewerResult PsyCrossSceneViewer::run(
   bool binding_capture = false;
   bool pause_was_down = false;
   bool interact_was_down = false;
-  bool graphics_shortcut_was_down = false;
   int pause_analog_x = 0;
   int pause_analog_y = 0;
   double dpad_down_held_seconds = 0.0;
   double simulation_accumulator_seconds = 0.0;
   double audio_accumulator_seconds = 0.0;
   double presentation_delta_seconds = 0.0;
+  double volumetric_effect_time_seconds = 0.0;
   game::GameplayInput latched_gameplay_input{};
   sf::platform::PlayerLookLatch latched_player_look;
   sf::platform::PlayerLookDisplayIntegrator display_player_look;
@@ -143,17 +166,10 @@ SceneViewerResult PsyCrossSceneViewer::run(
     presentation_look_correction = {};
   };
   const auto latch_gameplay_input = [&](const game::GameplayInput &input) {
-    // Continuous controls use the newest sampled state. Edges and sampled
-    // impulses survive until the next 20 Hz retail step; look and wheel
-    // deltas are accumulated across every native presentation frame.
-    latched_gameplay_input.move = input.move;
-    latched_gameplay_input.turn = input.turn;
-    latched_gameplay_input.run = input.run;
-    latched_gameplay_input.aim = input.aim;
-    latched_gameplay_input.strafe = input.strafe;
-    latched_gameplay_input.aim_peek = input.aim_peek;
-    latched_gameplay_input.fire_held = input.fire_held;
-    latched_gameplay_input.target_lock_held = input.target_lock_held;
+    // Continuous controls, including held directional look, use the newest
+    // sampled state. Edges survive until the next 20 Hz retail step; relative
+    // mouse look and wheel impulses are accumulated through separate paths.
+    game::latchLatestPlayerInputState(latched_gameplay_input, input);
     latched_gameplay_input.next_weapon =
         latched_gameplay_input.next_weapon || input.next_weapon;
     latched_gameplay_input.previous_weapon =
@@ -189,6 +205,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
   };
   std::uint64_t actor_tick = 0U;
   std::uint64_t submitted_presentation_sequence = 0U;
+  std::uint64_t render_capture_serial = 0U;
   game::LegacyWeaponEffectPresentationQueue weapon_presentation_edges;
   game::GameplayMuzzleFlashPresentationQueue muzzle_flash_edges;
   game::LegacyScrimCopyPresentationQueue scrim_copy_edges;
@@ -196,9 +213,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
   game::LegacyDroppedItemPresentationCache dropped_item_presentation;
   glass_shatter.reset(gameplay);
   RenderPresentationSnapshot current_render_presentation;
-  captureRenderPresentation(gameplay, current_render_presentation);
+  captureRenderPresentation(gameplay, current_render_presentation,
+                            ++render_capture_serial);
   dropped_item_presentation.reconcile(
       current_render_presentation.guest_frame,
+      current_render_presentation.dropped_item_floor_owner_mask,
       current_render_presentation.dropped_items);
   auto current_weapon_switch_countdown = gameplay.hud().weaponSwitchFrames();
   auto previous_weapon_switch_countdown = current_weapon_switch_countdown;
@@ -210,9 +229,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
   auto native_aim_held = current_render_presentation.first_person_aim;
   const auto reset_render_presentation = [&] {
     dropped_item_presentation.reset();
-    captureRenderPresentation(gameplay, current_render_presentation);
+    captureRenderPresentation(gameplay, current_render_presentation,
+                              ++render_capture_serial);
     dropped_item_presentation.reconcile(
         current_render_presentation.guest_frame,
+        current_render_presentation.dropped_item_floor_owner_mask,
         current_render_presentation.dropped_items);
     previous_render_presentation = current_render_presentation;
     interpolated_render_presentation = current_render_presentation;
@@ -228,7 +249,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
     dynamic_light_scratch.reset();
     world_lighting_cache.reset();
 
-    world_chunk_appearance.reset();
     primitives.invalidateCapacityPlan();
     weapon_presentation_edges.observe(gameplay.legacyPresentationFrame());
     muzzle_flash_edges.observe(gameplay.effects());
@@ -244,34 +264,28 @@ SceneViewerResult PsyCrossSceneViewer::run(
           // remains smooth at the display refresh. Raw counts stay linear and
           // the lower gain preserves fine target selection without adding
           // refresh-dependent acceleration.
-          .look_deadzone = 0.10,
+          .look_deadzone = sf::platform::controller_camera_deadzone,
           .mouse_yaw_sensitivity =
               sf::platform::first_person_mouse_yaw_sensitivity,
           .mouse_pitch_sensitivity =
               sf::platform::first_person_mouse_pitch_sensitivity,
-          // One full stick sample is consumed once per 20 Hz retail tick.
-          // Earlier saturation makes large turns faster; the smaller
-          // deadzone retains smooth fine adjustment near the stick centre.
-          .controller_yaw_sensitivity = 176.0,
-          .controller_pitch_sensitivity = 160.0,
+          // Keep the post-deadzone stick normalized. firstPersonAimInput()
+          // converts that proportional sample to retail heading units once;
+          // pre-scaling here would clamp nearly every deflection to full rate.
+          .controller_yaw_sensitivity = 1.0,
+          .controller_pitch_sensitivity = 1.0,
       }};
   RelativeMouseCapture mouse_capture;
   auto &pause_settings = pause_settings_;
-  pause_settings.graphics = {
-      .render_width = graphics_.render_width > 0 ? graphics_.render_width
-                                                  : graphics_.width,
-      .render_height = graphics_.render_height > 0 ? graphics_.render_height
-                                                    : graphics_.height,
-      .msaa_samples = graphics_.msaa_samples,
-      .bilinear_filtering = graphics_.bilinear_filtering,
-      .anisotropic_filtering = graphics_.anisotropic_filtering,
-      .aspect_ratio = graphics_.aspect_ratio == AspectRatioMode::adaptive
-                          ? game::PauseAspectRatio::adaptive
-                          : game::PauseAspectRatio::original_4_3,
-      .vsync = graphics_.vsync,
-      .frame_limit = graphics_.frame_limit,
-  };
   if (!pause_settings_initialized_) {
+    game::applyControllerPreset(pause_settings,
+                                game::ControllerPreset::standard);
+    const auto default_controller_bindings = ControllerButtonBindings{};
+    pause_settings.bindings = controller_bindings_;
+    pause_settings.vibration = controller_vibration_;
+    if (controller_bindings_.buttons != default_controller_bindings.buttons) {
+      pause_settings.controller_preset = game::ControllerPreset::custom;
+    }
     if (const auto volumes = gameplay.audioVolumes()) {
       pause_settings.sound_effects_volume = volumes->sound_effects;
       pause_settings.music_volume = volumes->music;
@@ -279,6 +293,61 @@ SceneViewerResult PsyCrossSceneViewer::run(
     }
     pause_settings_initialized_ = true;
   }
+  auto active_prompt_bindings = keyboardMouseInputPromptBindings(input_);
+  auto previous_controller_buttons = std::uint16_t{0xffffU};
+  auto previous_controller_analog =
+      std::array<unsigned char, 4U>{128U, 128U, 128U, 128U};
+  auto previous_controller_instance = -1;
+  auto previous_mouse_buttons = std::uint32_t{};
+  KeyboardMouseActionSnapshot previous_bound_actions;
+  auto delivered_pad_motor_sequence = gameplay.legacyPadMotorState().sequence;
+  auto controller_rumble_lease_active = false;
+  auto controller_rumble_failure_reported = false;
+  const auto stop_controller_rumble = [&] {
+    PsyX_Pad_StopRumble(0);
+    controller_rumble_lease_active = false;
+    delivered_pad_motor_sequence = gameplay.legacyPadMotorState().sequence;
+  };
+  const auto synchronize_controller_rumble = [&] {
+    constexpr unsigned int rumble_lease_milliseconds = 1000U;
+    const auto motors = gameplay.legacyPadMotorState();
+    if (!pause_settings.vibration || paused) {
+      if (controller_rumble_lease_active ||
+          motors.sequence != delivered_pad_motor_sequence) {
+        PsyX_Pad_StopRumble(0);
+      }
+      controller_rumble_lease_active = false;
+      delivered_pad_motor_sequence = motors.sequence;
+      return;
+    }
+    const auto new_retail_command =
+        motors.sequence != delivered_pad_motor_sequence;
+    if (!new_retail_command && !controller_rumble_lease_active) {
+      return;
+    }
+    const auto low = static_cast<unsigned short>(
+        static_cast<unsigned short>(motors.large) * 257U);
+    const auto high =
+        static_cast<unsigned short>(motors.small != 0U ? 0xffffU : 0U);
+    if (low == 0U && high == 0U) {
+      PsyX_Pad_StopRumble(0);
+      controller_rumble_lease_active = false;
+    } else {
+      // Refresh the lease every retail update while output remains active.
+      // One second tolerates frame hitches without leaving a stuck motor.
+      if (PsyX_Pad_SetRumble(0, low, high, rumble_lease_milliseconds) == 0) {
+        if (!controller_rumble_failure_reported) {
+          PsyX_Log_Warning("Controller rejected gameplay vibration output\n");
+          controller_rumble_failure_reported = true;
+        }
+        controller_rumble_lease_active = false;
+        return;
+      }
+      controller_rumble_failure_reported = false;
+      controller_rumble_lease_active = true;
+    }
+    delivered_pad_motor_sequence = motors.sequence;
+  };
   ui_audio.setVolumePercent(pause_settings.sound_effects_volume);
   ui_audio.setVoiceVolumePercent(pause_settings.voice_volume);
   game::PauseMenu pause_menu;
@@ -289,9 +358,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
     switch (cheat) {
     case game::RetailCheat::all_weapons:
       accepted = gameplay.setRetailAllWeaponsCheat(enabled);
-      break;
-    case game::RetailCheat::hard_mode:
-      accepted = gameplay.setRetailHardMode(enabled);
       break;
     case game::RetailCheat::one_shot_kills:
       accepted = gameplay.setRetailOneShotKills(enabled);
@@ -314,33 +380,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
     return accepted;
   };
   const auto apply_pause_settings = [&](const game::PauseSettings &settings) {
-    graphics_.render_width = settings.graphics.render_width;
-    graphics_.render_height = settings.graphics.render_height;
-    graphics_.msaa_samples = settings.graphics.msaa_samples;
-    graphics_.bilinear_filtering = settings.graphics.bilinear_filtering;
-    graphics_.anisotropic_filtering = settings.graphics.anisotropic_filtering;
-    graphics_.aspect_ratio =
-        settings.graphics.aspect_ratio == game::PauseAspectRatio::adaptive
-            ? AspectRatioMode::adaptive
-            : AspectRatioMode::original_4_3;
-    graphics_.vsync = settings.graphics.vsync;
-    graphics_.frame_limit = settings.graphics.frame_limit;
-    // PsyCross checks these values while it builds each presentation frame.
-    // In particular its native framebuffer is recreated whenever the MSAA
-    // sample count changes, so Xbox can apply this page without a dashboard
-    // restart or a second graphics launcher.
-    g_cfg_renderWidth = std::max(graphics_.render_width, 1);
-    g_cfg_renderHeight = std::max(graphics_.render_height, 1);
-    g_cfg_msaaSamples = graphics_.msaa_samples;
-    g_cfg_bilinearFiltering = graphics_.bilinear_filtering ? 1 : 0;
-    g_cfg_anisotropicFiltering = graphics_.anisotropic_filtering ? 1 : 0;
-    g_cfg_aspectMode = graphics_.aspect_ratio == AspectRatioMode::adaptive
-                           ? PSYX_ASPECT_ADAPTIVE
-                           : PSYX_ASPECT_ORIGINAL_4_3;
-    g_cfg_swapInterval = graphics_.vsync ? 1 : 0;
-    PsyX_EnableSwapInterval(graphics_.vsync ? 1 : 0);
-    PsyX_SetSwapInterval(1);
-    PsyX_SetFrameLimit(static_cast<int>(graphics_.frame_limit));
     SetGeomOffset(screen_width / 2 + settings.screen_center_x,
                   screen_height / 2 + settings.screen_center_y);
     auto configuration = player_input.configuration();
@@ -354,6 +393,10 @@ SceneViewerResult PsyCrossSceneViewer::run(
       PsyX_Log_Error("Cannot apply retail gameplay audio volumes\n");
       return false;
     }
+    if (!gameplay.setVibrationEnabled(settings.vibration)) {
+      PsyX_Log_Error("Cannot apply retail gameplay vibration mode\n");
+      return false;
+    }
     // MENU.OVL mutes the mission SPU/XA mix, but its BEEPSX bank remains
     // audible.  The UI source is independent from gameplay_audio for exactly
     // this reason.
@@ -361,50 +404,24 @@ SceneViewerResult PsyCrossSceneViewer::run(
     ui_audio.setVoiceVolumePercent(settings.voice_volume);
     return true;
   };
-#if defined(SF_XBOX_UWP)
-  const auto save_xbox_graphics_settings = [this]() noexcept {
-    try {
-      const auto *local_folder =
-          SDL_WinRTGetFSPathUTF8(SDL_WINRT_PATH_LOCAL_FOLDER);
-      if (local_folder == nullptr || local_folder[0] == '\0') {
-        return;
-      }
-      std::ofstream file{std::filesystem::path{local_folder} /
-                         "graphics-settings.ini",
-                         std::ios::out | std::ios::trunc};
-      if (!file) {
-        return;
-      }
-      file << "MSAA=" << graphics_.msaa_samples << '\n'
-           << "RenderWidth=" << graphics_.render_width << '\n'
-           << "RenderHeight=" << graphics_.render_height << '\n'
-           << "Bilinear=" << (graphics_.bilinear_filtering ? 1 : 0) << '\n'
-           << "Anisotropic=" << (graphics_.anisotropic_filtering ? 1 : 0)
-           << '\n'
-           << "Aspect="
-           << (graphics_.aspect_ratio == AspectRatioMode::adaptive ? 1 : 0)
-           << '\n'
-           << "VSync=" << (graphics_.vsync ? 1 : 0) << '\n'
-           << "FrameLimit=" << graphics_.frame_limit << '\n';
-    } catch (...) {
-      // A graphics preference must never compromise a running mission.
+  const auto commit_controller_settings = [&] {
+    const auto &bindings = pause_settings.bindings;
+    if (!game::areControllerBindingsValid(bindings)) {
+      PsyX_Log_Warning("Rejected invalid committed controller bindings\n");
+      return;
     }
-  };
-#else
-  const auto save_xbox_graphics_settings = []() noexcept {};
-#endif
-  const auto is_graphics_preview = [](std::uint32_t subject) noexcept {
-    switch (static_cast<game::PauseSetting>(subject)) {
-    case game::PauseSetting::graphics_render_resolution:
-    case game::PauseSetting::graphics_msaa:
-    case game::PauseSetting::graphics_bilinear_filtering:
-    case game::PauseSetting::graphics_anisotropic_filtering:
-    case game::PauseSetting::graphics_aspect_ratio:
-    case game::PauseSetting::graphics_vsync:
-    case game::PauseSetting::graphics_frame_limit:
-      return true;
-    default:
-      return false;
+    if (bindings == controller_bindings_ &&
+        pause_settings.vibration == controller_vibration_) {
+      return;
+    }
+    controller_bindings_ = bindings;
+    controller_vibration_ = pause_settings.vibration;
+    if (!controller_settings_commit_) {
+      return;
+    }
+    if (!controller_settings_commit_(bindings, controller_vibration_)) {
+      PsyX_Log_Warning(
+          "Cannot persist controller settings to launcher settings\n");
     }
   };
   if (!apply_pause_settings(pause_settings)) {
@@ -418,7 +435,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
       scrim_copy_edges.observe(gameplay.legacyPresentationFrame());
     }
     textures.invalidate();
-    textures.ensure(gameplay);
+    // Rebuild against the exact first frame that will be submitted.  Using
+    // an empty transient set here and adding retained effects in draw() made
+    // optional lookahead admission change between restore and presentation.
+    textures.ensure(gameplay, weapon_presentation_edges.sprites(),
+                    glass_shatter.shards());
     effect_textures.restore();
     hud_textures.invalidate();
     police_lightbar_animation.invalidate();
@@ -427,7 +448,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
           gameplay, current_render_presentation.scrim, textures);
     }
   };
-  const auto performance_frequency = SDL_GetPerformanceFrequency();
   const auto draw_gameplay_frame = [&](unsigned int effect_updates) {
     glass_shatter.observe(gameplay, current_render_presentation);
     // Resource selectors are published atomically by the 20 Hz guest. Do not
@@ -462,6 +482,18 @@ SceneViewerResult PsyCrossSceneViewer::run(
         presentation.environment.nightvision_clear_override_enabled = false;
       }
     }
+    // SVD night vision is enabled by the camera's retail 0x10 flag. CAVE2
+    // does not keep the unrelated atmospheric screen-filter descriptor live,
+    // so synthesize only the missing post-composition TILE. Average blending
+    // preserves the level's authored fog, lighting and distance gradient.
+    if (native_aim_held && presentation.first_person_aim &&
+        presentation.optic_mode == 3U &&
+        presentation.environment.nightvision_enabled &&
+        !presentation.environment.screen_filter_enabled) {
+      presentation.environment.screen_filter_enabled = true;
+      presentation.environment.screen_filter_material = 0U;
+      presentation.environment.screen_filter_color = {0U, 112U, 0U};
+    }
     // Keep the authoritative optic camera until the guest publishes its chase
     // cut, but retire all scope HUD immediately on the native release edge.
     const auto presented_first_person_aim =
@@ -478,12 +510,22 @@ SceneViewerResult PsyCrossSceneViewer::run(
                                  ? first_person_near_clip_depth
                                  : near_clip_depth;
     const auto &camera = presentation.camera;
+    mission_skybox.applyBoundaryAtmosphere(presentation.environment);
     applyRetailEnvironment(presentation.environment, camera.projection,
                            presentation.retail_environment_active);
     SetGeomScreen(camera.projection);
     worldCalloutAnchors(gameplay, actor_animations, actor_tick,
                         presentation.objects, hmd_pose_scratch,
                         world_callout_scratch);
+    if (gameplay.agentHeadshotThreatActive()) {
+      if (const auto head = playerHeadshotCalloutAnchor(
+              gameplay, actor_animations, gameplay.playerAnimationTick(),
+              presentation, hmd_pose_scratch)) {
+        world_callout_scratch.push_back(
+            WorldCalloutAnchor{*head, std::numeric_limits<std::uint16_t>::max(),
+                               "Head Shot", false});
+      }
+    }
     const auto target_anchor = [&]() -> std::optional<Vector3> {
       if (const auto target = gameplay.aimTarget()) {
         const auto existing = std::ranges::find_if(
@@ -498,18 +540,41 @@ SceneViewerResult PsyCrossSceneViewer::run(
       return aimTargetAnchor(gameplay, actor_animations, actor_tick,
                              presentation.objects, hmd_pose_scratch);
     }();
+    const auto mission_keycard_pickup_active = std::ranges::any_of(
+        gameplay.activeObjects(), [&](const auto object_index) {
+          if (object_index >= gameplay.objects().size()) {
+            return false;
+          }
+          const auto *displayed_model =
+              gameplay.displayedObjectModel(object_index);
+          return displayed_model != nullptr &&
+                 retailKeycardPickupObject(gameplay.objects()[object_index],
+                                           displayed_model->name);
+        });
     auto view = makeViewMatrix(camera);
     registerPreciseViewMatrix(view, camera);
     // Retail pickups and flying grenade billboards use interface art but are
     // inserted into the world OT. Their TIMs must already be resident when
     // that OT executes; a late HUD upload would lose scene depth ordering.
     hud_textures.restoreGameplay(gameplay.hud(), presented_first_person_aim,
+                                 mission_keycard_pickup_active,
                                  presentation.dropped_items,
                                  presentation.projectiles);
-    world_chunk_appearance.advance(gameplay.presentationModels(),
-                                   presentation_delta_seconds);
+    const auto volumes_requested = g_cfg_volumetricEffects != 0;
+    static_cast<void>(GR_BeginVolumetricFrame(
+        presentation.retail_virus_scanner_overlay || !volumes_requested ? 0
+                                                                       : 1));
+    const auto native_skybox_active =
+        presentation.retail_environment_active && mission_skybox.ready();
+    const auto render_retail_scrim =
+        presentation.scrim.visible &&
+        !(native_skybox_active && mission_skybox.replacesRetailScrim());
+    // This is the exact connected prefix whose cumulative texture selectors
+    // were admitted and uploaded by ensure() above. It still enters the one
+    // original linked-list world OT; lookahead never gets a separate pass.
+    const auto world_render_models = textures.worldRenderModels(gameplay);
     const auto stats = renderWorld(
-        gameplay, textures, hud_textures, fire_animation,
+        gameplay, world_render_models, textures, hud_textures, fire_animation,
         textures.firePlacement(), effect_textures, actor_animations, actor_tick,
         gameplay.playerAnimationTick(), weapon_presentation_edges.events(),
         weapon_presentation_edges.muzzleFlashes(), muzzle_flash_edges.flashes(),
@@ -518,60 +583,92 @@ SceneViewerResult PsyCrossSceneViewer::run(
         weapon_presentation_edges.sprites(),
         weapon_presentation_edges.rawPackets(), glass_shatter.shards(),
         interpolation_amount, previous_render_presentation,
-        current_render_presentation, presentation, view, ordering_table,
-        optic_trail_ordering_table, optic_subject_ordering_table,
-        shadow_ordering_table, scrim_ordering_table,
-        scanner_xray_ordering_table, guest_overlay_ordering_table,
+        current_render_presentation, presentation, view,
+        ordering_table, optic_trail_ordering_table,
+        optic_subject_ordering_table, shadow_ordering_table,
+        scrim_ordering_table, scanner_xray_ordering_table,
+        guest_overlay_ordering_table,
         fire_ordering_table, optic_history, actor_shadow_cache,
         dynamic_light_scratch, world_lighting_cache, local_scene_lighting_cache,
-        world_chunk_appearance, weapon_effects_scratch, hmd_pose_scratch,
-        primitives, log_next_frame);
+        weapon_effects_scratch, hmd_pose_scratch, primitives,
+        render_retail_scrim, log_next_frame);
     if (effect_updates != 0U) {
       fire_animation.update();
       glass_shatter.advance(effect_updates);
       ++actor_tick;
     }
-    // SCRIM is an unconditional background. Draw it first without reading or
-    // writing depth; the opaque world then starts against the pristine frame
-    // depth and overwrites the sky wherever real scene geometry exists.
+    if (native_skybox_active) {
+      // DrawOTag opens the PsyCross frame and clears its background colour.
+      // Open it first so the lazy clear cannot erase the native panorama.
+      static_cast<void>(PsyX_BeginScene());
+
+      const auto horizon =
+          presentation.environment.fogEnabled()
+              ? presentation.environment.fog_color
+              : presentation.environment.clear_color;
+      mission_skybox.draw(camera, horizon.red, horizon.green, horizon.blue);
+    }
+    // A loaded native dome replaces the authored flat SCRIM where configured.
+    // If its replacement asset fails, the retail backdrop remains the fallback.
     GR_SetBlendMode(BM_NONE);
-    GR_EnableDepth(0);
-    GR_SetDepthState(0, 0);
-    DrawOTag(reinterpret_cast<u_long *>(&scrim_ordering_table.back()));
+    if (render_retail_scrim) {
+      GR_EnableDepth(0);
+      GR_SetDepthState(0, 0);
+      DrawOTag(reinterpret_cast<u_long *>(&scrim_ordering_table.back()));
+    }
     GR_EnableDepth(1);
     GR_SetDepthState(1, 1);
     DrawOTag(reinterpret_cast<u_long *>(&ordering_table.back()));
+    GR_SetDepthState(1, 1);
+    GR_SetBlendMode(BM_NONE);
     // Retail SVD replays three opaque projected packet snapshots at -8 depth
     // steps. They read world depth without writing it; the live lime subject
     // then owns depth and cleanly covers the overlapping newest echo.
     GR_SetBlendMode(BM_NONE);
-    GR_SetDepthState(1, 0);
-    DrawOTag(reinterpret_cast<u_long *>(&optic_trail_ordering_table.back()));
+    const auto svd_active =
+        presentation.first_person_aim && presentation.optic_mode == 3U;
+    if (svd_active && primitives.optic_trails.size() != 0U) {
+      GR_SetDepthState(1, 0);
+      DrawOTag(reinterpret_cast<u_long *>(&optic_trail_ordering_table.back()));
+    }
     GR_SetDepthState(1, 1);
-    DrawOTag(reinterpret_cast<u_long *>(&optic_subject_ordering_table.back()));
+    if (svd_active && primitives.optic_subjects.size() != 0U) {
+      DrawOTag(
+          reinterpret_cast<u_long *>(&optic_subject_ordering_table.back()));
+    }
     GR_SetBlendMode(BM_NONE);
     // Posed silhouettes are projected onto exact gameplay receiver surfaces.
-    // First union their model triangles into a dedicated stencil bit, then
-    // shade that union once. This preserves limbs and equipment detail without
-    // exposing overlapping internal geometry through darker patches.
-    GR_SetBlendMode(BM_SUBTRACT);
-    GR_SetDepthState(1, 0);
-    GR_SetPolygonOffset(0.0F, -1.0F);
-    // Semi-transparent untextured PSX primitives inherit ABR from the active
-    // texture page. Pin ABR=2 here; otherwise the final world texture chosen
-    // by camera/OT order can turn subtractive shadows additive and white.
-    DR_TPAGE shadow_blend_page{};
-    SetDrawTPage(&shadow_blend_page, 1, 0, GetTPage(0, 2, 0, 0));
-    DrawPrim(&shadow_blend_page);
-    GR_BeginShadowMask();
-    DrawOTag(reinterpret_cast<u_long *>(&shadow_ordering_table.back()));
-    GR_BeginShadowShade();
-    DrawPrim(&shadow_blend_page);
-    DrawOTag(reinterpret_cast<u_long *>(&shadow_ordering_table.back()));
-    GR_EndShadowMask();
-    GR_SetPolygonOffset(0.0F, 0.0F);
-    GR_SetDepthState(1, 1);
-    GR_SetBlendMode(BM_NONE);
+    // Stencil admits only the first visible fragment at a receiver pixel, so
+    // overlapping limbs shade once without replaying the complete shadow OT.
+    if (primitives.actor_shadows.size() != 0U) {
+      GR_SetBlendMode(BM_SUBTRACT);
+      GR_SetDepthState(1, 0);
+      GR_SetPolygonOffset(0.0F, -1.0F);
+      // Semi-transparent untextured PSX primitives inherit ABR from the active
+      // texture page. Pin ABR=2 here; otherwise the final world texture chosen
+      // by camera/OT order can turn subtractive shadows additive and white.
+      DR_TPAGE shadow_blend_page{};
+      SetDrawTPage(&shadow_blend_page, 1, 0, GetTPage(0, 2, 0, 0));
+      DrawPrim(&shadow_blend_page);
+      GR_BeginShadowMask();
+      DrawOTag(reinterpret_cast<u_long *>(&shadow_ordering_table.back()));
+      GR_EndShadowMask();
+      GR_SetPolygonOffset(0.0F, 0.0F);
+      GR_SetDepthState(1, 1);
+      GR_SetBlendMode(BM_NONE);
+    }
+    // Object-local shadow maps read the final opaque depth, after the SVD and
+    // actor silhouettes have retained MSAA coverage. Resolving here switches
+    // only the following alpha/effect passes to the single-sample target.
+    if (!primitives.object_shadow_vertices.empty() &&
+        !primitives.object_shadow_casters.empty()) {
+      GR_DrawObjectShadows(
+          primitives.object_shadow_vertices.data(),
+          static_cast<int>(primitives.object_shadow_vertices.size()),
+          primitives.object_shadow_casters.data(),
+          static_cast<int>(primitives.object_shadow_casters.size()),
+          presentation.camera.projection, screen_width, screen_height);
+    }
     // Opaque geometry owns PGXP-Z. Fire blends additively against that
     // depth without writing it, so walls occlude particles and lightbars.
     GR_SetBlendMode(BM_ADD);
@@ -582,16 +679,23 @@ SceneViewerResult PsyCrossSceneViewer::run(
     GR_SetPolygonOffset(0.0F, 0.0F);
     GR_SetDepthState(1, 1);
     GR_SetBlendMode(BM_NONE);
+    GR_DrawVolumetricEffects(
+        primitives.volumetric_effects.data(),
+        static_cast<int>(primitives.volumetric_effects.size()),
+        presentation.camera.projection, screen_width, screen_height,
+        static_cast<float>(volumetric_effect_time_seconds));
     drawVirusScannerFilter(presentation.first_person_aim &&
                            presentation.optic_mode == 4U);
     // Static EMD/GMD scanner material stays in the ordinary depth-sorted OT.
     // This late depth-free table is reserved only for a script-hidden
     // GRGLO/GDF fallback marker during a room/visibility handoff.
-    GR_SetBlendMode(BM_AVERAGE);
-    GR_EnableDepth(0);
-    GR_SetDepthState(0, 0);
-    DrawOTag(reinterpret_cast<u_long *>(&scanner_xray_ordering_table.back()));
-    GR_SetBlendMode(BM_NONE);
+    if (presentation.retail_virus_scanner_overlay) {
+      GR_SetBlendMode(BM_AVERAGE);
+      GR_EnableDepth(0);
+      GR_SetDepthState(0, 0);
+      DrawOTag(reinterpret_cast<u_long *>(&scanner_xray_ordering_table.back()));
+      GR_SetBlendMode(BM_NONE);
+    }
     static_cast<void>(retail_scrim_animation.commitFrame(
         gameplay, presentation.scrim, scrim_copy_edges.phases(),
         presentation.guest_frame, textures));
@@ -603,8 +707,13 @@ SceneViewerResult PsyCrossSceneViewer::run(
     // Reserved framebuffer pages are transient. Restore the font, current
     // weapon and complete weapon-specific optic immediately before sampling.
     hud_textures.restoreGameplay(gameplay.hud(), presented_first_person_aim,
+                                 mission_keycard_pickup_active,
                                  presentation.dropped_items,
                                  presentation.projectiles);
+    // Resolve the complete 3D scene, then run morphological AA before any
+    // projected guest overlays or native HUD are submitted. This keeps text,
+    // optic markings and letterbox edges pixel-sharp.
+    GR_ApplySceneSMAA();
     // Remaining non-world packets are already projected presentation. Draw
     // them only after restoring HUD VRAM so the retail SCP-bearing sprites
     // sample their authored TIMs, then let the native HUD add the optic rings.
@@ -623,6 +732,13 @@ SceneViewerResult PsyCrossSceneViewer::run(
                              presentation.retail_environment_active);
     }
     drawGameBrightness(pause_settings.brightness);
+    const auto map_fade = gameplay.mapFade();
+    if (gameplay.missionFailed()) {
+      // Retail failure FONT/TEXT is composited over its authored scene fade.
+      // Drawing this TILE after the HUD hid the final type-on glyphs even
+      // though the guest animation and sound completed normally.
+      drawMapFade(map_fade);
+    }
     // Retail owns two independent transitions on the same script edge. Bars
     // follow the live 240 <-> 160 viewport RECT; the normal HUD follows its
     // own -1..13 FUN_800410d0 phase. XA is audio only and never gates either.
@@ -637,30 +753,156 @@ SceneViewerResult PsyCrossSceneViewer::run(
     const auto retail_bars = game::legacyRetailViewportBars(
         presentation.presentation_viewport_y,
         presentation.presentation_viewport_height);
+    const auto sniper_scope_letterbox =
+        retailSniperScopeLetterboxActive(presented_first_person_aim,
+                                         presentation.optic_mode);
+    const auto gameplay_hud_visibility =
+        retailRifleScopeGameplayHudVisibility(
+            presented_first_person_aim, presentation.interface_mode,
+            presentation.optic_mode, hud_visibility);
     constexpr double retail_screen_height = 240.0;
-    const auto top_bar_height =
+    const auto authored_top_bar_height =
         retail_ui_available
             ? static_cast<int>(std::lround(retail_bars.top * screen_height /
                                            retail_screen_height))
             : (gameplay.letterboxActive() ? 40 : 0);
-    const auto bottom_bar_height =
+    const auto authored_bottom_bar_height =
         retail_ui_available
             ? static_cast<int>(std::lround(retail_bars.bottom * screen_height /
                                            retail_screen_height))
-            : top_bar_height;
+            : authored_top_bar_height;
+    const auto sniper_scope_bar_height =
+        sniper_scope_letterbox
+            ? static_cast<int>(std::lround(retail_sniper_scope_bar_height *
+                                           screen_height / retail_screen_height))
+            : 0;
+    const auto top_bar_height =
+        std::max(authored_top_bar_height, sniper_scope_bar_height);
+    const auto bottom_bar_height =
+        std::max(authored_bottom_bar_height, sniper_scope_bar_height);
     constexpr double hidden_hud_threshold = 0.001;
     const auto hud_fully_hidden = hud_visibility <= hidden_hud_threshold;
     const auto gameplay_hud_active = game::legacyGameplayHudPresentationActive(
-        gameplay.missionComplete(), hud_fully_hidden);
-    if (gameplay_hud_active ||
-        (!gameplay.missionComplete() && presented_first_person_aim)) {
+        gameplay.missionComplete(), hud_fully_hidden, gameplay.missionFailed());
+    const auto target_lock_overlay_active = gameplay.targetLocked();
+    const auto legacy_frame = gameplay.legacyPresentationFrame();
+    const auto raw_target_lock_active =
+        legacy_frame && legacy_frame->renderer &&
+        legacy_frame->renderer->state.target_lock_active;
+    const auto ui_target_lock_active =
+        legacy_frame && legacy_frame->ui && legacy_frame->ui->target.active;
+    const auto target_lock_input_held = gameplay.targetLockInputHeld();
+    const auto *retail_target_ui =
+        legacy_frame && legacy_frame->ui ? &legacy_frame->ui->target : nullptr;
+    const auto retail_player_slot = retail_target_ui != nullptr
+                                        ? retail_target_ui->guest_slot
+                                        : std::int16_t{-1};
+    const auto retail_target_slot = retail_target_ui != nullptr
+                                        ? retail_target_ui->target_slot
+                                        : std::int16_t{-1};
+    const auto *retail_renderer = legacy_frame && legacy_frame->renderer
+                                      ? &legacy_frame->renderer->state
+                                      : nullptr;
+    const auto *retail_player =
+        retail_renderer != nullptr && retail_player_slot >= 0 &&
+                static_cast<std::size_t>(retail_player_slot) <
+                    retail_renderer->objects.size()
+            ? &retail_renderer
+                   ->objects[static_cast<std::size_t>(retail_player_slot)]
+            : nullptr;
+    const auto pad_target_lock_held =
+        retail_renderer != nullptr &&
+        (retail_renderer->pad.buttons & 0x0008U) != 0U;
+    const auto player_target_controller_ready =
+        retail_player != nullptr && retail_player->target_controller != 0U;
+    const auto player_has_target =
+        retail_player != nullptr && retail_player->has_target;
+    const auto retail_target_health =
+        retail_renderer != nullptr && retail_target_slot >= 0 &&
+                static_cast<std::size_t>(retail_target_slot) <
+                    retail_renderer->objects.size()
+            ? retail_renderer
+                  ->objects[static_cast<std::size_t>(retail_target_slot)]
+                  .health
+            : std::int16_t{};
+    const auto target_slot = gameplay.targetLockGuestSlot().value_or(-1);
+    const auto mapped_target = gameplay.aimTarget().has_value();
+    const auto anchor_available = target_anchor.has_value();
+    static auto target_lock_diag_initialized = false;
+    static auto previous_raw_target_lock_active = false;
+    static auto previous_ui_target_lock_active = false;
+    static auto previous_target_lock_overlay_active = false;
+    static auto previous_target_lock_input_held = false;
+    static auto previous_pad_target_lock_held = false;
+    static auto previous_retail_target_slot = std::int16_t{-1};
+    static auto previous_player_target_controller_ready = false;
+    static auto previous_player_has_target = false;
+    static auto previous_retail_target_health = std::int16_t{};
+    static auto previous_target_slot = std::int16_t{-1};
+    static auto previous_mapped_target = false;
+    static auto previous_anchor_available = false;
+    const auto target_lock_diag_changed =
+        !target_lock_diag_initialized ||
+        raw_target_lock_active != previous_raw_target_lock_active ||
+        ui_target_lock_active != previous_ui_target_lock_active ||
+        target_lock_overlay_active != previous_target_lock_overlay_active ||
+        target_lock_input_held != previous_target_lock_input_held ||
+        pad_target_lock_held != previous_pad_target_lock_held ||
+        retail_target_slot != previous_retail_target_slot ||
+        player_target_controller_ready !=
+            previous_player_target_controller_ready ||
+        player_has_target != previous_player_has_target ||
+        retail_target_health != previous_retail_target_health ||
+        target_slot != previous_target_slot ||
+        mapped_target != previous_mapped_target ||
+        anchor_available != previous_anchor_available;
+    if (target_lock_diag_changed &&
+        (raw_target_lock_active || ui_target_lock_active ||
+         target_lock_overlay_active || target_lock_input_held ||
+         pad_target_lock_held || previous_raw_target_lock_active ||
+         previous_ui_target_lock_active ||
+         previous_target_lock_overlay_active ||
+         previous_target_lock_input_held || previous_pad_target_lock_held)) {
+      PsyX_Log_Info(
+          "[TargetLockDiag] input=%d pad=%d raw=%d ui=%d overlay=%d "
+          "controller=%d has_target=%d retail_slot=%d health=%d slot=%d "
+          "mapped=%d anchor=%d hud=%.3f\n",
+          target_lock_input_held ? 1 : 0, pad_target_lock_held ? 1 : 0,
+          raw_target_lock_active ? 1 : 0, ui_target_lock_active ? 1 : 0,
+          target_lock_overlay_active ? 1 : 0,
+          player_target_controller_ready ? 1 : 0, player_has_target ? 1 : 0,
+          static_cast<int>(retail_target_slot),
+          static_cast<int>(retail_target_health), static_cast<int>(target_slot),
+          mapped_target ? 1 : 0, anchor_available ? 1 : 0, hud_visibility);
+    }
+    target_lock_diag_initialized = true;
+    previous_raw_target_lock_active = raw_target_lock_active;
+    previous_ui_target_lock_active = ui_target_lock_active;
+    previous_target_lock_overlay_active = target_lock_overlay_active;
+    previous_target_lock_input_held = target_lock_input_held;
+    previous_pad_target_lock_held = pad_target_lock_held;
+    previous_retail_target_slot = retail_target_slot;
+    previous_player_target_controller_ready = player_target_controller_ready;
+    previous_player_has_target = player_has_target;
+    previous_retail_target_health = retail_target_health;
+    previous_target_slot = target_slot;
+    previous_mapped_target = mapped_target;
+    previous_anchor_available = anchor_available;
+    const auto gameplay_ui_submission =
+        game::classifyLegacyGameplayUiSubmission(
+            gameplay_hud_active,
+            !gameplay.missionComplete() && presented_first_person_aim,
+            target_lock_overlay_active,
+            !gameplay.legacyUiMessages().empty());
+    if (gameplay_ui_submission.gameplay_hud) {
       drawGameplayHud(
           hud_textures, gameplay, camera, target_anchor, world_callout_scratch,
-          input_, presented_first_person_aim, aim_heading,
+          presented_first_person_aim, aim_heading,
           presented_weapon_switch_frames, presentation_delta_seconds,
           pause_settings.screen_center_x, pause_settings.screen_center_y,
-          hud_visibility, normal_hud_phase, gameplay_hud_scratch);
-      if (hud_visibility > 0.5) {
+          gameplay_hud_visibility, normal_hud_phase, difficulty_,
+          gameplay_hud_scratch);
+      if (gameplay_hud_visibility > 0.5) {
         drawRetailGrenadeTrajectory(presentation,
                                     pause_settings.screen_center_x,
                                     pause_settings.screen_center_y);
@@ -692,6 +934,28 @@ SceneViewerResult PsyCrossSceneViewer::run(
       const auto bar_right = static_cast<int>(
           std::ceil((static_cast<double>(screen_width) + visible_width) * 0.5));
       const auto bar_width = std::max(bar_right - bar_left, screen_width);
+      if (sniper_scope_letterbox) {
+        // Preserve the complete retail 320x160 aperture. In adaptive Hor+
+        // presentation the logical canvas is wider, so compensate for the
+        // final horizontal scale before masking its left and right edges.
+        const auto aperture_width =
+            static_cast<double>(retail_sniper_scope_aperture_width) /
+            horizontal_scale;
+        const auto aperture_left = static_cast<int>(std::floor(
+            (static_cast<double>(screen_width) - aperture_width) * 0.5));
+        const auto aperture_right = static_cast<int>(std::ceil(
+            (static_cast<double>(screen_width) + aperture_width) * 0.5));
+        const auto left_bar_width = std::max(aperture_left - bar_left, 0);
+        const auto right_bar_width = std::max(bar_right - aperture_right, 0);
+        if (left_bar_width > 0) {
+          drawSolidRect(bar_left, 0, left_bar_width, screen_height, 0U, 0U,
+                        0U);
+        }
+        if (right_bar_width > 0) {
+          drawSolidRect(aperture_right, 0, right_bar_width, screen_height, 0U,
+                        0U, 0U);
+        }
+      }
       if (top_bar_height > 0) {
         drawSolidRect(bar_left, 0, bar_width, top_bar_height, 0U, 0U, 0U);
       }
@@ -703,17 +967,28 @@ SceneViewerResult PsyCrossSceneViewer::run(
       GR_EnableDepth(1);
       GR_SetDepthState(1, 1);
     }
+    if (gameplay_ui_submission.information) {
+      // FONT/TEXT has its own guest type-on/fade lifetime. Composite it after
+      // the viewport bars so a failure/death message cannot be suppressed or
+      // inherit either the normal-HUD phase or letterbox animation.
+      drawGameplayInformationLayer(
+          hud_textures, gameplay, active_prompt_bindings,
+          presented_first_person_aim, pause_settings.screen_center_x,
+          pause_settings.screen_center_y, difficulty_, gameplay_hud_scratch);
+    }
     // Failure presentation belongs to retail FONT/TEXT and fade state.  The
     // guest publishes the same type-on glyph packets for player death and
     // scripted contract violations, then starts its authored 0xc8-tick fade.
     // A native full-screen black overlay used to cover those packets as soon
     // as the failure latch rose, turning objective/parameter failures into an
     // abrupt black frame.  Keep only the native success handoff overlay; the
-    // common failure path has already been drawn by drawGameplayHud above.
+    // common failure path has already been drawn by the information layer.
     if (gameplay.missionComplete()) {
       drawMissionCompleteOverlay(hud_textures);
     }
-    drawMapFade(gameplay.mapFade());
+    if (!gameplay.missionFailed()) {
+      drawMapFade(map_fade);
+    }
     return stats;
   };
   static_cast<void>(
@@ -774,6 +1049,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
   const auto end_presented_frame = [&] {
     PsyX_EndScene();
   };
+  const auto performance_frequency = SDL_GetPerformanceFrequency();
   auto previous_frame_counter = SDL_GetPerformanceCounter();
   const auto periodic_audio_diagnostics = psyCrossAudioDiagnosticsEnabled();
   auto next_audio_diagnostic_counter =
@@ -847,6 +1123,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
     const auto elapsed_seconds =
         std::clamp(raw_elapsed_seconds, 0.0, maximum_frame_time_seconds);
     presentation_delta_seconds = elapsed_seconds;
+    volumetric_effect_time_seconds += elapsed_seconds;
     audio_accumulator_seconds =
         std::min(audio_accumulator_seconds + elapsed_seconds,
                  retail_audio_step_seconds * maximum_audio_backlog_updates);
@@ -865,25 +1142,31 @@ SceneViewerResult PsyCrossSceneViewer::run(
     const auto pressed =
         settling_input ? std::uint16_t{}
                        : static_cast<std::uint16_t>(held & previous_buttons);
+    PsyXControllerSnapshot controller_snapshot{};
+    static_cast<void>(PsyX_Pad_GetControllerSnapshot(0, &controller_snapshot));
+    auto controller_buttons = std::uint16_t{0xffffU};
+    // PsyCross copies the current physical snapshot to PADRAW before merging
+    // keyboard buttons. Keep the proven gameplay-axis adapter on that buffer;
+    // the snapshot remains authoritative for device identity and labels.
+    const auto controller_analog = std::array<unsigned char, 4U>{
+        pad.analog[0], pad.analog[1], pad.analog[2], pad.analog[3]};
+    if (controller_snapshot.connected != 0U) {
+      controller_buttons = static_cast<std::uint16_t>(
+          static_cast<std::uint16_t>(controller_snapshot.buttons[0]) |
+          (static_cast<std::uint16_t>(controller_snapshot.buttons[1]) << 8U));
+    }
+    const auto controller_identity_changed =
+        controller_snapshot.connected != 0U &&
+        controller_snapshot.instanceId != previous_controller_instance;
+    const auto controller_held =
+        static_cast<std::uint16_t>(~controller_buttons);
+    const auto controller_pressed =
+        settling_input || controller_identity_changed
+            ? std::uint16_t{}
+            : static_cast<std::uint16_t>(controller_held &
+                                         previous_controller_buttons);
     int keyboard_count{};
     const auto *keyboard = SDL_GetKeyboardState(&keyboard_count);
-    const auto keyboard_pad_mask =
-        keyboardOriginPadMask(keyboard, keyboard_count, g_cfg_keyboardMapping);
-    const auto controller_held = static_cast<std::uint16_t>(
-        held & static_cast<std::uint16_t>(~keyboard_pad_mask));
-    const auto controller_pressed = static_cast<std::uint16_t>(
-        pressed & static_cast<std::uint16_t>(~keyboard_pad_mask));
-#if defined(SF_XBOX_UWP)
-    const auto graphics_shortcut_down =
-        (controller_held & graphics_shortcut_buttons) ==
-        graphics_shortcut_buttons;
-    const auto graphics_shortcut_pressed =
-        input_settle_seconds <= 0.0 && graphics_shortcut_down &&
-        !graphics_shortcut_was_down;
-    graphics_shortcut_was_down = graphics_shortcut_down;
-#else
-    constexpr auto graphics_shortcut_pressed = false;
-#endif
     const auto mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
     const auto mouse_wheel_delta = consumePsyCrossMouseWheel();
     const auto keyboard_state =
@@ -916,8 +1199,13 @@ SceneViewerResult PsyCrossSceneViewer::run(
     interact_was_down = interact_down;
     const auto controller_movement =
         static_cast<std::uint16_t>(controller_held & movement_buttons);
-    const auto analog_x = static_cast<int>(pad.analog[2]) - 128;
-    const auto analog_y = static_cast<int>(pad.analog[3]) - 128;
+    const auto controller_sticks = game::controllerStickAxes(
+        pause_settings.bindings.stick_layout, controller_analog[2],
+        controller_analog[3], controller_analog[0], controller_analog[1]);
+    const auto analog_x =
+        static_cast<int>(controller_sticks.character_horizontal) - 128;
+    const auto analog_y =
+        static_cast<int>(controller_sticks.character_vertical) - 128;
     const auto analog_forward = analog_y < -analog_deadzone;
     const auto analog_backward = analog_y > analog_deadzone;
     const auto analog_left = analog_x < -analog_deadzone;
@@ -930,6 +1218,39 @@ SceneViewerResult PsyCrossSceneViewer::run(
         mouse_capture.enabled() ? static_cast<double>(mouse_delta_x) : 0.0;
     raw_player_input.pc.mouse_delta_y =
         mouse_capture.enabled() ? static_cast<double>(mouse_delta_y) : 0.0;
+
+    const auto controller_analog_activity = [&] {
+      for (std::size_t index = 0U; index < controller_analog.size(); ++index) {
+        const auto current = static_cast<int>(controller_analog[index]);
+        const auto previous =
+            static_cast<int>(previous_controller_analog[index]);
+        if (std::abs(current - 128) > analog_deadzone &&
+            std::abs(current - previous) >= 4) {
+          return true;
+        }
+      }
+      return false;
+    }();
+    auto pc_action_edge = false;
+    for (std::size_t index = 0U; index < bound_actions.held.size(); ++index) {
+      pc_action_edge = pc_action_edge || (bound_actions.held[index] &&
+                                          !previous_bound_actions.held[index]);
+    }
+    const auto pc_input_activity = pc_action_edge || mouse_wheel_delta != 0 ||
+                                   mouse_delta_x != 0 || mouse_delta_y != 0 ||
+                                   (static_cast<std::uint32_t>(mouse_buttons) &
+                                    ~previous_mouse_buttons) != 0U;
+    const auto controller_input_activity =
+        controller_pressed != 0U || controller_analog_activity;
+    if (controller_snapshot.connected == 0U) {
+      active_prompt_bindings = keyboardMouseInputPromptBindings(input_);
+    } else if (pc_input_activity) {
+      active_prompt_bindings = keyboardMouseInputPromptBindings(input_);
+    } else if (controller_input_activity || controller_identity_changed ||
+               active_prompt_bindings.device == InputPromptDevice::controller) {
+      active_prompt_bindings =
+          controllerPromptBindings(controller_snapshot, pause_settings);
+    }
 
     // PADRAW merges PsyCross keyboard mappings with the physical controller.
     // Menus intentionally use that raw state, while gameplay keeps the PC and
@@ -955,10 +1276,10 @@ SceneViewerResult PsyCrossSceneViewer::run(
                                              : analog_move;
     raw_player_input.controller.left_x =
         digital_left != digital_right ? digital_left ? -1.0 : 1.0 : analog_turn;
-    raw_player_input.controller.right_x =
-        normalizedAnalogAxis(static_cast<int>(pad.analog[0]) - 128, 0);
-    raw_player_input.controller.right_y =
-        -normalizedAnalogAxis(static_cast<int>(pad.analog[1]) - 128, 0);
+    raw_player_input.controller.right_x = normalizedAnalogAxis(
+        static_cast<int>(controller_sticks.camera_horizontal) - 128, 0);
+    raw_player_input.controller.right_y = -normalizedAnalogAxis(
+        static_cast<int>(controller_sticks.camera_vertical) - 128, 0);
     const auto action_button =
         [&pause_settings](game::ControllerAction action) {
           return static_cast<std::uint16_t>(
@@ -1017,9 +1338,17 @@ SceneViewerResult PsyCrossSceneViewer::run(
         raw_player_input.pc.turn_right || raw_player_input.pc.strafe_left ||
         raw_player_input.pc.strafe_right;
     previous_buttons = buttons;
+    previous_controller_buttons = controller_buttons;
+    previous_controller_analog = controller_analog;
+    previous_controller_instance = controller_snapshot.connected != 0U
+                                       ? controller_snapshot.instanceId
+                                       : -1;
+    previous_mouse_buttons = static_cast<std::uint32_t>(mouse_buttons);
+    previous_bound_actions = bound_actions;
     input_settle_seconds =
         std::max(0.0, input_settle_seconds - elapsed_seconds);
-    const auto controller_pause_pressed = (pressed & pause_button) != 0;
+    const auto controller_pause_pressed =
+        (controller_pressed & pause_button) != 0;
     const auto pause_toggled = controller_pause_pressed || pause_pressed;
     const auto pause_direction = [](int value) {
       constexpr int pause_deadzone = 56;
@@ -1027,7 +1356,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
     };
     const auto current_pause_x = pause_direction(analog_x);
     const auto current_pause_y = pause_direction(analog_y);
-    if (!paused && (pause_toggled || graphics_shortcut_pressed)) {
+    if (!paused && pause_toggled) {
       if (!service_realtime_audio()) {
         PsyX_Log_Error("Realtime retail audio clock failed\n");
         return SceneViewerResult{previous_buttons,
@@ -1039,16 +1368,13 @@ SceneViewerResult PsyCrossSceneViewer::run(
       auto pause_data =
           game::makePauseMenuData(mission, gameplay, maximum_unlocked_mission);
       pause_data.cheats = cheats_;
-#if defined(SF_XBOX_UWP)
-      pause_data.graphics_settings_available = true;
-#endif
       pause_menu.reset(std::move(pause_data), pause_settings);
       if (cheats_.stage_select) {
         pause_menu.unlockMissionSelect();
       }
-      if (graphics_shortcut_pressed) {
-        static_cast<void>(pause_menu.openGraphicsSettings());
-      }
+      pause_menu.setControllerButtonLabels(
+          controllerButtonLabels(controller_snapshot));
+      stop_controller_rumble();
       paused = true;
       // Preserve the guest SPU/XA clock and queued PCM, but fade every host
       // output to silence while the ACD is open. Restoring the gain on exit
@@ -1060,12 +1386,17 @@ SceneViewerResult PsyCrossSceneViewer::run(
       pause_analog_y = current_pause_y;
       pause_animation_tick = 0U;
       static_cast<void>(drawPauseMenu(pause_menu, pause_textures, hud_textures,
-                                      pause_animation_tick++, input_));
+                                      pause_animation_tick++,
+                                      active_prompt_bindings));
       end_presented_frame();
       continue;
     }
 
     if (paused) {
+      if (controller_snapshot.connected != 0U) {
+        pause_menu.setControllerButtonLabels(
+            controllerButtonLabels(controller_snapshot));
+      }
       // Mission simulation stops in the ACD, while the 120 Hz SPU/CD stream
       // continues uninterrupted at its original sample rate.
       if (!service_realtime_audio()) {
@@ -1171,19 +1502,41 @@ SceneViewerResult PsyCrossSceneViewer::run(
       const auto previous_pause_page = pause_menu.page();
       const auto previous_pause_expanded = pause_menu.expanded();
       game::PauseMenuCommand command;
-      if (binding_capture && !pause_input.pause && !pause_input.cancel) {
-        const auto binding_button = static_cast<std::uint16_t>(
-            pressed & static_cast<std::uint16_t>(~pause_button));
-        if (binding_button != 0U) {
-          command = pause_menu.completeControllerBinding(binding_button);
+      auto binding_input_consumed = false;
+      auto binding_completed = false;
+      auto binding_cancelled = false;
+      if (binding_capture) {
+        binding_input_consumed = true;
+        if (controller_snapshot.connected == 0U) {
+          pause_menu.showControllerMissing();
           binding_capture = false;
+          binding_cancelled = true;
+        } else if (pause_pressed || controller_pause_pressed) {
+          pause_menu.cancelControllerBinding();
+          binding_capture = false;
+          binding_cancelled = true;
+        } else {
+          const auto binding_button = static_cast<std::uint16_t>(
+              controller_pressed & static_cast<std::uint16_t>(~pause_button));
+          if (game::isBindableControllerButton(binding_button)) {
+            command = pause_menu.completeControllerBinding(binding_button);
+            binding_capture = false;
+            binding_completed = static_cast<bool>(command);
+          }
         }
       }
-      if (!command) {
+      if (!command && !binding_input_consumed) {
         command = pause_menu.update(pause_input);
       }
-      if (pause_input.cancel || pause_input.pause) {
-        binding_capture = false;
+      if (command.type == game::PauseCommandType::begin_controller_binding) {
+        if (controller_snapshot.connected == 0U) {
+          pause_menu.showControllerMissing();
+          command = {};
+          binding_cancelled = true;
+        } else {
+          pause_menu.setControllerButtonLabels(
+              controllerButtonLabels(controller_snapshot));
+        }
       }
       const auto pause_changed =
           pause_menu.screen() != previous_pause_screen ||
@@ -1191,7 +1544,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
           pause_menu.page() != previous_pause_page ||
           pause_menu.expanded() != previous_pause_expanded ||
           static_cast<bool>(command);
-      if ((pause_input.cancel || pause_input.pause) && pause_changed) {
+      if (binding_completed) {
+        ui_audio.play(PsyCrossUiCue::confirm);
+      } else if (binding_cancelled) {
+        ui_audio.play(PsyCrossUiCue::cancel);
+      } else if ((pause_input.cancel || pause_input.pause) && pause_changed) {
         ui_audio.play(PsyCrossUiCue::cancel);
       } else if (pause_input.confirm && pause_changed) {
         ui_audio.play(PsyCrossUiCue::confirm);
@@ -1213,7 +1570,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
-        save_xbox_graphics_settings();
+        commit_controller_settings();
         player_input.synchronize(raw_player_input);
         clear_latched_gameplay_input();
         movement_armed = false;
@@ -1233,16 +1590,21 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
-        if (is_graphics_preview(command.subject)) {
-          save_xbox_graphics_settings();
-        }
         if (command.subject ==
             static_cast<std::uint32_t>(game::PauseSetting::vibration)) {
-          unsigned char motors[2]{
-              static_cast<unsigned char>(pause_settings.vibration ? 0x40U : 0U),
-              static_cast<unsigned char>(pause_settings.vibration ? 0x40U : 0U),
-          };
-          PadSetAct(0, motors, 2);
+          if (pause_settings.vibration) {
+            constexpr unsigned int preview_milliseconds = 180U;
+            constexpr unsigned short preview_strength = 0x6000U;
+            if (PsyX_Pad_SetRumble(0, preview_strength, preview_strength,
+                                   preview_milliseconds) == 0) {
+              PsyX_Log_Warning("Controller rejected vibration preview\n");
+              controller_rumble_failure_reported = true;
+            } else {
+              controller_rumble_failure_reported = false;
+            }
+          } else {
+            stop_controller_rumble();
+          }
         } else if (command.subject == static_cast<std::uint32_t>(
                                           game::PauseSetting::voice_volume)) {
           ui_audio.playVoicePreview();
@@ -1254,7 +1616,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
-        save_xbox_graphics_settings();
+        commit_controller_settings();
         break;
       case game::PauseCommandType::revert_settings:
         pause_settings = pause_menu.settings();
@@ -1262,10 +1624,12 @@ SceneViewerResult PsyCrossSceneViewer::run(
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
-        save_xbox_graphics_settings();
         break;
       case game::PauseCommandType::begin_controller_binding:
         binding_capture = true;
+        // The edge which opened capture cannot be rebound on the same frame;
+        // physical controller edges are sampled again on the next frame.
+        pause_input = {};
         break;
       case game::PauseCommandType::set_retail_cheat: {
         if (command.subject >= game::retail_cheat_count) {
@@ -1289,15 +1653,16 @@ SceneViewerResult PsyCrossSceneViewer::run(
       }
       case game::PauseCommandType::restart_checkpoint:
         pause_settings = pause_menu.settings();
-        if (!gameplay.restartCheckpoint()) {
+        if (!restart_checkpoint_with_retry_inventory()) {
           PsyX_Log_Error(
-              "Checkpoint restore rejected incoherent guest state\n");
+              "Checkpoint or retry inventory restore was rejected\n");
           return SceneViewerResult{previous_buttons,
                                    SceneExitReason::return_to_title};
         }
-        apply_retail_cheats();
+        apply_gameplay_modes();
         discard_gameplay_audio("pause-restart-checkpoint");
         ui_audio.reset();
+        stop_controller_rumble();
         paused = false;
         gameplay_audio->setGainPercent(100U);
         if (!apply_pause_settings(pause_settings)) {
@@ -1323,9 +1688,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
       case game::PauseCommandType::restart_mission:
         pause_settings = pause_menu.settings();
         gameplay.reset();
-        apply_retail_cheats();
+        latest_campaign_carry = gameplay.campaignCarryState();
+        apply_gameplay_modes();
         discard_gameplay_audio("pause-restart-mission");
         ui_audio.reset();
+        stop_controller_rumble();
         paused = false;
         gameplay_audio->setGainPercent(100U);
         if (!apply_pause_settings(pause_settings)) {
@@ -1363,7 +1730,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
       }
 
       static_cast<void>(drawPauseMenu(pause_menu, pause_textures, hud_textures,
-                                      pause_animation_tick++, input_));
+                                      pause_animation_tick++,
+                                      active_prompt_bindings));
       end_presented_frame();
       continue;
     }
@@ -1476,6 +1844,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
       std::swap(previous_render_presentation, current_render_presentation);
       previous_weapon_switch_countdown = current_weapon_switch_countdown;
       gameplay.update(simulation_input);
+      synchronize_controller_rumble();
       current_weapon_switch_countdown = gameplay.hud().weaponSwitchFrames();
       if (auto carry = gameplay.campaignCarryState()) {
         latest_campaign_carry = std::move(carry);
@@ -1483,9 +1852,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
       weapon_presentation_edges.observe(gameplay.legacyPresentationFrame());
       muzzle_flash_edges.observe(gameplay.effects());
       scrim_copy_edges.observe(gameplay.legacyPresentationFrame());
-      captureRenderPresentation(gameplay, current_render_presentation);
+      captureRenderPresentation(gameplay, current_render_presentation,
+                                ++render_capture_serial);
       dropped_item_presentation.reconcile(
           current_render_presentation.guest_frame,
+          current_render_presentation.dropped_item_floor_owner_mask,
           current_render_presentation.dropped_items);
       ++simulation_updates_this_frame;
       simulation_accumulator_seconds = std::max(
@@ -1517,13 +1888,34 @@ SceneViewerResult PsyCrossSceneViewer::run(
     // intentionally retired the old runtime, so another audio slice would be
     // misclassified as a fatal clock error and return to the title screen.
     if (gameplay.failureRestartRequested()) {
-      if (!gameplay.restartCheckpoint()) {
+      const auto terminal_presentation_sequence =
+          gameplay.legacyPresentationSequence();
+      if (gameplay.legacyRenderCommandsAuthoritative() &&
+          (terminal_presentation_sequence == 0U ||
+           terminal_presentation_sequence < submitted_presentation_sequence)) {
         PsyX_Log_Error(
-            "Failure restart rejected incoherent guest checkpoint\n");
+            "Guest renderer/UI command sequence is missing or regressed\n");
         return SceneViewerResult{previous_buttons,
                                  SceneExitReason::return_to_title};
       }
-      apply_retail_cheats();
+      if (game::legacyTerminalFailureFrameSubmissionRequired(
+              true, terminal_presentation_sequence,
+              submitted_presentation_sequence)) {
+        // State 2 has retired the VM/audio clock, but its immutable final
+        // FONT/TEXT + fade snapshot still owns one presentation. Submit it
+        // before replacing the timeline with the checkpoint.
+        static_cast<void>(draw_gameplay_frame(simulation_updates_this_frame));
+        submitted_presentation_sequence = terminal_presentation_sequence;
+        end_presented_frame();
+      }
+      if (!restart_checkpoint_with_retry_inventory()) {
+        PsyX_Log_Error(
+            "Failure checkpoint or retry inventory restore was rejected\n");
+        return SceneViewerResult{previous_buttons,
+                                 SceneExitReason::return_to_title};
+      }
+      stop_controller_rumble();
+      apply_gameplay_modes();
       discard_gameplay_audio("failure-restart-checkpoint");
       fire_animation = FireAnimation{gameplay};
       actor_tick = 0U;
@@ -1659,6 +2051,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
         return SceneViewerResult{previous_buttons,
                                  SceneExitReason::return_to_title};
       }
+      stop_controller_rumble();
       previous_buttons = movie_player.playStandalone(
           scripted_movies[*scripted_movie_index], pad, previous_buttons);
       previous_frame_counter = SDL_GetPerformanceCounter();

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <assert.h>
 #include <string.h>
 #include <vector>
@@ -220,7 +221,10 @@ int g_dbg_texturelessMode = 0;
 int g_cfg_pgxpTextureCorrection = 1;
 int g_cfg_pgxpZBuffer = 1;
 int g_cfg_bilinearFiltering = 0;
+int g_cfg_trilinearFiltering = 0;
 int g_cfg_anisotropicFiltering = 0;
+int g_cfg_smaa = 0;
+int g_cfg_volumetricEffects = 0;
 int g_cfg_msaaSamples = 0;
 int g_cfg_aspectMode = PSYX_ASPECT_ORIGINAL_4_3;
 
@@ -427,7 +431,6 @@ void PBO_Download(GrPBO *pbo) {
 GLuint g_glVertexArray[MAX_NUM_VERTEX_BUFFERS];
 GLuint g_glVertexBuffer[MAX_NUM_VERTEX_BUFFERS];
 int g_curVertexBuffer = 0;
-GLuint g_boundVertexArray = 0;
 
 GLuint g_glBlitFramebuffer;
 GrPBO g_glFramebufferPBO;
@@ -448,6 +451,15 @@ GLuint g_glNativeMultisampleDepthRenderbuffer;
 int g_nativeFramebufferWidth;
 int g_nativeFramebufferHeight;
 int g_nativeFramebufferSamples;
+static int g_nativeFramePostprocessed;
+static float g_reversedDepthScale = -1.0f;
+static float g_reversedDepthBias = 0.0f;
+namespace {
+void PsyX_DestroySkybox();
+void PsyX_DestroySMAA();
+void PsyX_DestroyVolumetrics();
+void PsyX_DestroyObjectShadows();
+}
 
 #if defined(RENDERER_OGL)
 static GLenum g_nativeDepthInternalFormat = GL_DEPTH32F_STENCIL8;
@@ -474,6 +486,8 @@ static void PsyX_AllocateNativeDepthTexture(GLenum internalFormat, int width,
 #endif
 
 static GLuint PsyX_GetNativeDrawFramebuffer() {
+  if (g_nativeFramePostprocessed)
+    return g_glNativeFramebuffer;
   return g_nativeFramebufferSamples > 1 ? g_glNativeMultisampleFramebuffer
                                         : g_glNativeFramebuffer;
 }
@@ -593,18 +607,21 @@ static int PsyX_EnsureNativeFramebuffer() {
   return 1;
 }
 
-static void PsyX_ResolveNativeFramebuffer() {
+static void PsyX_ResolveNativeFramebuffer(int preserveDepthStencil = 0) {
 #if USE_FRAMEBUFFER_BLIT
-  if (g_nativeFramebufferSamples <= 1)
+  if (g_nativeFramebufferSamples <= 1 || g_nativeFramePostprocessed)
     return;
 
   const int scissorEnabled = g_PreviousScissorState;
   glDisable(GL_SCISSOR_TEST);
   glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glNativeMultisampleFramebuffer);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glNativeFramebuffer);
+  GLbitfield mask = GL_COLOR_BUFFER_BIT;
+  if (preserveDepthStencil)
+    mask |= GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
   glBlitFramebuffer(0, 0, g_nativeFramebufferWidth, g_nativeFramebufferHeight,
                     0, 0, g_nativeFramebufferWidth, g_nativeFramebufferHeight,
-                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                    mask, GL_NEAREST);
   if (scissorEnabled)
     glEnable(GL_SCISSOR_TEST);
 #endif
@@ -806,6 +823,10 @@ int GR_InitialiseRender(char *windowName, int width, int height,
 
 void GR_Shutdown() {
 #if USE_OPENGL
+  PsyX_DestroySkybox();
+  PsyX_DestroySMAA();
+  PsyX_DestroyVolumetrics();
+  PsyX_DestroyObjectShadows();
   glDeleteVertexArrays(MAX_NUM_VERTEX_BUFFERS, g_glVertexArray);
   glDeleteBuffers(MAX_NUM_VERTEX_BUFFERS, g_glVertexBuffer);
 
@@ -851,6 +872,7 @@ void GR_BeginScene() {
   g_lastBoundTexture = 0;
 
 #if USE_OPENGL
+  g_nativeFramePostprocessed = 0;
   PsyX_EnsureNativeFramebuffer();
   // glClear obeys the depth write mask. The previous frame normally ends in
   // the depth-free HUD pass, so restore writes before clearing world depth.
@@ -894,7 +916,6 @@ void GR_EndScene() {
 
 #if USE_OPENGL
   glBindVertexArray(0);
-  g_boundVertexArray = 0;
 #endif
 }
 
@@ -1055,14 +1076,16 @@ GLint u_textureBlendModeLoc;
 
 #if defined(RENDERER_OGL) || (OGLES_VERSION == 3)
 
-#define GPU_DITHERING "	vec4 dither(vec4 color) { return color; }\n"
+#define GPU_DITHERING                                                       \
+  "	vec4 dither(vec4 color) { return color; }\n"
 
 #define GPU_ARRAY_FUNC                                                         \
   "	float _idx2(vec2 array, int idx) { return array[idx]; }\n"
 
 #else
 
-#define GPU_DITHERING "	vec4 dither(vec4 color) { return color; }\n"
+#define GPU_DITHERING                                                       \
+  "	vec4 dither(vec4 color) { return color; }\n"
 
 #define GPU_ARRAY_FUNC                                                         \
   "	float _idx2(vec2 array, int idx) { return idx == 0 ? array.x : "           \
@@ -1136,7 +1159,214 @@ GLint u_textureBlendModeLoc;
   "\t}\n"                                                                      \
   "\tvec4 anisotropicTextureSample(vec2 P, out float coverage) {\n"            \
   "\t\treturn edgeSafeBilinearTextureSample(P, coverage);\n"                   \
+  "\t}\n"                                                                      \
+  "\tvec4 trilinearTextureSample(vec2 P, out float coverage) {\n"              \
+  "\t\treturn edgeSafeBilinearTextureSample(P, coverage);\n"                   \
   "\t}\n"
+
+#endif
+
+#if defined(RENDERER_OGL) || (OGLES_VERSION == 3)
+
+// Indexed PS1 VRAM cannot use hardware-generated mipmaps: averaging palette
+// indices creates unrelated colours and a conventional atlas mip chain bleeds
+// adjacent tiles. Reconstruct two decoded, tile-clamped mip levels per sample
+// and blend them exactly like trilinear filtering.
+#undef GPU_MINIFICATION_FILTER
+#define GPU_MINIFICATION_FILTER R"PSYX(
+	vec4 edgeSafeBilinearTextureSample(vec2 P, out float coverage) {
+		return bilinearTextureSample(boundedPSX(P), coverage);
+	}
+
+	void accumulateDecodedColor(vec4 color, float texelCoverage, float weight,
+			inout vec4 premultiplied, inout float coverageSum,
+			inout float weightSum) {
+		float paletteAlpha = textureBlendMode == 0 ? 1.0 : color.a;
+		float alphaWeight = texelCoverage * paletteAlpha * weight;
+		premultiplied.rgb += color.rgb * alphaWeight;
+		premultiplied.a += alphaWeight;
+		coverageSum += texelCoverage * weight;
+		weightSum += weight;
+	}
+
+	vec4 resolveDecodedFilter(vec4 premultiplied, float coverageSum,
+			float weightSum, out float coverage) {
+		coverage = coverageSum / max(weightSum, 0.0001);
+		vec3 straightColor = premultiplied.rgb /
+			max(premultiplied.a, 0.0001);
+		float paletteAlpha = premultiplied.a /
+			max(coverageSum, 0.0001);
+		return vec4(straightColor, paletteAlpha);
+	}
+
+	vec4 decodedPointTextureSample(vec2 P, out float coverage) {
+		vec2 rg = samplePSX(floor(boundedPSX(P) + vec2(0.5)));
+		coverage = float(rg.r + rg.g > 0.0);
+		vec4 color = lut(rg);
+		color.w = 1.0 - color.w;
+		return color;
+	}
+
+	void accumulateDecodedPoint(vec2 P, float weight,
+			inout vec4 premultiplied, inout float coverageSum,
+			inout float weightSum) {
+		float tapCoverage;
+		vec4 tapColor = decodedPointTextureSample(P, tapCoverage);
+		accumulateDecodedColor(tapColor, tapCoverage, weight,
+			premultiplied, coverageSum, weightSum);
+	}
+
+	vec4 resolveTileFilter(vec4 premultiplied, float coverageSum,
+			float weightSum, out float coverage) {
+		return resolveDecodedFilter(premultiplied, coverageSum, weightSum,
+			coverage);
+	}
+
+	vec4 tileMipLevelTextureSample(vec2 P, float lod, out float coverage) {
+		if (lod < 0.001) {
+			return edgeSafeBilinearTextureSample(P, coverage);
+		}
+		float spread = exp2(lod) * 0.25;
+		vec4 premultiplied = vec4(0.0);
+		float coverageSum = 0.0;
+		float weightSum = 0.0;
+		// Keep the authored centre texel dominant. Sparse diagonal-only taps can
+		// otherwise turn a solid GMD texel into transparent/foreign atlas colour.
+		accumulateDecodedPoint(P, 4.0, premultiplied, coverageSum, weightSum);
+		accumulateDecodedPoint(P + vec2(-spread, -spread), 1.0,
+			premultiplied, coverageSum, weightSum);
+		accumulateDecodedPoint(P + vec2( spread, -spread), 1.0,
+			premultiplied, coverageSum, weightSum);
+		accumulateDecodedPoint(P + vec2(-spread,  spread), 1.0,
+			premultiplied, coverageSum, weightSum);
+		accumulateDecodedPoint(P + vec2( spread,  spread), 1.0,
+			premultiplied, coverageSum, weightSum);
+		return resolveTileFilter(premultiplied, coverageSum, weightSum,
+			coverage);
+	}
+
+	vec4 trilinearTextureSampleAtLod(vec2 P, float lod,
+			out float coverage) {
+		float lowLod = floor(lod);
+		float highLod = min(lowLod + 1.0, 4.0);
+		float lowCoverage;
+		float highCoverage;
+		vec4 lowColor = tileMipLevelTextureSample(P, lowLod, lowCoverage);
+		vec4 highColor = tileMipLevelTextureSample(P, highLod, highCoverage);
+		float blend = fract(lod);
+		vec4 premultiplied = vec4(0.0);
+		float coverageSum = 0.0;
+		float weightSum = 0.0;
+		accumulateDecodedColor(lowColor, lowCoverage, 1.0 - blend,
+			premultiplied, coverageSum, weightSum);
+		accumulateDecodedColor(highColor, highCoverage, blend,
+			premultiplied, coverageSum, weightSum);
+		return resolveTileFilter(premultiplied, coverageSum, weightSum, coverage);
+	}
+
+	vec4 trilinearTextureSample(vec2 P, out float coverage) {
+		vec2 axisX = dFdx(P);
+		vec2 axisY = dFdy(P);
+		float footprint = max(length(axisX), length(axisY));
+		float lod = clamp(log2(max(footprint, 1.0)), 0.0, 4.0);
+		return trilinearTextureSampleAtLod(P, lod, coverage);
+	}
+
+	vec4 legacyAnisotropicTextureSample(vec2 P, out float coverage) {
+		vec2 boundedP = boundedPSX(P);
+		float centerCoverage;
+		vec4 centerColor = bilinearTextureSample(boundedP, centerCoverage);
+		vec2 axisX = dFdx(P);
+		vec2 axisY = dFdy(P);
+		float covarianceA = axisX.x * axisX.x + axisY.x * axisY.x;
+		float covarianceB = axisX.x * axisX.y + axisY.x * axisY.y;
+		float covarianceC = axisX.y * axisX.y + axisY.y * axisY.y;
+		float discriminant = sqrt(max((covarianceA - covarianceC) *
+			(covarianceA - covarianceC) + 4.0 * covarianceB * covarianceB,
+			0.0));
+		float majorSquared = max(0.5 * (covarianceA + covarianceC +
+			discriminant), 0.0);
+		float majorLength = sqrt(majorSquared);
+		float filterBlend = smoothstep(0.75, 1.25, majorLength);
+		if (filterBlend <= 0.0) {
+			coverage = centerCoverage;
+			return centerColor;
+		}
+		float footprintScale = min(1.0, 16.0 / max(majorLength, 0.0001));
+		vec2 footprintX = axisX * footprintScale;
+		vec2 footprintY = axisY * footprintScale;
+		vec4 areaPremultiplied = vec4(0.0);
+		float areaCoverageSum = 0.0;
+		float areaWeightSum = 0.0;
+		for (int tap = 0; tap < 16; ++tap) {
+			float index = float(tap);
+			float offsetX = (index + 0.5) * (1.0 / 16.0) - 0.5;
+			float offsetY = mod(index, 2.0) * 0.5 +
+				mod(floor(index * 0.5), 2.0) * 0.25 +
+				mod(floor(index * 0.25), 2.0) * 0.125 +
+				mod(floor(index * 0.125), 2.0) * 0.0625 +
+				(1.0 / 32.0) - 0.5;
+			vec2 offset = vec2(offsetX, offsetY);
+			float weight = exp2(-4.0 * dot(offset, offset));
+			float tapCoverage;
+			vec4 tapColor = bilinearTextureSample(
+				boundedPSX(P + footprintX * offset.x +
+					footprintY * offset.y), tapCoverage);
+			accumulateDecodedColor(tapColor, tapCoverage, weight,
+				areaPremultiplied, areaCoverageSum, areaWeightSum);
+		}
+		float filteredCoverage;
+		vec4 filteredColor = resolveTileFilter(areaPremultiplied,
+			areaCoverageSum, areaWeightSum, filteredCoverage);
+		vec4 premultiplied = vec4(0.0);
+		float coverageSum = 0.0;
+		float weightSum = 0.0;
+		accumulateDecodedColor(centerColor, centerCoverage, 1.0 - filterBlend,
+			premultiplied, coverageSum, weightSum);
+		accumulateDecodedColor(filteredColor, filteredCoverage, filterBlend,
+			premultiplied, coverageSum, weightSum);
+		return resolveTileFilter(premultiplied, coverageSum, weightSum, coverage);
+	}
+
+	vec4 mipmappedAnisotropicTextureSample(vec2 P, out float coverage) {
+		vec2 axisX = dFdx(P);
+		vec2 axisY = dFdy(P);
+		float lengthX = length(axisX);
+		float lengthY = length(axisY);
+		vec2 majorAxis = lengthX >= lengthY ? axisX : axisY;
+		float majorLength = max(lengthX, lengthY);
+		float minorLength = max(min(lengthX, lengthY), 1.0);
+		if (majorLength <= 1.0) {
+			return edgeSafeBilinearTextureSample(P, coverage);
+		}
+		float laneCount = clamp(ceil(majorLength / minorLength), 1.0, 4.0);
+		float lod = clamp(log2(minorLength), 0.0, 4.0);
+		vec4 premultiplied = vec4(0.0);
+		float coverageSum = 0.0;
+		float weightSum = 0.0;
+		for (int lane = 0; lane < 4; ++lane) {
+			if (float(lane) >= laneCount) {
+				continue;
+			}
+			float position = (float(lane) + 0.5) / laneCount - 0.5;
+			float tapCoverage;
+			vec4 tapColor = trilinearTextureSampleAtLod(
+				P + majorAxis * position, lod, tapCoverage);
+			accumulateDecodedColor(tapColor, tapCoverage, 1.0,
+				premultiplied, coverageSum, weightSum);
+		}
+		return resolveTileFilter(premultiplied, coverageSum, weightSum,
+			coverage);
+	}
+
+	vec4 anisotropicTextureSample(vec2 P, out float coverage) {
+		#ifdef TRILINEAR_FILTER
+		return mipmappedAnisotropicTextureSample(P, coverage);
+		#else
+		return legacyAnisotropicTextureSample(P, coverage);
+		#endif
+	}
+)PSYX"
 
 #endif
 
@@ -1144,6 +1374,7 @@ GLint u_textureBlendModeLoc;
   GPU_FETCH_VRAM_FUNC                                                          \
   GPU_ARRAY_FUNC                                                               \
   GPU_SAMPLE_TEXTURE_##bit##BIT_FUNC                                           \
+      "	uniform int textureBlendMode;\n"                                       \
       "	uniform sampler2D s_rgLut;\n"                                          \
       "	const vec2 c_LUTTexel = vec2(1.0 / 256.0, 1.0 / 256.0);\n"             \
       "	vec4 lut(vec2 rg) { return texture2D(s_rgLut, rg - c_LUTTexel * "      \
@@ -1191,20 +1422,22 @@ GLint u_textureBlendModeLoc;
       "		return t;\n"                                                          \
       "	}\n"                                                                   \
       "	uniform int textureFilterMode;\n"                                      \
-      "	uniform int textureBlendMode;\n"                                       \
       "	void main() {\n"                                                       \
       "		float coverage = 1.0;\n"                                              \
       "		vec4 color;\n"                                                        \
       "		if (textureFilterMode > 0) {\n"                                       \
-      "			color = textureFilterMode > 1\n"                                     \
-      "				? anisotropicTextureSample(v_texcoord.xy, "                         \
-      "coverage)\n"                                                            \
-      "				: "                                                                 \
-      "edgeSafeBilinearTextureSample(v_texcoord.xy, coverage);\n"              \
+      "			color = textureFilterMode > 2\n"                                     \
+      "				? anisotropicTextureSample(v_texcoord.xy, coverage)\n"            \
+      "				: textureFilterMode > 1\n"                                        \
+      "					? trilinearTextureSample(v_texcoord.xy, coverage)\n"            \
+      "					: edgeSafeBilinearTextureSample(v_texcoord.xy, coverage);\n"    \
       "			float sourceCoverage;\n"                                             \
-      "			pointTextureSample(v_texcoord.xy, sourceCoverage);\n"                \
+      "			vec4 sourceColor = pointTextureSample(v_texcoord.xy, "             \
+      "sourceCoverage);\n"                                                  \
       "			if (textureBlendMode == 0) {\n"                                      \
       "				if (sourceCoverage < 0.5) { discard; }\n"                           \
+      "				float mipConfidence = smoothstep(0.50, 0.75, coverage);\n"          \
+      "				color = mix(sourceColor, color, mipConfidence);\n"                  \
       "				coverage = 1.0;\n"                                                  \
       "			} else {\n"                                                          \
       "				coverage = smoothstep(0.015, 0.98, "                                \
@@ -1229,7 +1462,6 @@ static const char *gpu_shader_common = R"(
 	FLAT varying vec4 v_page_clut;
 	FLAT varying float v_alias_page;
 	FLAT varying vec4 v_texbounds;
-	varying float v_z;
 )";
 
 const char *gpu_shader_4 = GPU_FRAGMENT_SAMPLE_SHADER(4);
@@ -1295,7 +1527,6 @@ const char *gpu_shader_32_rgba =
   "		v_page_clut.zw += c_UVFudge;\n" GTE_PERSPECTIVE_CORRECTION     \
   "		gl_Position.xy *= mix(PresentationScale, vec2(1.0), "                     \
   "clamp(a_extra.z, 0.0, 1.0));\n"                                             \
-  "		v_z = (gl_Position.z - 40.0) * 0.005;\n"                                  \
   "	}\n"
 
 int GR_Shader_CheckShaderStatus(GLuint shader) {
@@ -1402,6 +1633,9 @@ ShaderID GR_Shader_Compile(const char *source, int isPsxShader) {
   if (g_cfg_bilinearFiltering || g_cfg_anisotropicFiltering) {
     strcat(extra_fs_defines, "#define BILINEAR_FILTER\n");
   }
+  if (g_cfg_trilinearFiltering) {
+    strcat(extra_fs_defines, "#define TRILINEAR_FILTER\n");
+  }
 
   const char *vs_list_psx[] = {GLSL_HEADER_VERT, extra_vs_defines,
                                gpu_shader_common, GTE_VERTEX_SHADER};
@@ -1473,6 +1707,11 @@ ShaderID GR_Shader_Compile(const char *source, int isPsxShader) {
 #else
 #error
 #endif
+
+#include "PsyX_skybox.inc"
+#include "PsyX_smaa.inc"
+#include "PsyX_volumetrics.inc"
+#include "PsyX_object_shadows.inc"
 
 //--------------------------------------------------------------------------------------------
 
@@ -1644,6 +1883,10 @@ int GR_InitialisePSX() {
   glGenFramebuffers(1, &g_glNativeMultisampleFramebuffer);
   glGenRenderbuffers(1, &g_glNativeMultisampleColorRenderbuffer);
   glGenRenderbuffers(1, &g_glNativeMultisampleDepthRenderbuffer);
+  PsyX_InitialiseSkybox();
+  PsyX_InitialiseSMAA();
+  PsyX_InitialiseVolumetrics();
+  PsyX_InitialiseObjectShadows();
 
   // gen framebuffer
   {
@@ -1782,6 +2025,43 @@ int GR_InitialisePSX() {
       glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[i]);
       glBufferData(GL_ARRAY_BUFFER, sizeof(GrVertex) * MAX_VERTEX_BUFFER_SIZE,
                    NULL, GL_DYNAMIC_DRAW);
+
+      // Attribute format and source-buffer association are VAO state. Record
+      // the immutable stream layout once instead of repeating it for every
+      // non-empty ordering-table upload.
+      glEnableVertexAttribArray(a_position);
+      glEnableVertexAttribArray(a_page_clut);
+      glEnableVertexAttribArray(a_texcoord);
+      glEnableVertexAttribArray(a_color);
+      glEnableVertexAttribArray(a_extra);
+      glEnableVertexAttribArray(a_texbounds);
+      glEnableVertexAttribArray(a_precise_uv);
+
+#if USE_PGXP
+      glVertexAttribPointer(a_position, 2, GL_FLOAT, GL_FALSE,
+                            sizeof(GrVertex), &((GrVertex *)NULL)->x);
+      glVertexAttribPointer(a_page_clut, 2, GL_FLOAT, GL_FALSE,
+                            sizeof(GrVertex), &((GrVertex *)NULL)->page);
+      glVertexAttribPointer(a_zw, 4, GL_FLOAT, GL_FALSE, sizeof(GrVertex),
+                            &((GrVertex *)NULL)->z);
+      glEnableVertexAttribArray(a_zw);
+#else
+      glVertexAttribPointer(a_position, 2, GL_SHORT, GL_FALSE,
+                            sizeof(GrVertex), &((GrVertex *)NULL)->x);
+      glVertexAttribPointer(a_page_clut, 2, GL_UNSIGNED_SHORT, GL_FALSE,
+                            sizeof(GrVertex), &((GrVertex *)NULL)->page);
+#endif
+      glVertexAttribPointer(a_texcoord, 4, GL_UNSIGNED_BYTE, GL_FALSE,
+                            sizeof(GrVertex), &((GrVertex *)NULL)->u);
+      glVertexAttribPointer(a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE,
+                            sizeof(GrVertex), &((GrVertex *)NULL)->r);
+      glVertexAttribPointer(a_extra, 4, GL_BYTE, GL_FALSE, sizeof(GrVertex),
+                            &((GrVertex *)NULL)->tcx);
+      glVertexAttribPointer(a_texbounds, 4, GL_UNSIGNED_BYTE, GL_FALSE,
+                            sizeof(GrVertex), &((GrVertex *)NULL)->umin);
+      glVertexAttribPointer(a_precise_uv, 2, GL_FLOAT, GL_FALSE,
+                            sizeof(GrVertex),
+                            &((GrVertex *)NULL)->precise_u);
     }
 
     glBindVertexArray(0);
@@ -1827,6 +2107,8 @@ void GR_Perspective3D(const float fov, const float width, const float height,
   float depthScale;
   float depthBias;
   GR_CalculateReversedDepthProjection(zNear, zFar, &depthScale, &depthBias);
+  g_reversedDepthScale = depthScale;
+  g_reversedDepthBias = depthBias;
 
   float persp[16] = {w, 0, 0,          0, 0, h, 0,         0,
                      0, 0, depthScale, 1, 0, 0, depthBias, 0};
@@ -1930,9 +2212,13 @@ void GR_SetShader(const ShaderID shader) {
 
 TextureFilterMode GR_ResolveTextureFilterMode(TextureFilterMode requestedMode,
                                               int bilinearFiltering,
+                                              int trilinearFiltering,
                                               int anisotropicFiltering) {
   if (requestedMode == TEXTURE_FILTER_WORLD_ANISOTROPIC && anisotropicFiltering)
     return TEXTURE_FILTER_WORLD_ANISOTROPIC;
+  if (requestedMode >= TEXTURE_FILTER_WORLD_TRILINEAR &&
+      trilinearFiltering)
+    return TEXTURE_FILTER_WORLD_TRILINEAR;
   if (requestedMode != TEXTURE_FILTER_NEAREST && bilinearFiltering)
     return TEXTURE_FILTER_BILINEAR;
   return TEXTURE_FILTER_NEAREST;
@@ -2009,7 +2295,8 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat,
   // follow the same bilinear/nearest selection as all other primitives.
   const GLint effectiveFilterMode =
       static_cast<GLint>(GR_ResolveTextureFilterMode(
-          filterMode, g_cfg_bilinearFiltering, g_cfg_anisotropicFiltering));
+          filterMode, g_cfg_bilinearFiltering, g_cfg_trilinearFiltering,
+          g_cfg_anisotropicFiltering));
   if (textureFilterModeLoc != -1 && activeShader != NULL &&
       activeShader->appliedTextureFilterMode != effectiveFilterMode) {
     glUniform1i(textureFilterModeLoc, effectiveFilterMode);
@@ -2599,26 +2886,20 @@ void GR_SetDepthState(int testEnable, int writeEnable) {
 #endif
 }
 
-void GR_ClearDepthBuffer(void) {
-#if USE_OPENGL
-  // glClear obeys the depth write mask. Preserve the caller's write state so a
-  // transparent run stays test-only after an OT depth discontinuity.
-  const int restoreWrite = g_PreviousDepthWrite;
-  glDepthMask(GL_TRUE);
-#ifdef RENDERER_OGLES
-  glClearDepthf(0.0f);
-#else
-  glClearDepth(0.0f);
-#endif
-  glClear(GL_DEPTH_BUFFER_BIT);
-  if (restoreWrite == 0)
-    glDepthMask(GL_FALSE);
-#endif
-}
-
 void GR_EnableDepth(int enable) {
   g_RequestedDepthMode = enable ? 1 : 0;
   GR_SetDepthState(enable, enable);
+}
+
+void GR_EnableStencil(int enable) {
+#if USE_OPENGL
+  if (enable)
+    glEnable(GL_STENCIL_TEST);
+  else
+    glDisable(GL_STENCIL_TEST);
+#else
+  (void)enable;
+#endif
 }
 
 void GR_SetStencilMode(int drawPrim) {
@@ -2645,29 +2926,16 @@ void GR_BeginShadowMask(void) {
   g_ShadowStencilPhase = 1;
 #if USE_OPENGL
   // Preserve the retail mask bit (0x01) and reserve bit 0x02 for the native
-  // shadow union. glClear obeys the stencil write mask, so this never erases
+  // shadow gate. glClear obeys the stencil write mask, so this never erases
   // guest-authored PSX mask state from the opaque world pass.
   glStencilMask(0x02);
   glClearStencil(0);
   glClear(GL_STENCIL_BUFFER_BIT);
-  glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-  // Reject guest pixels carrying the retail mask bit while writing only the
-  // native shadow bit. The replacement reference supplies bit 0x02 without
-  // disturbing bit 0x01.
-  glStencilFunc(GL_NOTEQUAL, 0x03, 0x01);
-  glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-#endif
-}
-
-void GR_BeginShadowShade(void) {
-  g_ShadowStencilPhase = 2;
-#if USE_OPENGL
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-  glStencilMask(0x02);
-  glStencilFunc(GL_EQUAL, 0x02, 0x03);
-  // Clear the native bit as each visible pixel is shaded. Overlapping body
-  // triangles consequently darken a receiver exactly once.
-  glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
+  // Accept only unmasked, not-yet-shaded pixels. The first visible shadow
+  // fragment flips bit 0x02; overlapping triangles then fail this test.
+  glStencilFunc(GL_EQUAL, 0x00, 0x03);
+  glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
 #endif
 }
 
@@ -2730,9 +2998,9 @@ void GR_SetBlendMode(BlendMode blendMode) {
 }
 
 void GR_SetPolygonOffset(float slope, float units) {
-  // GPU split submission restores the generic polygon state for every split.
-  // Keep the receiver bias selected by the two-pass shadow operation until
-  // that operation ends; otherwise coplanar wall portions flicker per split.
+  // GPU split submission preserves the caller-selected offset until its pass
+  // completes. Keep the receiver bias selected by the two-pass shadow
+  // operation unchanged while that operation owns the polygon state.
   if (g_ShadowStencilPhase != 0)
     return;
 
@@ -2766,45 +3034,9 @@ void GR_SetWireframe(int enable) {
 void GR_BindVertexBuffer() {
 #if USE_OPENGL
   glBindVertexArray(g_glVertexArray[g_curVertexBuffer]);
-  g_boundVertexArray = g_glVertexArray[g_curVertexBuffer];
-  // GL_ARRAY_BUFFER is not VAO binding state. Explicitly select the matching
-  // stream buffer before recording attribute pointers and uploading data;
-  // otherwise both VAOs silently reuse the last buffer created at startup.
+  // GL_ARRAY_BUFFER is not VAO binding state. Select the matching ring buffer
+  // for the upload; its immutable attribute layout already belongs to the VAO.
   glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[g_curVertexBuffer]);
-
-  glEnableVertexAttribArray(a_position);
-  glEnableVertexAttribArray(a_page_clut);
-  glEnableVertexAttribArray(a_texcoord);
-  glEnableVertexAttribArray(a_color);
-  glEnableVertexAttribArray(a_extra);
-  glEnableVertexAttribArray(a_texbounds);
-  glEnableVertexAttribArray(a_precise_uv);
-
-#if USE_PGXP
-  glVertexAttribPointer(a_position, 2, GL_FLOAT, GL_FALSE, sizeof(GrVertex),
-                        &((GrVertex *)NULL)->x);
-  glVertexAttribPointer(a_page_clut, 2, GL_FLOAT, GL_FALSE, sizeof(GrVertex),
-                        &((GrVertex *)NULL)->page);
-  glVertexAttribPointer(a_zw, 4, GL_FLOAT, GL_FALSE, sizeof(GrVertex),
-                        &((GrVertex *)NULL)->z);
-
-  glEnableVertexAttribArray(a_zw);
-#else
-  glVertexAttribPointer(a_position, 2, GL_SHORT, GL_FALSE, sizeof(GrVertex),
-                        &((GrVertex *)NULL)->x);
-  glVertexAttribPointer(a_page_clut, 2, GL_UNSIGNED_SHORT, GL_FALSE,
-                        sizeof(GrVertex), &((GrVertex *)NULL)->page);
-#endif
-  glVertexAttribPointer(a_texcoord, 4, GL_UNSIGNED_BYTE, GL_FALSE,
-                        sizeof(GrVertex), &((GrVertex *)NULL)->u);
-  glVertexAttribPointer(a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GrVertex),
-                        &((GrVertex *)NULL)->r);
-  glVertexAttribPointer(a_extra, 4, GL_BYTE, GL_FALSE, sizeof(GrVertex),
-                        &((GrVertex *)NULL)->tcx);
-  glVertexAttribPointer(a_texbounds, 4, GL_UNSIGNED_BYTE, GL_FALSE,
-                        sizeof(GrVertex), &((GrVertex *)NULL)->umin);
-  glVertexAttribPointer(a_precise_uv, 2, GL_FLOAT, GL_FALSE, sizeof(GrVertex),
-                        &((GrVertex *)NULL)->precise_u);
 
   g_curVertexBuffer = (g_curVertexBuffer + 1) % MAX_NUM_VERTEX_BUFFERS;
 #else

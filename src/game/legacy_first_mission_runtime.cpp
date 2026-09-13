@@ -1,12 +1,13 @@
 #include "sf/game/legacy_first_mission_runtime.hpp"
 
+#include "sf/game/agent_bomb_challenge.hpp"
+#include "sf/game/agent_mission_timer.hpp"
 #include "sf/game/legacy_mission_image.hpp"
 #include "sf/game/mission.hpp"
 #include "sf/game/player_controller.hpp"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -133,12 +134,15 @@ republishLegacyCoherentPresentation(
 }
 
 LegacyFirstMissionRuntime::LegacyFirstMissionRuntime(
-    const LegacyMissionImage &image) noexcept
-    : LegacyFirstMissionRuntime(missionDefinition(0U), image) {}
+    const LegacyMissionImage &image, bool initial_agent_difficulty) noexcept
+    : LegacyFirstMissionRuntime(missionDefinition(0U), image,
+                                initial_agent_difficulty) {}
 
 LegacyFirstMissionRuntime::LegacyFirstMissionRuntime(
-    const MissionDefinition &mission, const LegacyMissionImage &image) noexcept
-    : mission_index_(mission.index) {
+    const MissionDefinition &mission, const LegacyMissionImage &image,
+    bool initial_agent_difficulty) noexcept
+    : mission_index_(mission.index),
+      agent_difficulty_(initial_agent_difficulty) {
   try {
     virtual_cd_ = image.createVirtualCd();
     // The outer runtime owns the exact 20 Hz hardware cadence. Guest frame
@@ -147,6 +151,10 @@ LegacyFirstMissionRuntime::LegacyFirstMissionRuntime(
     vm_ = std::make_unique<LegacyGameplayVm>(image.executable());
     vm_->bindSyphonFilterUsaV11BootstrapPlatformCalls();
     vm_->bindSyphonFilterUsaV11VirtualCdCalls(virtual_cd_);
+    if (!vm_->setAgentDifficulty(initial_agent_difficulty)) {
+      markFault();
+      return;
+    }
 
     if (mission.selection_index < 0) {
       markFault();
@@ -158,6 +166,15 @@ LegacyFirstMissionRuntime::LegacyFirstMissionRuntime(
         syphonFilterUsaV11RetailPlatformTailProfile(),
         syphonFilterUsaV11FirstMissionOpeningProfile(), 500'000'000U);
     if (!bootstrap.completed()) {
+      markFault();
+      return;
+    }
+
+    // Native bootstrap starts after the console frontend routine which
+    // normally selects vibration mode 3. Restore its exact RAM side effect
+    // before the first retail frame and before capturing restart snapshots;
+    // the host pause setting can explicitly disable it afterwards.
+    if (!vm_->setRetailVibrationEnabled(true)) {
       markFault();
       return;
     }
@@ -248,6 +265,11 @@ void LegacyFirstMissionRuntime::setHostAimRay(
   }
 }
 
+void LegacyFirstMissionRuntime::setPark2FlameLineOfSight(
+    std::optional<bool> line_of_sight_clear) noexcept {
+  pending_park2_flame_line_of_sight_clear_ = line_of_sight_clear;
+}
+
 bool LegacyFirstMissionRuntime::restoreHostPlayerHeading(
     std::int32_t yaw) noexcept {
   if (!ready_ || finished_ || faulted_ || !vm_) {
@@ -265,6 +287,18 @@ bool LegacyFirstMissionRuntime::restoreHostPlayerHeading(
 
 std::uint64_t LegacyFirstMissionRuntime::hostAimRayPatchCount() const noexcept {
   return vm_ ? vm_->hostAimRayPatchCount() : 0U;
+}
+
+LegacyPadMotorState LegacyFirstMissionRuntime::padMotorState() const noexcept {
+  return vm_ ? vm_->padMotorState() : LegacyPadMotorState{};
+}
+
+bool LegacyFirstMissionRuntime::setRetailVibrationEnabled(
+    bool enabled) noexcept {
+  if (!ready_ || finished_ || faulted_ || !vm_) {
+    return false;
+  }
+  return vm_->setRetailVibrationEnabled(enabled);
 }
 
 bool LegacyFirstMissionRuntime::applyHostWeaponMenuInput(
@@ -347,11 +381,139 @@ bool LegacyFirstMissionRuntime::setRetailAllWeaponsCheat(
   return true;
 }
 
+bool LegacyFirstMissionRuntime::maintainAgentMissionNpcOverrides() noexcept {
+  return !agent_difficulty_ ||
+         (vm_ && vm_->applyAgentMissionNpcOverrides(mission_index_, true));
+}
+
+bool LegacyFirstMissionRuntime::maintainAgentMissionTimers() noexcept {
+  return !agent_difficulty_ ||
+         (vm_ && vm_->applyAgentMissionTimer(mission_index_));
+}
+
+void LegacyFirstMissionRuntime::resetAgentPark2BombDetonation() noexcept {
+  agent_park2_bomb_detonation_percent_ = 0U;
+}
+
+bool LegacyFirstMissionRuntime::updateAgentPark2BombDetonation() noexcept {
+  constexpr std::uint32_t park2_mission_index = 4U;
+  constexpr auto maximum_percent = std::uint8_t{100U};
+  if (!vm_ || !agent_difficulty_ || mission_index_ != park2_mission_index) {
+    return true;
+  }
+
+  const auto live_mission = vm_->readMissionBridgeState();
+  const auto *mission = live_mission ? &*live_mission : missionBridge();
+  if (mission == nullptr) {
+    return true;
+  }
+  // Gabe's health reaches zero before retail raises mission.failure. Clear
+  // the host-only meter on that earlier death edge as well as on the common
+  // terminal transition, so Girdeux and scripted failures cannot leave a
+  // stale partial value visible during the death/failure fade.
+  if (mission->player_health <= 0 || mission->terminal || mission->failure) {
+    resetAgentPark2BombDetonation();
+    return true;
+  }
+  if (agent_park2_bomb_detonation_percent_ >= maximum_percent) {
+    return true;
+  }
+
+  auto percent = agent_park2_bomb_detonation_percent_;
+  for (const auto &event : vm_->weaponEvents()) {
+    if (event.actor_slot != mission->player_slot) {
+      continue;
+    }
+    percent = applyAgentPark2BombDetonation(
+        percent, event.type, static_cast<WeaponId>(event.weapon));
+  }
+  if (percent == agent_park2_bomb_detonation_percent_) {
+    return true;
+  }
+  agent_park2_bomb_detonation_percent_ = percent;
+  if (percent < maximum_percent) {
+    return true;
+  }
+
+  // Use the same resident wrapper as PARK2's class-0x2e BOMB death callback.
+  // This keeps the original failure text, sound, 0xc8 delay and fade intact.
+  return vm_->invokeRetailPark2BombFailure().completed();
+}
+
 bool LegacyFirstMissionRuntime::setRetailHardMode(bool enabled) noexcept {
   if (!ready_ || finished_ || faulted_ || !vm_) {
     return false;
   }
   return vm_->setRetailHardMode(enabled);
+}
+
+bool LegacyFirstMissionRuntime::setAgentDifficulty(bool enabled) noexcept {
+  if (!ready_ || finished_ || faulted_ || !vm_) {
+    return false;
+  }
+
+  const auto previous_difficulty = agent_difficulty_;
+  const auto previous_bomb_detonation = agent_park2_bomb_detonation_percent_;
+  std::optional<LegacyGameplayVmSnapshot> snapshot;
+  try {
+    snapshot.emplace(vm_->captureSnapshot());
+  } catch (...) {
+    return false;
+  }
+
+  const auto rollback = [&]() noexcept {
+    const auto snapshot_restored = vm_->restoreSnapshot(*snapshot);
+    const auto difficulty_restored =
+        vm_->setAgentDifficulty(previous_difficulty);
+    agent_difficulty_ = previous_difficulty;
+    agent_park2_bomb_detonation_percent_ = previous_bomb_detonation;
+    if (!snapshot_restored || !difficulty_restored) {
+      try {
+        fault_detail_ = "stage=agent-difficulty stop=rollback";
+      } catch (...) {
+        fault_detail_.clear();
+      }
+      markFault();
+    }
+  };
+
+  const auto difficulty_changed = agent_difficulty_ != enabled;
+  if (!vm_->setAgentDifficulty(enabled)) {
+    rollback();
+    return false;
+  }
+  agent_difficulty_ = enabled;
+  if (!vm_->applyAgentMissionNpcOverrides(mission_index_, enabled)) {
+    rollback();
+    return false;
+  }
+  if (!maintainAgentMissionTimers()) {
+    rollback();
+    return false;
+  }
+  if (!enabled || difficulty_changed) {
+    resetAgentPark2BombDetonation();
+  }
+  return true;
+}
+
+bool LegacyFirstMissionRuntime::agentHeadshotThreatActive() const noexcept {
+  return ready_ && !faulted_ && vm_ && vm_->agentHeadshotThreatActive();
+}
+
+std::optional<std::uint8_t>
+LegacyFirstMissionRuntime::agentPark2BombDetonationPercent() const noexcept {
+  constexpr std::uint32_t park2_mission_index = 4U;
+  if (!ready_ || finished_ || faulted_ || !agent_difficulty_ ||
+      mission_index_ != park2_mission_index) {
+    return std::nullopt;
+  }
+  const auto *mission = missionBridge();
+  if (mission == nullptr || mission->player_health <= 0 || mission->terminal ||
+      mission->failure) {
+    return std::nullopt;
+  }
+  return agent_park2_bomb_detonation_percent_;
 }
 
 bool LegacyFirstMissionRuntime::setRetailOneShotKills(bool enabled) noexcept {
@@ -447,6 +609,47 @@ bool LegacyFirstMissionRuntime::applyCampaignCarryState(
   }
 }
 
+bool LegacyFirstMissionRuntime::applyRetryInventoryState(
+    const CampaignCarryState &state) noexcept {
+  if (!ready_ || finished_ || faulted_ || !vm_ || !validCampaignCarry(state) ||
+      !missionBridge()) {
+    return false;
+  }
+  try {
+    const auto inventory =
+        mergeRetryInventoryState(missionBridge()->inventory, state);
+    const auto snapshot = vm_->captureSnapshot();
+    const auto previous_frame = presentation_frame_;
+    const auto previous_sequence = presentation_sequence_;
+    const auto rollback = [&] {
+      const auto restored = vm_->restoreSnapshot(snapshot);
+      presentation_frame_ = previous_frame;
+      presentation_sequence_ = previous_sequence;
+      return restored;
+    };
+    try {
+      // A retry is not a new campaign baseline. Restore only the ordinary
+      // weapon table over the checkpoint VM and leave health, mission-local
+      // items, initial_snapshot_ and checkpoint_ untouched.
+      if (!vm_->writeHostInventoryState(inventory) ||
+          !publishPresentationFrame()) {
+        if (!rollback()) {
+          markFault();
+        }
+        return false;
+      }
+      return true;
+    } catch (...) {
+      if (!rollback()) {
+        markFault();
+      }
+      return false;
+    }
+  } catch (...) {
+    return false;
+  }
+}
+
 bool LegacyFirstMissionRuntime::consumeCheckpointCommit() noexcept {
   const bool committed = checkpoint_commit_pending_ && presentation_frame_ &&
                          presentation_frame_->contains(
@@ -527,12 +730,15 @@ bool LegacyFirstMissionRuntime::restoreCheckpoint() noexcept {
     markFault();
     return false;
   }
+  resetAgentPark2BombDetonation();
   try {
     if (!vm_->restoreSnapshot(checkpoint_->vm)) {
       markFault();
       return false;
     }
     vm_->setHostAimRay(std::nullopt);
+    pending_park2_flame_line_of_sight_clear_.reset();
+    vm_->setPark2FlameLineOfSight(std::nullopt);
     host_pad_state_ = checkpoint_->host_pad;
     latched_pad_buttons_ = checkpoint_->latched_pad_buttons;
     guest_frame_ = checkpoint_->guest_frame;
@@ -577,12 +783,15 @@ void LegacyFirstMissionRuntime::reset() noexcept {
     return;
   }
 
+  resetAgentPark2BombDetonation();
   try {
     if (!vm_->restoreSnapshot(*initial_snapshot_)) {
       markFault();
       return;
     }
     vm_->setHostAimRay(std::nullopt);
+    pending_park2_flame_line_of_sight_clear_.reset();
+    vm_->setPark2FlameLineOfSight(std::nullopt);
     checkpoint_.reset();
     host_pad_state_ = {};
     latched_pad_buttons_ = 0U;
@@ -623,8 +832,6 @@ void LegacyFirstMissionRuntime::reset() noexcept {
 }
 
 void LegacyFirstMissionRuntime::advanceHostUpdate() noexcept {
-  last_retail_vm_milliseconds_ = 0.0;
-  last_retail_renderer_milliseconds_ = 0.0;
   if (!ready_ || finished_ || !vm_) {
     return;
   }
@@ -689,15 +896,29 @@ void LegacyFirstMissionRuntime::advanceHostUpdate() noexcept {
 
     // H4 has no native-driven gameplay frame. The retail outer loop owns
     // input processing, gameplay, player, animation and mission state.
-    const auto vm_started = std::chrono::steady_clock::now();
+    vm_->setPark2FlameLineOfSight(
+        std::exchange(pending_park2_flame_line_of_sight_clear_, std::nullopt));
     auto frame = vm_->tickRetailOuterFrame();
-    const auto vm_finished = std::chrono::steady_clock::now();
-    last_retail_vm_milliseconds_ =
-        std::chrono::duration<double, std::milli>(vm_finished - vm_started)
-            .count();
-    last_retail_renderer_milliseconds_ = frame.renderer_tail_milliseconds;
+    vm_->setPark2FlameLineOfSight(std::nullopt);
     if (!frame.completed()) {
       recordExecutionFault(frame);
+      markFault();
+      return;
+    }
+    if (!maintainAgentMissionTimers()) {
+      fault_detail_ = "stage=agent-mission-timer stop=guest-write";
+      markFault();
+      return;
+    }
+    if (!maintainAgentMissionNpcOverrides()) {
+      fault_detail_ = "stage=agent-mission-npc-overrides stop=guest-write";
+      markFault();
+      return;
+    }
+    if ((isGameplayState(frame.state_after) ||
+         legacyRetailStreamingState(frame.state_after)) &&
+        !updateAgentPark2BombDetonation()) {
+      fault_detail_ = "stage=agent-park2-bomb-failure stop=guest-callback";
       markFault();
       return;
     }
@@ -792,6 +1013,7 @@ void LegacyFirstMissionRuntime::advanceHostUpdate() noexcept {
     }
     opening_finished_ = opening_finished_ || openingRailFinished(*bridge());
   } catch (...) {
+    vm_->setPark2FlameLineOfSight(std::nullopt);
     markFault();
   }
 }
@@ -806,8 +1028,9 @@ bool LegacyFirstMissionRuntime::maintainRetailCheats(
     inventory.owned_weapons |= retail_infinite_ammo_->owned_weapons;
     for (std::size_t weapon = 0U; weapon < inventory.magazines.size();
          ++weapon) {
-      inventory.magazines[weapon] = std::max(
-          inventory.magazines[weapon], retail_infinite_ammo_->magazines[weapon]);
+      inventory.magazines[weapon] =
+          std::max(inventory.magazines[weapon],
+                   retail_infinite_ammo_->magazines[weapon]);
       inventory.reserves[weapon] = std::max(
           inventory.reserves[weapon], retail_infinite_ammo_->reserves[weapon]);
     }
@@ -1012,6 +1235,22 @@ bool LegacyFirstMissionRuntime::publishPresentationFrame() noexcept {
       fault_reason_ = LegacyRuntimeFaultReason::mission_bridge;
       return false;
     }
+    constexpr std::string_view retail_park_timer_parameter =
+        "All bombs must be defused in under 20 minutes";
+    constexpr std::string_view agent_park_timer_parameter =
+        "All bombs must be defused in under 15 minutes";
+    for (auto &parameter : ui->parameter_texts) {
+      if (agent_difficulty_ && mission_index_ == 3U &&
+          parameter == retail_park_timer_parameter) {
+        parameter = agent_park_timer_parameter;
+      } else {
+        const auto replacement = agentMissionParameterText(
+            mission_index_, agent_difficulty_, parameter);
+        if (replacement != parameter) {
+          parameter = replacement;
+        }
+      }
+    }
     if (!renderer) {
       // Retail pointer tables have a few short hand-off frames outside the
       // explicit state-7/9 streaming loop. Keep advancing authoritative guest
@@ -1032,6 +1271,10 @@ bool LegacyFirstMissionRuntime::publishPresentationFrame() noexcept {
         return false;
       }
       ++consecutive_renderer_snapshot_replays_;
+      if (ui->player_health <= 0) {
+        vm_->clearAgentHeadshotThreat();
+        resetAgentPark2BombDetonation();
+      }
       if (!publishPresentationFrame(*coherent_renderer, *ui)) {
         return false;
       }
@@ -1040,6 +1283,15 @@ bool LegacyFirstMissionRuntime::publishPresentationFrame() noexcept {
       return true;
     }
     consecutive_renderer_snapshot_replays_ = 0U;
+    if (ui->player_health <= 0) {
+      vm_->clearAgentHeadshotThreat();
+      resetAgentPark2BombDetonation();
+    } else {
+      static_cast<void>(vm_->updateAgentGrenadeAwareness(*renderer));
+      if (!vm_->updateAgentHeadshotThreat(*renderer, ui->player_slot)) {
+        vm_->clearAgentHeadshotThreat();
+      }
+    }
     if (!publishPresentationFrame(*renderer, *ui)) {
       fault_reason_ = LegacyRuntimeFaultReason::presentation_contract;
       return false;
@@ -1079,6 +1331,9 @@ bool LegacyFirstMissionRuntime::publishPresentationFrame(
 
 bool LegacyFirstMissionRuntime::republishPresentationFrame(
     const std::shared_ptr<const LegacyPresentationFrame> &source) noexcept {
+  if (vm_ && finished_) {
+    vm_->clearAgentHeadshotThreat();
+  }
   const auto commands = pendingPresentationCommands();
   const auto frame = republishLegacyCoherentPresentation(
       source, presentation_sequence_, guest_frame_, commands);
@@ -1105,6 +1360,7 @@ void LegacyFirstMissionRuntime::markFault(
     fault_reason_ = reason;
   }
   if (vm_) {
+    vm_->clearAgentHeadshotThreat();
     vm_->clearWeaponEvents();
     vm_->clearUiMessages();
   }

@@ -35,12 +35,25 @@ readLocalizedAsset(std::string_view relative_path) noexcept;
 // dynamic numeric values) and owns the returned storage.
 [[nodiscard]] std::string localizeTextCopy(std::string_view english);
 
+// Encodes authored UTF-8 Cyrillic into the original ViT single-byte glyph
+// map. Native UI and exact localization tests share this boundary so expected
+// strings cannot silently drift into mojibake.
+[[nodiscard]] std::string encodeVitText(std::u8string_view source);
+
 // Retail can expose a gameplay status while its type-on animation has only
 // submitted a prefix of the source glyphs. Resolve known HUD prefixes back to
 // their complete English source so localization preserves both the intended
 // text and the original reveal timing.
 [[nodiscard]] std::optional<std::string_view>
 completeGameplayTextSource(std::string_view observed) noexcept;
+
+// English normally presents the guest's exact live prefix. Mission Failed is
+// the sole exception because the retail terminal packet retires at that
+// identifiable prefix and requires the canonical source for its final frame.
+[[nodiscard]] constexpr bool
+completedGameplayTextRequiredInEnglish(std::string_view completed) noexcept {
+  return completed == "Mission Failed";
+}
 
 struct LocalizedMissionBriefing {
   std::string location;
